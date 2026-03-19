@@ -80,26 +80,53 @@ async def scrape_cereales():
 # DÓLAR BNA
 # ──────────────────────────────────────────
 async def fetch_dolar_bna():
-    apis = [
-        "https://dolarapi.com/v1/dolares/oficial",
-        "https://api.argentinadatos.com/v1/cotizaciones/dolar/oficial",
-        "https://api.bluelytics.com.ar/v2/latest",
-    ]
-    async with httpx.AsyncClient(timeout=6) as client:
-        for url in apis:
-            try:
-                r = await client.get(url)
-                if r.status_code != 200:
-                    continue
+    """Obtiene el dolar divisa tipo comprador BNA"""
+    async with httpx.AsyncClient(timeout=8) as client:
+        # 1. dolarapi /mayorista = divisa comprador BNA
+        try:
+            r = await client.get("https://dolarapi.com/v1/dolares/mayorista")
+            if r.status_code == 200:
                 j = r.json()
-                # dolarapi y argentinadatos
-                val = j.get("compra") or j.get("oficial", {}).get("value_buy") if isinstance(j.get("oficial"), dict) else None
-                if not val:
-                    val = j.get("compra") or j.get("venta")
+                val = j.get("compra") or j.get("venta")
                 if val and float(val) > 100:
-                    return round(float(val), 2), url
-            except Exception as e:
-                print(f"Dólar API error {url}: {e}")
+                    return round(float(val), 2), "BNA divisa comprador"
+        except Exception as e:
+            print(f"Dolar mayorista error: {e}")
+
+        # 2. argentinadatos /mayorista
+        try:
+            r = await client.get("https://api.argentinadatos.com/v1/cotizaciones/dolar/mayorista")
+            if r.status_code == 200:
+                j = r.json()
+                if isinstance(j, list) and j:
+                    j = j[-1]
+                val = j.get("compra") or j.get("venta")
+                if val and float(val) > 100:
+                    return round(float(val), 2), "BNA divisa comprador"
+        except Exception as e:
+            print(f"Dolar argentinadatos error: {e}")
+
+        # 3. Scraping BNA directo
+        try:
+            headers = {"User-Agent": "Mozilla/5.0"}
+            r = await client.get("https://www.bna.com.ar/Personas", headers=headers, timeout=10)
+            if r.status_code == 200:
+                soup = BeautifulSoup(r.text, "html.parser")
+                for row in soup.find_all("tr"):
+                    cells = row.find_all("td")
+                    if len(cells) >= 3:
+                        texto = cells[0].get_text(strip=True).lower()
+                        if "divisa" in texto and ("dolar" in texto or "u.s.a" in texto):
+                            compra = cells[1].get_text(strip=True).replace(",", ".")
+                            try:
+                                val = float(compra)
+                                if val > 100:
+                                    return round(val, 2), "BNA divisa comprador"
+                            except:
+                                pass
+        except Exception as e:
+            print(f"Scraping BNA error: {e}")
+
     return None, None
 
 
