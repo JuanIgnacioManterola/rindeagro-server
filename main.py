@@ -29,56 +29,108 @@ cache_precios = {
 # ──────────────────────────────────────────
 # PRECIOS CEREALES — scraping BCR Rosario
 # ──────────────────────────────────────────
-async def scrape_cereales():
-    urls = [
-        "https://www.bcr.com.ar/es/mercados/granos/granos-disponible-cpp",
-        "https://cac.bcr.com.ar/es/precios-de-granos",
-    ]
+async def scrape_cereales(bna: float = 1385):
+    """
+    Obtiene precios pizarra Rosario desde Agrofy.
+    Los precios de Agrofy vienen en PESOS — se dividen por el BNA para obtener USD/t.
+    Precio tipico: soja ~$465.000 ARS / 1385 BNA = ~335 USD/t (correcto para productor)
+    """
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept": "text/html,application/xhtml+xml",
     }
-    mapeo = {
-        "soja": ["soja", "soybean"],
-        "maiz": ["maiz", "maíz", "corn", "maize"],
-        "trigo": ["trigo", "wheat"],
-        "girasol": ["girasol", "sunflower"],
-        "sorgo": ["sorgo", "sorghum"],
-    }
-    
-    async with httpx.AsyncClient(timeout=10, follow_redirects=True) as client:
-        for url in urls:
+
+    async with httpx.AsyncClient(timeout=12, follow_redirects=True) as client:
+
+        # ── Agrofy precios pizarra (en pesos ARS) ──
+        for url in [
+            "https://news.agrofy.com.ar/granos/precios-pizarra",
+            "https://news.agrofy.com.ar/granos/mercado-fisico",
+        ]:
             try:
-                resp = await client.get(url, headers=headers)
-                if resp.status_code != 200:
+                r = await client.get(url, headers=headers)
+                if r.status_code != 200:
                     continue
-                soup = BeautifulSoup(resp.text, "html.parser")
-                texto = soup.get_text(" ", strip=True).lower()
-                
+                soup = BeautifulSoup(r.text, "html.parser")
+                texto = soup.get_text(" ", strip=True)
+                print(f"Agrofy ({url[-20:]}) snippet: {texto[:600]}")
+
+                mapeo = {
+                    "soja":    ["soja"],
+                    "maiz":    ["maíz", "maiz"],
+                    "trigo":   ["trigo"],
+                    "girasol": ["girasol"],
+                    "sorgo":   ["sorgo"],
+                }
                 encontrados = {}
-                # Buscar patrones como "soja 341" o "soja USD 341"
+                # Buscar precios en pesos: formato "465.000" o "465000" o "$ 465.000"
+                import re as _re
                 for cereal, aliases in mapeo.items():
                     for alias in aliases:
-                        # Patron: nombre seguido de número en rango 50-1000 (USD/t)
-                        patron = rf"{alias}[^0-9]{{0,30}}?(\d{{2,4}}(?:[.,]\d{{1,2}})?)"
-                        m = re.search(patron, texto)
+                        # patron: nombre del cereal + precio en pesos (6 digitos tipico)
+                        pat = alias + r"[^0-9]{0,60}?(\d{2,3}[\.,]\d{3})"
+                        m = _re.search(pat, texto.lower())
                         if m:
-                            val = float(m.group(1).replace(",", "."))
-                            if 50 < val < 1000:
-                                encontrados[cereal] = round(val, 2)
-                                break
-                
+                            raw = m.group(1).replace(".", "").replace(",", "")
+                            val_pesos = float(raw)
+                            if val_pesos > 50000:  # precio en pesos razonable (>50k ARS)
+                                val_usd = round(val_pesos / bna, 1)
+                                if 80 < val_usd < 700:
+                                    encontrados[cereal] = val_usd
+                                    break
+
                 if len(encontrados) >= 3:
-                    return encontrados, url
+                    print(f"Encontrados (pesos→USD): {encontrados}")
+                    return encontrados, "Pizarra Rosario"
+
             except Exception as e:
-                print(f"Error scraping {url}: {e}")
-                continue
+                print(f"Agrofy error {url}: {e}")
+
     return None, None
 
 
-# ──────────────────────────────────────────
-# DÓLAR BNA
-# ──────────────────────────────────────────
+def parsear_agrofy(data):
+    """Parsea respuesta JSON de Agrofy"""
+    encontrados = {}
+    mapeo = {"soja": ["soja"], "maiz": ["maiz", "maíz"], "trigo": ["trigo"], "girasol": ["girasol"], "sorgo": ["sorgo"]}
+    items = data if isinstance(data, list) else data.get("data", data.get("items", data.get("precios", [])))
+    if isinstance(items, list):
+        for item in items:
+            nombre = (item.get("nombre") or item.get("cereal") or item.get("grano") or "").lower()
+            precio = item.get("precio") or item.get("usd") or item.get("valor")
+            if precio:
+                for key, aliases in mapeo.items():
+                    if any(a in nombre for a in aliases):
+                        val = float(precio)
+                        if 100 < val < 600:
+                            encontrados[key] = round(val, 2)
+    return encontrados
+
+
+def parsear_tabla_agrofy(soup):
+    """Parsea tabla HTML de precios de Agrofy"""
+    encontrados = {}
+    mapeo = {"soja": ["soja"], "maiz": ["maiz", "maíz"], "trigo": ["trigo"], "girasol": ["girasol"], "sorgo": ["sorgo"]}
+    tablas = soup.find_all("table")
+    for tabla in tablas:
+        for fila in tabla.find_all("tr"):
+            celdas = fila.find_all(["td", "th"])
+            if len(celdas) >= 2:
+                nombre = celdas[0].get_text(strip=True).lower()
+                for key, aliases in mapeo.items():
+                    if any(a in nombre for a in aliases):
+                        for celda in celdas[1:]:
+                            txt = celda.get_text(strip=True).replace(",", ".").replace("$", "").replace("USD", "").strip()
+                            try:
+                                val = float(txt)
+                                if 100 < val < 600:
+                                    encontrados[key] = round(val, 2)
+                                    break
+                            except:
+                                continue
+    return encontrados
+
+
 async def fetch_dolar_bna():
     """Obtiene el dolar divisa tipo comprador BNA"""
     async with httpx.AsyncClient(timeout=8) as client:
@@ -147,18 +199,19 @@ async def get_precios():
     )
     
     if necesita_refresh:
-        # Actualizar en paralelo
-        cereales_task = scrape_cereales()
-        dolar_task = fetch_dolar_bna()
-        (cereales, fuente_c), (bna, fuente_d) = await asyncio.gather(cereales_task, dolar_task)
-        
+        # Primero obtener BNA, luego usarlo para convertir pesos a USD en cereales
+        bna, fuente_d = await fetch_dolar_bna()
+        bna_val = bna if bna else cache_precios["bna"]
+
+        cereales, fuente_c = await scrape_cereales(bna=bna_val)
+
         if cereales:
             cache_precios["cereales"].update(cereales)
-            cache_precios["fuente"] = "BCR Rosario"
-        
+            cache_precios["fuente"] = fuente_c or "Pizarra Rosario"
+
         if bna:
             cache_precios["bna"] = bna
-        
+
         cache_precios["ultima_actualizacion"] = ahora
     
     return {
