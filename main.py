@@ -465,6 +465,159 @@ async def cargar_en_supabase(datos: dict, usuario: dict, sb_url: str, sb_key: st
 
 
 # ──────────────────────────────────────────
+# MERCADO PAGO — SUSCRIPCIONES
+# ──────────────────────────────────────────
+
+PLANES = {
+    "lote":        {"nombre": "Lote",        "precio": 29,  "descripcion": "Hasta 5 campos · Todos los módulos · WhatsApp"},
+    "agronomo":    {"nombre": "Agrónomo",     "precio": 36,  "descripcion": "20 productores · Panel multi-productor"},
+    "corporativo": {"nombre": "Corporativo",  "precio": 45,  "descripcion": "Campos ilimitados · 5 usuarios"},
+}
+
+@app.post("/mp/crear-suscripcion")
+async def crear_suscripcion(request: Request):
+    """Crea una suscripción en Mercado Pago y devuelve la URL de pago"""
+    MP_ACCESS_TOKEN = os.environ.get("MP_ACCESS_TOKEN", "")
+    SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
+    SERVER_URL = os.environ.get("SERVER_URL", "https://rindeagro-server-production.up.railway.app")
+
+    if not MP_ACCESS_TOKEN:
+        raise HTTPException(status_code=500, detail="MP_ACCESS_TOKEN no configurado")
+
+    body = await request.json()
+    plan_id = body.get("plan")
+    usuario_id = body.get("usuario_id")
+    email = body.get("email")
+
+    if plan_id not in PLANES:
+        raise HTTPException(status_code=400, detail="Plan inválido")
+
+    plan = PLANES[plan_id]
+
+    async with httpx.AsyncClient(timeout=15) as client:
+        # 1. Crear preapproval plan (plan de suscripción) en MP
+        r = await client.post(
+            "https://api.mercadopago.com/preapproval_plan",
+            headers={
+                "Authorization": f"Bearer {MP_ACCESS_TOKEN}",
+                "Content-Type": "application/json"
+            },
+            json={
+                "reason": f"RindeAgro · Plan {plan['nombre']}",
+                "auto_recurring": {
+                    "frequency": 1,
+                    "frequency_type": "months",
+                    "transaction_amount": plan["precio"],
+                    "currency_id": "ARS"
+                },
+                "back_url": "https://juanignaciomanterola.github.io/Rindeagro",
+                "payment_methods_allowed": {
+                    "payment_types": [{"id": "credit_card"}, {"id": "debit_card"}]
+                }
+            }
+        )
+
+        if r.status_code not in (200, 201):
+            print(f"MP error: {r.text}")
+            raise HTTPException(status_code=500, detail="Error creando plan en MP")
+
+        plan_mp = r.json()
+        plan_mp_id = plan_mp.get("id")
+
+        # 2. Crear suscripción del usuario a ese plan
+        r2 = await client.post(
+            "https://api.mercadopago.com/preapproval",
+            headers={
+                "Authorization": f"Bearer {MP_ACCESS_TOKEN}",
+                "Content-Type": "application/json"
+            },
+            json={
+                "preapproval_plan_id": plan_mp_id,
+                "reason": f"RindeAgro · Plan {plan['nombre']}",
+                "external_reference": f"{usuario_id}|{plan_id}",
+                "payer_email": email,
+                "auto_recurring": {
+                    "frequency": 1,
+                    "frequency_type": "months",
+                    "transaction_amount": plan["precio"],
+                    "currency_id": "ARS"
+                },
+                "back_url": "https://juanignaciomanterola.github.io/Rindeagro",
+                "status": "pending"
+            }
+        )
+
+        if r2.status_code not in (200, 201):
+            print(f"MP suscripcion error: {r2.text}")
+            raise HTTPException(status_code=500, detail="Error creando suscripción en MP")
+
+        suscripcion = r2.json()
+        init_point = suscripcion.get("init_point")
+
+        return {
+            "ok": True,
+            "init_point": init_point,
+            "suscripcion_id": suscripcion.get("id"),
+            "plan": plan_id
+        }
+
+
+@app.post("/mp/webhook")
+async def mp_webhook(request: Request):
+    """Recibe notificaciones de Mercado Pago cuando se procesa un pago"""
+    MP_ACCESS_TOKEN = os.environ.get("MP_ACCESS_TOKEN", "")
+    SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
+    SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "")
+
+    body = await request.json()
+    print(f"[MP Webhook] {json.dumps(body)}")
+
+    tipo = body.get("type")
+    data_id = body.get("data", {}).get("id")
+
+    if tipo == "subscription_preapproval" and data_id:
+        async with httpx.AsyncClient(timeout=10) as client:
+            # Consultar detalles de la suscripción
+            r = await client.get(
+                f"https://api.mercadopago.com/preapproval/{data_id}",
+                headers={"Authorization": f"Bearer {MP_ACCESS_TOKEN}"}
+            )
+            if r.status_code == 200:
+                sus = r.json()
+                estado = sus.get("status")
+                ref = sus.get("external_reference", "")
+
+                if "|" in ref:
+                    usuario_id, plan_id = ref.split("|", 1)
+
+                    # Actualizar estado en Supabase
+                    if SUPABASE_URL and SUPABASE_KEY:
+                        headers = {
+                            "apikey": SUPABASE_KEY,
+                            "Authorization": f"Bearer {SUPABASE_KEY}",
+                            "Content-Type": "application/json"
+                        }
+                        await client.patch(
+                            f"{SUPABASE_URL}/rest/v1/perfiles?id=eq.{usuario_id}",
+                            headers=headers,
+                            json={
+                                "plan": plan_id if estado == "authorized" else "semilla",
+                                "suscripcion_mp_id": data_id,
+                                "suscripcion_estado": estado
+                            }
+                        )
+                        print(f"[MP] Usuario {usuario_id} → plan {plan_id} ({estado})")
+
+    return {"ok": True}
+
+
+@app.get("/mp/planes")
+async def get_planes():
+    """Devuelve los planes disponibles con sus precios"""
+    return {"ok": True, "planes": PLANES}
+
+
+# ──────────────────────────────────────────
 # ENDPOINT: GET /health
 # ──────────────────────────────────────────
 @app.get("/health")
