@@ -469,9 +469,9 @@ async def cargar_en_supabase(datos: dict, usuario: dict, sb_url: str, sb_key: st
 # ──────────────────────────────────────────
 
 PLANES = {
-    "lote":        {"nombre": "Lote",        "precio": 29,  "descripcion": "Hasta 5 campos · Todos los módulos · WhatsApp"},
-    "agronomo":    {"nombre": "Agrónomo",     "precio": 36,  "descripcion": "20 productores · Panel multi-productor"},
-    "corporativo": {"nombre": "Corporativo",  "precio": 45,  "descripcion": "Campos ilimitados · 5 usuarios"},
+    "lote":        {"nombre": "Lote",        "precio_usd": 29,  "precio_usd_anual": 278,  "descripcion": "Hasta 5 campos · Todos los módulos · WhatsApp"},
+    "agronomo":    {"nombre": "Agrónomo",     "precio_usd": 36,  "precio_usd_anual": 346,  "descripcion": "20 productores · Panel multi-productor"},
+    "corporativo": {"nombre": "Corporativo",  "precio_usd": 45,  "precio_usd_anual": 432,  "descripcion": "Campos ilimitados · 5 usuarios"},
 }
 
 @app.post("/mp/crear-suscripcion")
@@ -487,38 +487,92 @@ async def crear_suscripcion(request: Request):
     plan_id = body.get("plan")
     usuario_id = body.get("usuario_id")
     email = body.get("email")
+    es_anual = body.get("anual", False)
+    cuotas = int(body.get("cuotas", 1))
+    if not es_anual:
+        cuotas = 1
+    # Validar cuotas
+    if cuotas < 1: cuotas = 1
+    if cuotas > 12: cuotas = 12
 
     if plan_id not in PLANES:
         raise HTTPException(status_code=400, detail="Plan inválido")
 
     plan = PLANES[plan_id]
 
+    # Obtener BNA actual
+    bna, _ = await fetch_dolar_bna()
+    bna_val = bna if bna else cache_precios["bna"]
+
+    # Tabla de intereses por cuotas
+    INTERESES = {1:0, 2:0, 3:0, 4:10, 5:14, 6:18, 7:22, 8:26, 9:30, 10:34, 11:38, 12:42}
+    interes = INTERESES.get(cuotas, 0) if es_anual else 0
+
+    # Calcular precio en ARS
+    if es_anual:
+        precio_usd = plan["precio_usd_anual"]
+        razon = f"RindeAgro · Plan {plan['nombre']} Anual"
+    else:
+        precio_usd = plan["precio_usd"]
+        razon = f"RindeAgro · Plan {plan['nombre']} Mensual"
+
+    precio_ars_base = round(precio_usd * bna_val)
+    precio_ars = round(precio_ars_base * (1 + interes / 100))
+
     async with httpx.AsyncClient(timeout=15) as client:
-        # Crear preapproval_plan — MP genera un link de pago donde el usuario ingresa su tarjeta
-        r = await client.post(
-            "https://api.mercadopago.com/preapproval_plan",
-            headers={
-                "Authorization": f"Bearer {MP_ACCESS_TOKEN}",
-                "Content-Type": "application/json"
-            },
-            json={
-                "reason": f"RindeAgro · Plan {plan['nombre']}",
-                "external_reference": f"{usuario_id}|{plan_id}",
-                "auto_recurring": {
-                    "frequency": 1,
-                    "frequency_type": "months",
-                    "transaction_amount": plan["precio"],
+        if es_anual:
+            # Pago único con cuotas (preference)
+            installments_payload = {
+                "items": [{
+                    "title": razon,
+                    "quantity": 1,
+                    "unit_price": float(precio_ars),
                     "currency_id": "ARS"
+                }],
+                "payer": {"email": email} if email else {},
+                "external_reference": f"{usuario_id}|{plan_id}|anual|{cuotas}c",
+                "back_urls": {
+                    "success": "https://juanignaciomanterola.github.io/Rindeagro",
+                    "failure": "https://juanignaciomanterola.github.io/Rindeagro",
+                    "pending": "https://juanignaciomanterola.github.io/Rindeagro"
                 },
-                "back_url": "https://juanignaciomanterola.github.io/Rindeagro",
                 "notification_url": f"{SERVER_URL}/mp/webhook",
-                "payment_methods_allowed": {
-                    "payment_types": [{"id": "credit_card"}, {"id": "debit_card"}]
+                "auto_return": "approved",
+                "installments": cuotas,
+                "payment_methods": {
+                    "excluded_payment_types": [],
+                    "installments": cuotas,
+                    "default_installments": cuotas
                 }
             }
-        )
+            r = await client.post(
+                "https://api.mercadopago.com/checkout/preferences",
+                headers={"Authorization": f"Bearer {MP_ACCESS_TOKEN}", "Content-Type": "application/json"},
+                json=installments_payload
+            )
+        else:
+            # Suscripción mensual recurrente (preapproval_plan)
+            r = await client.post(
+                "https://api.mercadopago.com/preapproval_plan",
+                headers={"Authorization": f"Bearer {MP_ACCESS_TOKEN}", "Content-Type": "application/json"},
+                json={
+                    "reason": razon,
+                    "external_reference": f"{usuario_id}|{plan_id}|mensual",
+                    "auto_recurring": {
+                        "frequency": 1,
+                        "frequency_type": "months",
+                        "transaction_amount": precio_ars,
+                        "currency_id": "ARS"
+                    },
+                    "back_url": "https://juanignaciomanterola.github.io/Rindeagro",
+                    "notification_url": f"{SERVER_URL}/mp/webhook",
+                    "payment_methods_allowed": {
+                        "payment_types": [{"id": "credit_card"}, {"id": "debit_card"}]
+                    }
+                }
+            )
 
-        print(f"MP preapproval_plan response {r.status_code}: {r.text}")
+        print(f"MP response {r.status_code}: {r.text[:300]}")
 
         if r.status_code not in (200, 201):
             raise HTTPException(status_code=500, detail=f"Error MP: {r.text}")
@@ -532,8 +586,13 @@ async def crear_suscripcion(request: Request):
         return {
             "ok": True,
             "init_point": init_point,
-            "plan_mp_id": data.get("id"),
-            "plan": plan_id
+            "plan": plan_id,
+            "precio_usd": precio_usd,
+            "precio_ars": precio_ars,
+            "bna": bna_val,
+            "anual": es_anual,
+            "cuotas": cuotas,
+            "interes_pct": interes
         }
 
 
@@ -588,8 +647,20 @@ async def mp_webhook(request: Request):
 
 @app.get("/mp/planes")
 async def get_planes():
-    """Devuelve los planes disponibles con sus precios"""
-    return {"ok": True, "planes": PLANES}
+    """Devuelve los planes disponibles con sus precios en USD y ARS al BNA del día"""
+    bna, _ = await fetch_dolar_bna()
+    bna_val = bna if bna else cache_precios["bna"]
+
+    planes_con_ars = {}
+    for id, plan in PLANES.items():
+        planes_con_ars[id] = {
+            **plan,
+            "precio_ars": round(plan["precio_usd"] * bna_val),
+            "precio_ars_anual": round(plan["precio_usd_anual"] * bna_val),
+            "bna": bna_val
+        }
+
+    return {"ok": True, "planes": planes_con_ars, "bna": bna_val}
 
 
 # ──────────────────────────────────────────
