@@ -618,6 +618,19 @@ async def get_planes():
 
 
 # ──────────────────────────────────────────
+# ENDPOINT: GET /debug-env (temporal)
+# ──────────────────────────────────────────
+@app.get("/debug-env")
+async def debug_env():
+    token = os.environ.get("MP_ACCESS_TOKEN", "")
+    return {
+        "MP_ACCESS_TOKEN_set": bool(token),
+        "MP_ACCESS_TOKEN_length": len(token),
+        "MP_ACCESS_TOKEN_preview": token[:10] + "..." if token else "VACIO"
+    }
+
+
+# ──────────────────────────────────────────
 # ENDPOINT: GET /health
 # ──────────────────────────────────────────
 @app.get("/health")
