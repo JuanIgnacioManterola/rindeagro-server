@@ -476,9 +476,8 @@ PLANES = {
 
 @app.post("/mp/crear-suscripcion")
 async def crear_suscripcion(request: Request):
-    """Crea una suscripción en Mercado Pago y devuelve la URL de pago"""
+    """Crea un plan de suscripción en Mercado Pago y devuelve la URL de pago"""
     MP_ACCESS_TOKEN = os.environ.get("MP_ACCESS_TOKEN", "")
-    SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
     SERVER_URL = os.environ.get("SERVER_URL", "https://rindeagro-server-production.up.railway.app")
 
     if not MP_ACCESS_TOKEN:
@@ -495,7 +494,7 @@ async def crear_suscripcion(request: Request):
     plan = PLANES[plan_id]
 
     async with httpx.AsyncClient(timeout=15) as client:
-        # 1. Crear preapproval plan (plan de suscripción) en MP
+        # Crear preapproval_plan — MP genera un link de pago donde el usuario ingresa su tarjeta
         r = await client.post(
             "https://api.mercadopago.com/preapproval_plan",
             headers={
@@ -504,6 +503,7 @@ async def crear_suscripcion(request: Request):
             },
             json={
                 "reason": f"RindeAgro · Plan {plan['nombre']}",
+                "external_reference": f"{usuario_id}|{plan_id}",
                 "auto_recurring": {
                     "frequency": 1,
                     "frequency_type": "months",
@@ -511,53 +511,28 @@ async def crear_suscripcion(request: Request):
                     "currency_id": "ARS"
                 },
                 "back_url": "https://juanignaciomanterola.github.io/Rindeagro",
+                "notification_url": f"{SERVER_URL}/mp/webhook",
                 "payment_methods_allowed": {
                     "payment_types": [{"id": "credit_card"}, {"id": "debit_card"}]
                 }
             }
         )
 
+        print(f"MP preapproval_plan response {r.status_code}: {r.text}")
+
         if r.status_code not in (200, 201):
-            print(f"MP error: {r.text}")
-            raise HTTPException(status_code=500, detail="Error creando plan en MP")
+            raise HTTPException(status_code=500, detail=f"Error MP: {r.text}")
 
-        plan_mp = r.json()
-        plan_mp_id = plan_mp.get("id")
+        data = r.json()
+        init_point = data.get("init_point") or data.get("sandbox_init_point")
 
-        # 2. Crear suscripción del usuario a ese plan
-        r2 = await client.post(
-            "https://api.mercadopago.com/preapproval",
-            headers={
-                "Authorization": f"Bearer {MP_ACCESS_TOKEN}",
-                "Content-Type": "application/json"
-            },
-            json={
-                "preapproval_plan_id": plan_mp_id,
-                "reason": f"RindeAgro · Plan {plan['nombre']}",
-                "external_reference": f"{usuario_id}|{plan_id}",
-                "payer_email": email,
-                "auto_recurring": {
-                    "frequency": 1,
-                    "frequency_type": "months",
-                    "transaction_amount": plan["precio"],
-                    "currency_id": "ARS"
-                },
-                "back_url": "https://juanignaciomanterola.github.io/Rindeagro",
-                "status": "pending"
-            }
-        )
-
-        if r2.status_code not in (200, 201):
-            print(f"MP suscripcion error: {r2.text}")
-            raise HTTPException(status_code=500, detail="Error creando suscripción en MP")
-
-        suscripcion = r2.json()
-        init_point = suscripcion.get("init_point")
+        if not init_point:
+            raise HTTPException(status_code=500, detail="MP no devolvió URL de pago")
 
         return {
             "ok": True,
             "init_point": init_point,
-            "suscripcion_id": suscripcion.get("id"),
+            "plan_mp_id": data.get("id"),
             "plan": plan_id
         }
 
