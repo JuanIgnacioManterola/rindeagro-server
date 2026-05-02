@@ -472,11 +472,14 @@ PLANES = {
     "lote":        {"nombre": "Lote",        "precio_usd": 29,  "precio_usd_anual": 278,  "descripcion": "Hasta 5 campos · Todos los módulos · WhatsApp"},
     "agronomo":    {"nombre": "Agrónomo",     "precio_usd": 36,  "precio_usd_anual": 346,  "descripcion": "20 productores · Panel multi-productor"},
     "corporativo": {"nombre": "Corporativo",  "precio_usd": 45,  "precio_usd_anual": 432,  "descripcion": "Campos ilimitados · 5 usuarios"},
+},
+    "agronomo":    {"nombre": "Agrónomo",     "precio": 36,  "descripcion": "20 productores · Panel multi-productor"},
+    "corporativo": {"nombre": "Corporativo",  "precio": 45,  "descripcion": "Campos ilimitados · 5 usuarios"},
 }
 
 @app.post("/mp/crear-suscripcion")
 async def crear_suscripcion(request: Request):
-    """Crea un plan de suscripción en Mercado Pago y devuelve la URL de pago"""
+    """Crea suscripción en MP y devuelve URL de pago"""
     MP_ACCESS_TOKEN = os.environ.get("MP_ACCESS_TOKEN", "")
     SERVER_URL = os.environ.get("SERVER_URL", "https://rindeagro-server-production.up.railway.app")
 
@@ -489,9 +492,7 @@ async def crear_suscripcion(request: Request):
     email = body.get("email")
     es_anual = body.get("anual", False)
     cuotas = int(body.get("cuotas", 1))
-    if not es_anual:
-        cuotas = 1
-    # Validar cuotas
+    if not es_anual: cuotas = 1
     if cuotas < 1: cuotas = 1
     if cuotas > 12: cuotas = 12
 
@@ -500,15 +501,14 @@ async def crear_suscripcion(request: Request):
 
     plan = PLANES[plan_id]
 
-    # Obtener BNA actual
+    # BNA actual
     bna, _ = await fetch_dolar_bna()
     bna_val = bna if bna else cache_precios["bna"]
 
-    # Tabla de intereses por cuotas
+    # Tabla de intereses
     INTERESES = {1:0, 2:0, 3:0, 4:10, 5:14, 6:18, 7:22, 8:26, 9:30, 10:34, 11:38, 12:42}
     interes = INTERESES.get(cuotas, 0) if es_anual else 0
 
-    # Calcular precio en ARS
     if es_anual:
         precio_usd = plan["precio_usd_anual"]
         razon = f"RindeAgro · Plan {plan['nombre']} Anual"
@@ -521,37 +521,23 @@ async def crear_suscripcion(request: Request):
 
     async with httpx.AsyncClient(timeout=15) as client:
         if es_anual:
-            # Pago único con cuotas (preference)
-            installments_payload = {
-                "items": [{
-                    "title": razon,
-                    "quantity": 1,
-                    "unit_price": float(precio_ars),
-                    "currency_id": "ARS"
-                }],
-                "payer": {"email": email} if email else {},
-                "external_reference": f"{usuario_id}|{plan_id}|anual|{cuotas}c",
-                "back_urls": {
-                    "success": "https://juanignaciomanterola.github.io/Rindeagro",
-                    "failure": "https://juanignaciomanterola.github.io/Rindeagro",
-                    "pending": "https://juanignaciomanterola.github.io/Rindeagro"
-                },
-                "notification_url": f"{SERVER_URL}/mp/webhook",
-                "auto_return": "approved",
-                "installments": cuotas,
-                "payment_methods": {
-                    "excluded_payment_types": [],
-                    "installments": cuotas,
-                    "default_installments": cuotas
-                }
-            }
             r = await client.post(
                 "https://api.mercadopago.com/checkout/preferences",
                 headers={"Authorization": f"Bearer {MP_ACCESS_TOKEN}", "Content-Type": "application/json"},
-                json=installments_payload
+                json={
+                    "items": [{"title": razon, "quantity": 1, "unit_price": float(precio_ars), "currency_id": "ARS"}],
+                    "payer": {"email": email} if email else {},
+                    "external_reference": f"{usuario_id}|{plan_id}|anual|{cuotas}c",
+                    "back_urls": {
+                        "success": "https://juanignaciomanterola.github.io/Rindeagro",
+                        "failure": "https://juanignaciomanterola.github.io/Rindeagro",
+                        "pending": "https://juanignaciomanterola.github.io/Rindeagro"
+                    },
+                    "auto_return": "approved",
+                    "payment_methods": {"installments": cuotas, "default_installments": cuotas}
+                }
             )
         else:
-            # Suscripción mensual recurrente (preapproval_plan)
             r = await client.post(
                 "https://api.mercadopago.com/preapproval_plan",
                 headers={"Authorization": f"Bearer {MP_ACCESS_TOKEN}", "Content-Type": "application/json"},
@@ -573,13 +559,11 @@ async def crear_suscripcion(request: Request):
             )
 
         print(f"MP response {r.status_code}: {r.text[:300]}")
-
         if r.status_code not in (200, 201):
             raise HTTPException(status_code=500, detail=f"Error MP: {r.text}")
 
         data = r.json()
         init_point = data.get("init_point") or data.get("sandbox_init_point")
-
         if not init_point:
             raise HTTPException(status_code=500, detail="MP no devolvió URL de pago")
 
@@ -591,8 +575,7 @@ async def crear_suscripcion(request: Request):
             "precio_ars": precio_ars,
             "bna": bna_val,
             "anual": es_anual,
-            "cuotas": cuotas,
-            "interes_pct": interes
+            "cuotas": cuotas
         }
 
 
@@ -647,10 +630,9 @@ async def mp_webhook(request: Request):
 
 @app.get("/mp/planes")
 async def get_planes():
-    """Devuelve los planes disponibles con sus precios en USD y ARS al BNA del día"""
+    """Devuelve los planes con precios en USD y ARS al BNA del día"""
     bna, _ = await fetch_dolar_bna()
     bna_val = bna if bna else cache_precios["bna"]
-
     planes_con_ars = {}
     for id, plan in PLANES.items():
         planes_con_ars[id] = {
@@ -659,21 +641,7 @@ async def get_planes():
             "precio_ars_anual": round(plan["precio_usd_anual"] * bna_val),
             "bna": bna_val
         }
-
     return {"ok": True, "planes": planes_con_ars, "bna": bna_val}
-
-
-# ──────────────────────────────────────────
-# ENDPOINT: GET /debug-env (temporal)
-# ──────────────────────────────────────────
-@app.get("/debug-env")
-async def debug_env():
-    token = os.environ.get("MP_ACCESS_TOKEN", "")
-    return {
-        "MP_ACCESS_TOKEN_set": bool(token),
-        "MP_ACCESS_TOKEN_length": len(token),
-        "MP_ACCESS_TOKEN_preview": token[:10] + "..." if token else "VACIO"
-    }
 
 
 # ──────────────────────────────────────────
