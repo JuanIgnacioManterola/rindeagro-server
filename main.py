@@ -61,26 +61,31 @@ async def _sb_get(table: str, params: dict = None) -> list:
             r = await c.get(f"{_sb_url()}/rest/v1/{table}", headers=_sb_headers(), params=params)
             if r.status_code == 200:
                 return r.json()
+            print(f"[SB GET {table}] HTTP {r.status_code}: {r.text[:200]}")
     except Exception as e:
-        print(f"[SB GET {table}] {e}")
+        print(f"[SB GET {table}] excepción: {e}")
     return []
 
 async def _sb_post(table: str, payload: dict) -> dict:
     try:
         async with httpx.AsyncClient(timeout=10) as c:
             r = await c.post(f"{_sb_url()}/rest/v1/{table}", headers=_sb_headers(), json=payload)
-            data = r.json()
-            return data[0] if isinstance(data, list) and data else (data or {})
+            if r.status_code in (200, 201):
+                data = r.json()
+                return data[0] if isinstance(data, list) and data else (data or {})
+            print(f"[SB POST {table}] HTTP {r.status_code}: {r.text[:200]}")
     except Exception as e:
-        print(f"[SB POST {table}] {e}")
+        print(f"[SB POST {table}] excepción: {e}")
     return {}
 
 async def _sb_patch(path: str, payload: dict):
     try:
         async with httpx.AsyncClient(timeout=10) as c:
-            await c.patch(f"{_sb_url()}/rest/v1/{path}", headers=_sb_headers(), json=payload)
+            r = await c.patch(f"{_sb_url()}/rest/v1/{path}", headers=_sb_headers(), json=payload)
+            if r.status_code not in (200, 204):
+                print(f"[SB PATCH {path}] HTTP {r.status_code}: {r.text[:200]}")
     except Exception as e:
-        print(f"[SB PATCH {path}] {e}")
+        print(f"[SB PATCH {path}] excepción: {e}")
 
 async def _sb_upsert(table: str, payload: dict, on_conflict: str = "") -> list:
     try:
@@ -88,9 +93,11 @@ async def _sb_upsert(table: str, payload: dict, on_conflict: str = "") -> list:
         params = {"on_conflict": on_conflict} if on_conflict else {}
         async with httpx.AsyncClient(timeout=10) as c:
             r = await c.post(f"{_sb_url()}/rest/v1/{table}", headers=h, json=payload, params=params)
-            return r.json()
+            if r.status_code in (200, 201):
+                return r.json()
+            print(f"[SB UPSERT {table}] HTTP {r.status_code}: {r.text[:300]}")
     except Exception as e:
-        print(f"[SB UPSERT {table}] {e}")
+        print(f"[SB UPSERT {table}] excepción: {e}")
     return []
 
 
@@ -1199,6 +1206,72 @@ async def health():
         "timestamp": datetime.now().isoformat(),
         "scheduler": scheduler.running,
     }
+
+
+@app.get("/wa/test")
+async def wa_test():
+    """
+    Diagnóstico rápido de las tablas de WhatsApp en Supabase.
+    Llama a GET /wa/test para ver si las tablas existen y están accesibles.
+    """
+    resultados = {}
+
+    # Test wa_conversaciones
+    async with httpx.AsyncClient(timeout=8) as c:
+        r = await c.get(
+            f"{_sb_url()}/rest/v1/wa_conversaciones",
+            headers=_sb_headers(),
+            params={"limit": "1"},
+        )
+        resultados["wa_conversaciones"] = {
+            "status": r.status_code,
+            "ok": r.status_code == 200,
+            "detalle": r.json() if r.status_code != 200 else f"{len(r.json())} registros",
+        }
+
+    # Test wa_preferencias_notificaciones
+    async with httpx.AsyncClient(timeout=8) as c:
+        r = await c.get(
+            f"{_sb_url()}/rest/v1/wa_preferencias_notificaciones",
+            headers=_sb_headers(),
+            params={"limit": "1"},
+        )
+        resultados["wa_preferencias_notificaciones"] = {
+            "status": r.status_code,
+            "ok": r.status_code == 200,
+            "detalle": r.json() if r.status_code != 200 else f"{len(r.json())} registros",
+        }
+
+    # Test escritura en wa_conversaciones (upsert de un número ficticio)
+    test_payload = {
+        "numero_whatsapp": "test_diagnostico_borrar",
+        "estado": "completado",
+        "datos_parciales": {},
+        "actualizado_en": datetime.utcnow().isoformat(),
+    }
+    h = _sb_headers({"Prefer": "resolution=merge-duplicates,return=representation"})
+    async with httpx.AsyncClient(timeout=8) as c:
+        r = await c.post(
+            f"{_sb_url()}/rest/v1/wa_conversaciones",
+            headers=h,
+            json=test_payload,
+            params={"on_conflict": "numero_whatsapp"},
+        )
+        resultados["wa_conversaciones_escritura"] = {
+            "status": r.status_code,
+            "ok": r.status_code in (200, 201),
+            "detalle": r.json() if r.status_code not in (200, 201) else "ok",
+        }
+        # Limpiar el registro de prueba
+        if r.status_code in (200, 201):
+            await c.delete(
+                f"{_sb_url()}/rest/v1/wa_conversaciones",
+                headers=_sb_headers(),
+                params={"numero_whatsapp": "eq.test_diagnostico_borrar"},
+            )
+
+    todo_ok = all(v["ok"] for v in resultados.values())
+    return {"ok": todo_ok, "supabase_url": _sb_url()[:40] + "...", "tablas": resultados}
 
 
 # ══════════════════════════════════════════════
