@@ -472,9 +472,6 @@ PLANES = {
     "lote":        {"nombre": "Lote",        "precio_usd": 29,  "precio_usd_anual": 278,  "descripcion": "Hasta 5 campos · Todos los módulos · WhatsApp"},
     "agronomo":    {"nombre": "Agrónomo",     "precio_usd": 36,  "precio_usd_anual": 346,  "descripcion": "20 productores · Panel multi-productor"},
     "corporativo": {"nombre": "Corporativo",  "precio_usd": 45,  "precio_usd_anual": 432,  "descripcion": "Campos ilimitados · 5 usuarios"},
-},
-    "agronomo":    {"nombre": "Agrónomo",     "precio": 36,  "descripcion": "20 productores · Panel multi-productor"},
-    "corporativo": {"nombre": "Corporativo",  "precio": 45,  "descripcion": "Campos ilimitados · 5 usuarios"},
 }
 
 @app.post("/mp/crear-suscripcion")
