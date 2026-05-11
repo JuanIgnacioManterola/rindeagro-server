@@ -633,15 +633,36 @@ async def procesar_mensaje_whatsapp(numero: str, texto: str, media_url: str, med
     """Punto central de procesamiento de mensajes WhatsApp entrantes."""
     OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 
-    if not _sb_url() or not _sb_key():
-        return "⚠️ Servidor en configuración. Pronto vas a poder cargar datos por acá."
-
-    # ── 0. STOP / ACTIVAR ───────────────────────────────────────
+    # ── 0. STOP / ACTIVAR (no bloquea aunque Supabase falle) ───────────
     stop_resp = await _manejar_stop_activar(numero, texto)
     if stop_resp:
         return stop_resp
 
-    # ── 1. Identificar usuario ──────────────────────────────────
+    # ── 1. Transcribir audio / PDF antes de cualquier routing ──────────
+    # (no necesita Supabase)
+    texto_final = texto
+    if media_url and "audio" in media_type and OPENAI_API_KEY:
+        texto_final = await transcribir_audio(media_url, OPENAI_API_KEY) or texto
+    if media_url and "pdf" in media_type:
+        texto_final = await extraer_pdf(media_url) or texto
+    if not texto_final:
+        return "No entendí el mensaje. Podés escribir, mandar audio o adjuntar un PDF."
+
+    n = _norm(texto_final)
+
+    # ── 2. Comandos de menú puro → responder sin necesitar Supabase ─────
+    # "hola", "menú", "start", etc. muestran el menú siempre, incluso si
+    # Supabase no está configurado o hay un error de conexión.
+    if n in MENU_WORDS:
+        return MENU_TEXT
+
+    # ── 3. Validar que Supabase esté configurado ────────────────────────
+    # A partir de acá todas las operaciones necesitan la BD.
+    if not _sb_url() or not _sb_key():
+        print(f"[WA] ⚠️ SUPABASE_URL o SUPABASE_SERVICE_KEY no configurados")
+        return MENU_TEXT  # fallback seguro: al menos el usuario ve el menú
+
+    # ── 4. Identificar usuario ──────────────────────────────────────────
     rows = await _sb_get("perfiles", {"whatsapp": f"eq.{numero}", "select": "id,nombre,campos(id,nombre)"})
     if not rows:
         return (
@@ -650,31 +671,16 @@ async def procesar_mensaje_whatsapp(numero: str, texto: str, media_url: str, med
         )
     usuario = rows[0]
 
-    # ── 2. Transcribir audio (Whisper) ──────────────────────────
-    texto_final = texto
-    if media_url and "audio" in media_type and OPENAI_API_KEY:
-        texto_final = await transcribir_audio(media_url, OPENAI_API_KEY) or texto
-
-    # ── 3. Extraer texto de PDF ─────────────────────────────────
-    if media_url and "pdf" in media_type:
-        texto_final = await extraer_pdf(media_url) or texto
-
-    if not texto_final:
-        return "No entendí el mensaje. Podés escribir, mandar audio o adjuntar un PDF."
-
-    # ── 4. ¿Hay una conversación activa? ────────────────────────
+    # ── 5. ¿Hay una conversación activa en curso? ───────────────────────
     conv = await _wa_get_conv(numero)
     if conv:
         return await _procesar_flujo(conv, texto_final, usuario)
 
-    # ── 5. Comandos de menú o selección de opción ───────────────
-    n = _norm(texto_final)
-    if n in MENU_WORDS:
-        return MENU_TEXT
+    # ── 6. Selección de opción del menú principal ───────────────────────
     if n in {"1", "2", "3", "4", "0"}:
         return await _procesar_opcion_menu(n, usuario, numero)
 
-    # ── 6. Mensaje libre → intentar con IA, si falla → menú ────
+    # ── 7. Mensaje libre → intentar con IA; si no → menú ───────────────
     if OPENAI_API_KEY and len(texto_final) > 8:
         resultado = await interpretar_con_ia(texto_final, usuario, OPENAI_API_KEY)
         if resultado and resultado.get("confianza") in ("alta", "media"):
