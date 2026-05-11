@@ -138,11 +138,15 @@ CONV_TIMEOUT_MIN = 30  # minutos sin actividad para resetear
 async def _wa_get_conv(numero: str) -> dict | None:
     """Devuelve la conversación activa del número, o None si no hay o expiró."""
     rows = await _sb_get("wa_conversaciones", {"numero_whatsapp": f"eq.{numero}"})
+    print(f"[DEBUG _wa_get_conv] numero={numero} rows={rows}")
     if not rows:
+        print(f"[DEBUG _wa_get_conv] → sin registro en wa_conversaciones")
         return None
     conv = rows[0]
     estado = conv.get("estado", "completado")
+    print(f"[DEBUG _wa_get_conv] → estado en BD={repr(estado)}")
     if estado == "completado":
+        print(f"[DEBUG _wa_get_conv] → estado=completado, retorna None")
         return None
     # Verificar timeout de 30 minutos
     actualizado = conv.get("actualizado_en", "")
@@ -150,17 +154,21 @@ async def _wa_get_conv(numero: str) -> dict | None:
         try:
             dt = datetime.fromisoformat(actualizado.replace("Z", "+00:00"))
             diff_min = (datetime.now(pytz.utc) - dt).total_seconds() / 60
+            print(f"[DEBUG _wa_get_conv] → antigüedad={diff_min:.1f} min")
             if diff_min > CONV_TIMEOUT_MIN:
+                print(f"[DEBUG _wa_get_conv] → expiró (>{CONV_TIMEOUT_MIN} min), limpiando")
                 await _wa_clear_conv(numero)
                 return None
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[DEBUG _wa_get_conv] → error parseando fecha: {e}")
     conv["numero_whatsapp"] = numero
+    print(f"[DEBUG _wa_get_conv] → conversación activa: estado={estado}")
     return conv
 
 async def _wa_set_conv(numero: str, estado: str, datos: dict = None):
     """Crea o actualiza el estado de conversación."""
-    await _sb_upsert(
+    print(f"[DEBUG _wa_set_conv] numero={numero} estado={repr(estado)} datos={datos}")
+    result = await _sb_upsert(
         "wa_conversaciones",
         {
             "numero_whatsapp": numero,
@@ -170,6 +178,7 @@ async def _wa_set_conv(numero: str, estado: str, datos: dict = None):
         },
         on_conflict="numero_whatsapp",
     )
+    print(f"[DEBUG _wa_set_conv] → resultado upsert: {result}")
 
 async def _wa_clear_conv(numero: str):
     """Marca la conversación como completada (finalizada)."""
@@ -311,15 +320,19 @@ async def _procesar_flujo(conv: dict, texto: str, usuario: dict) -> str:
 
 async def _procesar_opcion_menu(opcion: str, usuario: dict, numero: str) -> str:
     """Arranca el sub-flujo de la opción elegida en el menú principal."""
-    campos = usuario.get("campos", [])
+    campos = usuario.get("campos") or []
+    print(f"[DEBUG _procesar_opcion_menu] opcion={repr(opcion)} campos={[c.get('nombre') for c in campos]} numero={numero}")
 
     if opcion == "1":  # Gasto
         if not campos:
+            print(f"[DEBUG _procesar_opcion_menu] → sin campos, retorna advertencia")
             return "⚠️ No tenés campos registrados. Ingresá a rindeagro.lat para crear uno."
         if len(campos) == 1:
             datos = {"campo_id": campos[0]["id"], "campo_nombre": campos[0]["nombre"]}
+            print(f"[DEBUG _procesar_opcion_menu] → 1 campo, seteando estado=gasto_rubro datos={datos}")
             await _wa_set_conv(numero, "gasto_rubro", datos)
             return f"Campo: *{campos[0]['nombre']}*\n\n¿Qué rubro?\n\n" + "\n".join(f"• {r}" for r in RUBROS)
+        print(f"[DEBUG _procesar_opcion_menu] → {len(campos)} campos, seteando estado=gasto_campo")
         await _wa_set_conv(numero, "gasto_campo", {})
         return "¿En qué campo fue el gasto?\n\n" + "\n".join(f"• {c['nombre']}" for c in campos)
 
@@ -639,6 +652,7 @@ async def whatsapp_webhook(request: Request):
 async def procesar_mensaje_whatsapp(numero: str, texto: str, media_url: str, media_type: str) -> str:
     """Punto central de procesamiento de mensajes WhatsApp entrantes."""
     OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
+    print(f"[DEBUG procesar] numero={numero} texto_raw={repr(texto)} media_type={repr(media_type)}")
 
     # ── 0. STOP / ACTIVAR (no bloquea aunque Supabase falle) ───────────
     stop_resp = await _manejar_stop_activar(numero, texto)
@@ -646,7 +660,6 @@ async def procesar_mensaje_whatsapp(numero: str, texto: str, media_url: str, med
         return stop_resp
 
     # ── 1. Transcribir audio / PDF antes de cualquier routing ──────────
-    # (no necesita Supabase)
     texto_final = texto
     if media_url and "audio" in media_type and OPENAI_API_KEY:
         texto_final = await transcribir_audio(media_url, OPENAI_API_KEY) or texto
@@ -656,35 +669,41 @@ async def procesar_mensaje_whatsapp(numero: str, texto: str, media_url: str, med
         return "No entendí el mensaje. Podés escribir, mandar audio o adjuntar un PDF."
 
     n = _norm(texto_final)
+    print(f"[DEBUG procesar] texto_final={repr(texto_final)} n={repr(n)}")
 
     # ── 2. Comandos de menú puro → responder sin necesitar Supabase ─────
-    # "hola", "menú", "start", etc. muestran el menú siempre, incluso si
-    # Supabase no está configurado o hay un error de conexión.
     if n in MENU_WORDS:
+        print(f"[DEBUG procesar] → es MENU_WORD, retorna menú")
         return MENU_TEXT
 
     # ── 3. Validar que Supabase esté configurado ────────────────────────
-    # A partir de acá todas las operaciones necesitan la BD.
     if not _sb_url() or not _sb_key():
-        print(f"[WA] ⚠️ SUPABASE_URL o SUPABASE_SERVICE_KEY no configurados")
-        return MENU_TEXT  # fallback seguro: al menos el usuario ve el menú
+        print(f"[DEBUG procesar] ⚠️ SUPABASE_URL o SUPABASE_SERVICE_KEY no configurados")
+        return MENU_TEXT
 
     # ── 4. Identificar usuario ──────────────────────────────────────────
     rows = await _sb_get("perfiles", {"whatsapp": f"eq.{numero}", "select": "id,nombre,campos(id,nombre)"})
+    print(f"[DEBUG procesar] perfiles encontrados: {len(rows)} — ids={[r.get('id') for r in rows]}")
     if not rows:
         return (
             f"⚠️ Tu número {numero} no está vinculado a ninguna cuenta RindeAgro.\n"
             "Ingresá a rindeagro.lat y vinculá tu WhatsApp en Configuración."
         )
     usuario = rows[0]
+    campos = usuario.get("campos") or []
+    print(f"[DEBUG procesar] usuario.id={usuario.get('id')} campos={[c.get('nombre') for c in campos]}")
 
     # ── 5. ¿Hay una conversación activa en curso? ───────────────────────
     conv = await _wa_get_conv(numero)
+    print(f"[DEBUG procesar] conversación activa: {conv is not None} — estado={conv.get('estado') if conv else None}")
     if conv:
+        print(f"[DEBUG procesar] → entra a _procesar_flujo")
         return await _procesar_flujo(conv, texto_final, usuario)
 
     # ── 6. Selección de opción del menú principal ───────────────────────
+    print(f"[DEBUG procesar] sin conv activa — n={repr(n)} es_opcion={n in {'1','2','3','4','0'}}")
     if n in {"1", "2", "3", "4", "0"}:
+        print(f"[DEBUG procesar] → entra a _procesar_opcion_menu(opcion={n})")
         return await _procesar_opcion_menu(n, usuario, numero)
 
     # ── 7. Mensaje libre → intentar con IA; si no → menú ───────────────
@@ -693,6 +712,7 @@ async def procesar_mensaje_whatsapp(numero: str, texto: str, media_url: str, med
         if resultado and resultado.get("confianza") in ("alta", "media"):
             return await cargar_en_supabase(resultado, usuario, _sb_url(), _sb_key())
 
+    print(f"[DEBUG procesar] → sin match, retorna menú")
     return MENU_TEXT
 
 
