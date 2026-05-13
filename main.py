@@ -216,7 +216,7 @@ async def _manejar_stop_activar(numero: str, texto: str) -> str | None:
     """Devuelve respuesta si el mensaje es STOP/ACTIVAR, None si no aplica."""
     n = _norm(texto)
     if n in STOP_WORDS or any(sw in n for sw in STOP_WORDS):
-        rows = await _sb_get("perfiles", {"whatsapp": f"eq.{numero}", "select": "id"})
+        rows = await _sb_get("perfiles", {"telefono": f"eq.{numero}", "select": "id"})
         if rows:
             await _sb_patch(
                 f"wa_preferencias_notificaciones?user_id=eq.{rows[0]['id']}",
@@ -228,7 +228,7 @@ async def _manejar_stop_activar(numero: str, texto: str) -> str | None:
             "Si querés volver a activarlos escribí *ACTIVAR* en cualquier momento."
         )
     if n in ACTIVAR_WORDS or any(aw in n for aw in ACTIVAR_WORDS):
-        rows = await _sb_get("perfiles", {"whatsapp": f"eq.{numero}", "select": "id"})
+        rows = await _sb_get("perfiles", {"telefono": f"eq.{numero}", "select": "id"})
         if rows:
             await _sb_patch(
                 f"wa_preferencias_notificaciones?user_id=eq.{rows[0]['id']}",
@@ -682,7 +682,7 @@ async def procesar_mensaje_whatsapp(numero: str, texto: str, media_url: str, med
         return MENU_TEXT
 
     # ── 4. Identificar usuario ──────────────────────────────────────────
-    rows = await _sb_get("perfiles", {"whatsapp": f"eq.{numero}", "select": "id,nombre,campos(id,nombre)"})
+    rows = await _sb_get("perfiles", {"telefono": f"eq.{numero}", "select": "id,nombre,campos(id,nombre)"})
     print(f"[DEBUG procesar] perfiles encontrados: {len(rows)} — ids={[r.get('id') for r in rows]}")
     if not rows:
         return (
@@ -878,11 +878,11 @@ async def _wa_get_destinatarios(flag: str) -> list[dict]:
         uid = p.get("user_id")
         if not uid:
             continue
-        rows = await _sb_get("perfiles", {"id": f"eq.{uid}", "select": "id,nombre,whatsapp"})
-        if rows and rows[0].get("whatsapp"):
+        rows = await _sb_get("perfiles", {"id": f"eq.{uid}", "select": "id,nombre,telefono"})
+        if rows and rows[0].get("telefono"):
             destinatarios.append({
                 "user_id": uid,
-                "numero":  rows[0]["whatsapp"],
+                "numero":  rows[0]["telefono"],
                 "nombre":  rows[0].get("nombre", ""),
             })
     return destinatarios
