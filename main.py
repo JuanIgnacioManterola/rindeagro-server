@@ -711,21 +711,34 @@ async def _kapso_tarea_detalle(ident: dict, numero: str, tarea_id: str) -> None:
         botones.append((f"t_ini:{tarea_id}", "▶️ La empecé"))
     botones.append(("tareas", "Volver"))
     await kapso.enviar_botones(numero, "\n".join(partes), botones)
+    # Queda en foco: si después escribe "la terminé", sabemos de cuál habla.
+    await _wa_set_conv(numero, "k_tarea_activa",
+                       {"tarea_id": tarea_id, "titulo": t.get("titulo") or ""})
 
 
 async def _kapso_tarea_iniciar(ident: dict, numero: str, tarea_id: str) -> None:
     await _sb_patch(f"tareas?id=eq.{tarea_id}", {"estado": "en_progreso"})
-    await kapso.enviar_texto(numero, "Marcada como empezada ▶️\n\nAvisame cuando la termines.")
+    await _wa_set_conv(numero, "k_tarea_activa", {"tarea_id": tarea_id})
+    await kapso.enviar_texto(
+        numero,
+        "Marcada como empezada ▶️\n\nCuando termines escribime *la terminé*. "
+        "Si querés dejar una nota o una foto, mandámela cuando quieras.")
 
 
-async def _kapso_tarea_completar(ident: dict, numero: str, tarea_id: str) -> None:
-    await _sb_patch(f"tareas?id=eq.{tarea_id}", {
+async def _kapso_tarea_completar(ident: dict, numero: str, tarea_id: str, nota: str = "") -> None:
+    payload = {
         "estado": "completada",
         "completada_at": datetime.utcnow().isoformat(),
         "completado_por": ident.get("user_id"),
-    })
+    }
+    if nota:
+        payload["comentario_completado"] = nota[:1000]
+    await _sb_patch(f"tareas?id=eq.{tarea_id}", payload)
     await _wa_set_conv(numero, "k_tarea_evidencia", {"tarea_id": tarea_id})
-    if PEDIR_EVIDENCIA_TAREA:
+
+    if nota:
+        await kapso.enviar_texto(numero, f"Listo ✅ Anoté: _{nota[:200]}_\n\nSi querés sumar una foto, mandala.")
+    elif PEDIR_EVIDENCIA_TAREA:
         await kapso.enviar_texto(numero, "Anotado ✅\n\nMandame una foto o un comentario de cómo quedó.")
     else:
         await kapso.enviar_texto(
@@ -1030,7 +1043,8 @@ async def _kapso_invitar_crear(ident: dict, numero: str, rol_ui: str, datos: dic
 
 # ── Texto libre ───────────────────────────────
 
-async def _kapso_texto_libre(ident: dict, numero: str, texto: str) -> None:
+async def _kapso_texto_libre(ident: dict, numero: str, texto: str,
+                             tarea_activa: dict = None) -> None:
     """
     Intenta resolver el mensaje sin menú: primero lluvia (que es un patrón
     clarísimo), después la IA si está configurada, y si no, el menú.
@@ -1055,6 +1069,13 @@ async def _kapso_texto_libre(ident: dict, numero: str, texto: str) -> None:
             if not await _kapso_pedir_campo(ident, numero, "k_lluvia_campo", datos, f"¿Dónde llovieron {_num(mm)} mm?"):
                 campo_unico = {"id": datos["campo_id"], "nombre": datos["campo_nombre"]}
                 await _kapso_guardar_lluvia(ident, numero, campo_unico, mm)
+            return
+
+    # Claude entiende el resto: "la terminé, anotá que sobró medio bidón"
+    if os.environ.get("ANTHROPIC_API_KEY"):
+        tareas = await _wa_tareas_pendientes(ident)
+        intencion = await _interpretar_con_claude(texto, ident, tareas, tarea_activa)
+        if intencion and await _kapso_aplicar_intencion(ident, numero, intencion):
             return
 
     # IA para gastos dichos en criollo ("gasté 1200 de urea en La Esperanza")
@@ -1124,6 +1145,29 @@ async def _kapso_flujo(ident: dict, numero: str, m, conv: dict) -> None:
     datos = conv.get("datos_parciales") or {}
     accion = m.accion or ""
     texto = m.texto or ""
+
+    if estado == "k_tarea_activa":
+        tid = datos.get("tarea_id")
+        if not tid:
+            await _wa_clear_conv(numero)
+            await _kapso_menu(ident, numero)
+            return
+        if m.tiene_media:
+            await _kapso_tarea_evidencia(ident, numero, m, datos)
+            return
+        n = _norm(texto)
+        if _RE_TERMINE.search(n):
+            await _kapso_tarea_completar(ident, numero, tid, _extraer_nota(texto))
+            return
+        if _RE_ANOTAR.search(n):
+            await _kapso_tarea_nota(ident, numero, tid, _extraer_nota(texto))
+            return
+        if _RE_EMPECE.search(n):
+            await _kapso_tarea_iniciar(ident, numero, tid)
+            return
+        await _kapso_texto_libre(ident, numero, texto,
+                                 {"id": tid, "titulo": datos.get("titulo") or ""})
+        return
 
     if estado == "k_tarea_evidencia":
         await _kapso_tarea_evidencia(ident, numero, m, datos)
@@ -1206,6 +1250,232 @@ async def _kapso_flujo(ident: dict, numero: str, m, conv: dict) -> None:
     await _wa_clear_conv(numero)
     await _kapso_menu(ident, numero)
 
+
+# ── Interpretación de lenguaje natural con Claude ──
+
+MODELO_CLAUDE = os.environ.get("CLAUDE_MODEL", "claude-opus-5")
+
+# Todo lo que el bot sabe hacer. Claude elige una acción y completa los datos.
+ESQUEMA_INTENCION = {
+    "type": "object",
+    "properties": {
+        "accion": {
+            "type": "string",
+            "enum": ["completar_tarea", "iniciar_tarea", "nota_tarea", "ver_tareas",
+                     "gasto", "lluvia", "invitar", "menu", "nada"],
+        },
+        "tarea_id":        {"type": ["string", "null"]},
+        "nota":            {"type": ["string", "null"]},
+        "campo_id":        {"type": ["string", "null"]},
+        "rubro":           {"type": ["string", "null"]},
+        "monto_usd":       {"type": ["number", "null"]},
+        "descripcion":     {"type": ["string", "null"]},
+        "mm":              {"type": ["number", "null"]},
+        "nombre_invitado": {"type": ["string", "null"]},
+        "confianza":       {"type": "string", "enum": ["alta", "media", "baja"]},
+    },
+    "required": ["accion", "tarea_id", "nota", "campo_id", "rubro", "monto_usd",
+                 "descripcion", "mm", "nombre_invitado", "confianza"],
+    "additionalProperties": False,
+}
+
+INSTRUCCIONES_CLAUDE = """Sos el asistente de Rinde.Agro, una app de gestión agropecuaria argentina, \
+atendiendo por WhatsApp a productores y a sus empleados de campo.
+
+Tu trabajo es leer un mensaje escrito como habla la gente en el campo y decidir qué acción corresponde.
+
+Acciones:
+- completar_tarea: dice que terminó/hizo algo. Poné el tarea_id de la lista. Si además comenta algo \
+("la terminé, sobró medio bidón"), ese comentario va en nota.
+- iniciar_tarea: dice que arrancó o está haciendo algo.
+- nota_tarea: quiere dejar un comentario sobre una tarea sin darla por terminada.
+- ver_tareas: pregunta qué tiene pendiente.
+- gasto: compró o pagó algo. monto_usd en dólares, rubro entre herbicidas, fungicidas, insecticidas, \
+fertilizantes, semillas, laboreo, flete u otros. descripcion es el producto.
+- lluvia: llovió. mm es la cantidad.
+- invitar: quiere sumar a alguien al equipo. nombre_invitado es de quién habla.
+- menu: saluda o pide ver las opciones.
+- nada: no se entiende o no tiene que ver con la app.
+
+Reglas:
+- campo_id y tarea_id tienen que ser IDs exactos de las listas de abajo, o null. Nunca inventes uno.
+- Si menciona un campo o una tarea de forma aproximada ("la loma", "lo del silo"), resolvé al ID que \
+corresponda.
+- Si hay una tarea en foco y el mensaje habla de "la tarea", "esto" o "la", se refiere a esa.
+- Los montos son en dólares salvo que diga pesos. Si dice pesos, dejá monto_usd en null.
+- confianza baja si estás adivinando. Ante la duda, poné baja: preferimos preguntar antes que cargar mal.
+- No inventes datos que el mensaje no dice."""
+
+
+def _contexto_para_claude(ident: dict, tareas: list, tarea_activa: dict = None) -> str:
+    partes = []
+    campos = ident.get("campos") or []
+    if campos:
+        partes.append("Campos del productor:")
+        for c in campos:
+            partes.append(f"- id={c['id']} · {c['nombre']}")
+    else:
+        partes.append("El productor no tiene campos cargados.")
+
+    if tareas:
+        partes.append("\nTareas pendientes:")
+        for t in tareas:
+            partes.append(f"- id={t['id']} · {t.get('titulo') or 'sin título'}")
+    else:
+        partes.append("\nNo hay tareas pendientes.")
+
+    if tarea_activa:
+        partes.append(f"\nTarea en foco ahora mismo: id={tarea_activa.get('id')} · "
+                      f"{tarea_activa.get('titulo') or ''}")
+
+    quien = "el dueño de la cuenta" if ident.get("es_dueño") else f"un {ident.get('rol')} del equipo"
+    partes.append(f"\nQuien escribe es {quien}, se llama {ident.get('nombre') or 'sin nombre'}.")
+    return "\n".join(partes)
+
+
+async def _interpretar_con_claude(texto: str, ident: dict, tareas: list,
+                                  tarea_activa: dict = None) -> dict | None:
+    """Traduce un mensaje libre a una acción concreta. None si no hay clave o falla."""
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        return None
+    try:
+        import anthropic
+    except ImportError:
+        print("[CLAUDE] falta el paquete anthropic")
+        return None
+
+    try:
+        cliente = anthropic.AsyncAnthropic()
+        r = await cliente.messages.create(
+            model=MODELO_CLAUDE,
+            max_tokens=1000,
+            system=INSTRUCCIONES_CLAUDE,
+            messages=[{
+                "role": "user",
+                "content": (f"{_contexto_para_claude(ident, tareas, tarea_activa)}\n\n"
+                            f"Mensaje recibido:\n{texto}"),
+            }],
+            output_config={
+                "effort": "low",
+                "format": {"type": "json_schema", "schema": ESQUEMA_INTENCION},
+            },
+        )
+        crudo = next((b.text for b in r.content if b.type == "text"), "")
+        return json.loads(crudo) if crudo else None
+    except Exception as e:
+        print(f"[CLAUDE] error interpretando: {e}")
+        return None
+
+
+async def _kapso_aplicar_intencion(ident: dict, numero: str, intencion: dict) -> bool:
+    """Ejecuta lo que Claude entendió. Devuelve False si no se pudo hacer nada."""
+    accion = intencion.get("accion") or "nada"
+    if accion == "nada" or intencion.get("confianza") == "baja":
+        return False
+
+    ids_campos = {c["id"] for c in ident.get("campos", [])}
+
+    if accion == "menu":
+        await _kapso_menu(ident, numero)
+        return True
+
+    if accion == "ver_tareas":
+        await _kapso_tareas(ident, numero)
+        return True
+
+    if accion in ("completar_tarea", "iniciar_tarea", "nota_tarea"):
+        tid = intencion.get("tarea_id")
+        if not tid:
+            await _kapso_tareas(ident, numero)
+            return True
+        if accion == "iniciar_tarea":
+            await _kapso_tarea_iniciar(ident, numero, tid)
+        elif accion == "nota_tarea":
+            await _kapso_tarea_nota(ident, numero, tid, intencion.get("nota") or "")
+        else:
+            await _kapso_tarea_completar(ident, numero, tid, intencion.get("nota") or "")
+        return True
+
+    if accion == "lluvia" and intencion.get("mm") is not None:
+        if not _wa_puede(ident, "lluvias", "editar"):
+            return False
+        cid = intencion.get("campo_id")
+        if cid in ids_campos:
+            campo = next(c for c in ident["campos"] if c["id"] == cid)
+            await _kapso_guardar_lluvia(ident, numero, campo, float(intencion["mm"]))
+            return True
+        datos = {"mm": float(intencion["mm"])}
+        if await _kapso_pedir_campo(ident, numero, "k_lluvia_campo", datos,
+                                    f"¿Dónde llovieron {_num(intencion['mm'])} mm?"):
+            return True
+        await _kapso_guardar_lluvia(
+            ident, numero, {"id": datos["campo_id"], "nombre": datos["campo_nombre"]},
+            float(intencion["mm"]))
+        return True
+
+    if accion == "gasto" and intencion.get("monto_usd") is not None:
+        if not _wa_puede(ident, "gastos", "editar"):
+            return False
+        datos = {"gasto": {
+            "rubro": (intencion.get("rubro") or "Otros").capitalize(),
+            "descripcion": intencion.get("descripcion") or "",
+            "total_de_usd": float(intencion["monto_usd"]),
+        }}
+        cid = intencion.get("campo_id")
+        if cid in ids_campos:
+            campo = next(c for c in ident["campos"] if c["id"] == cid)
+            datos["campo_id"] = campo["id"]
+            datos["campo_nombre"] = campo["nombre"]
+        elif await _kapso_pedir_campo(ident, numero, "k_gasto_campo", datos, "¿A qué campo lo cargo?"):
+            return True
+
+        if CONFIRMAR_ANTES_DE_GUARDAR:
+            await _wa_set_conv(numero, "k_gasto_confirmar", datos)
+            g = datos["gasto"]
+            await kapso.enviar_botones(
+                numero,
+                f"Entendí esto:\n{g['rubro']} · {g['descripcion']}\n"
+                f"*USD {_num(g['total_de_usd'])}* · {datos['campo_nombre']}\n\n¿Lo cargo así?",
+                [("g_ok", "Sí, cargalo"), ("menu", "Cambiar algo")])
+        else:
+            await _kapso_guardar_gasto(ident, numero, datos)
+        return True
+
+    if accion == "invitar":
+        await _kapso_invitar_inicio(ident, numero, intencion.get("nombre_invitado") or "")
+        return True
+
+    return False
+
+
+async def _kapso_tarea_nota(ident: dict, numero: str, tarea_id: str, nota: str) -> None:
+    """Deja un comentario en una tarea sin cambiarle el estado."""
+    if not nota:
+        await kapso.enviar_texto(numero, "¿Qué querés que anote?")
+        return
+    await _sb_patch(f"tareas?id=eq.{tarea_id}", {"comentario_completado": nota[:1000]})
+    await kapso.enviar_texto(numero, f"Anotado 📝\n\n_{nota[:200]}_")
+
+
+# Frases con las que alguien da por terminada una tarea, sin pasar por Claude.
+_RE_TERMINE = re.compile(
+    r"\b(termin[eé]|termin[oó]|terminad[ao]|complet[eé]|completad[ao]|"
+    r"list[oa]|ya est[aá]|hech[ao]|finalic[eé]|acab[eé]|la hice|lo hice)\b")
+_RE_EMPECE = re.compile(r"\b(empec[eé]|empez[oó]|arranqu[eé]|comenc[eé]|estoy haciendo|en eso)\b")
+_RE_ANOTAR = re.compile(r"\b(anot[aá]|apunt[aá]|agreg[aá]|not[aá]|coment[aá])\w*\s+(que\s+)?")
+
+
+def _extraer_nota(texto: str) -> str:
+    """Saca el comentario de frases tipo 'la terminé, anotá que sobró medio bidón'."""
+    m = _RE_ANOTAR.search(texto)
+    if m:
+        return texto[m.end():].strip(" .,:")
+    # "la terminé, sobró medio bidón" → lo que va después de la coma
+    if "," in texto:
+        cola = texto.split(",", 1)[1].strip(" .,:")
+        if len(cola) > 3:
+            return cola
+    return ""
 
 # ── Router principal ──────────────────────────
 
