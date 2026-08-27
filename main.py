@@ -1071,6 +1071,26 @@ async def _kapso_texto_libre(ident: dict, numero: str, texto: str,
                 await _kapso_guardar_lluvia(ident, numero, campo_unico, mm)
             return
 
+    # Ver tareas
+    if _wa_puede(ident, "tareas") and _RE_VER_TAREAS.search(n) and len(n) < 60:
+        await _kapso_tareas(ident, numero)
+        return
+
+    # Gasto dicho en criollo, sin IA: "gasté 1200 de urea en La Esperanza"
+    if _wa_puede(ident, "gastos", "editar"):
+        parseado = _parsear_gasto(texto, ident.get("campos") or [])
+        if parseado:
+            datos = {"gasto": parseado["gasto"]}
+            campo = parseado.get("campo")
+            if campo:
+                datos["campo_id"] = campo["id"]
+                datos["campo_nombre"] = campo["nombre"]
+                await _kapso_guardar_gasto(ident, numero, datos)
+            elif not await _kapso_pedir_campo(ident, numero, "k_gasto_campo", datos,
+                                              "¿A qué campo lo cargo?"):
+                await _kapso_guardar_gasto(ident, numero, datos)
+            return
+
     # Claude entiende el resto: "la terminé, anotá que sobró medio bidón"
     if os.environ.get("ANTHROPIC_API_KEY"):
         tareas = await _wa_tareas_pendientes(ident)
@@ -1249,6 +1269,130 @@ async def _kapso_flujo(ident: dict, numero: str, m, conv: dict) -> None:
     # Estado desconocido → limpiar y volver al menú
     await _wa_clear_conv(numero)
     await _kapso_menu(ident, numero)
+
+
+# ── Entender sin IA ───────────────────────────
+#
+# La mayoría de los mensajes de campo siguen patrones muy estables. Resolverlos
+# acá evita depender de una clave de API y no cuesta nada por mensaje. Lo que
+# no cae en estos patrones recién ahí va a Claude.
+
+# Producto → rubro. Nombres como los dice la gente, no como figuran en la factura.
+_RUBRO_POR_PRODUCTO = {
+    "herbicidas": ["glifosato", "glifo", "2,4-d", "24d", "dicamba", "atrazina", "acetoclor",
+                   "metolaclor", "s-metolaclor", "sulfentrazone", "flumioxazin", "imazetapir",
+                   "cletodim", "haloxifop", "quizalofop", "bentazon", "saflufenacil", "picloram",
+                   "metsulfuron", "glufosinato", "paraquat", "tembotrione", "herbicida"],
+    "fungicidas": ["mancozeb", "carbendazim", "clorotalonil", "tebuconazole", "epoxiconazole",
+                   "cyproconazole", "azoxistrobina", "piraclostrobina", "trifloxistrobina",
+                   "estrobilurina", "triazol", "carboxamida", "curasemilla", "fungicida"],
+    "insecticidas": ["cipermetrina", "lambdacialotrina", "bifentrin", "deltametrina", "permetrina",
+                     "imidacloprid", "tiametoxam", "acetamiprid", "clotianidina", "clorantraniliprole",
+                     "coragen", "flubendiamide", "belt", "spinosad", "spinetoram", "metoxifenocide",
+                     "lufenuron", "clorpirifos", "dimetoato", "insecticida"],
+    "fertilizantes": ["urea", "uan", "solmix", "sulfato de amonio", "nitrato de amonio", "map", "dap",
+                      "fosfato", "superfosfato", "sfs", "sft", "kcl", "cloruro de potasio", "sulpomag",
+                      "nps", "npk", "starter", "fertilizante", "fertilizante liquido", "nitrogeno",
+                      "azufre", "boro", "zinc"],
+    "semillas": ["semilla", "semillas", "bolsa de soja", "bolsas de soja", "bolsa de maiz",
+                 "bolsas de maiz", "plantin", "simiente"],
+    "laboreo": ["laboreo", "labranza", "siembra", "sembrada", "pulverizacion", "pulverizada",
+                "cosecha", "cosechada", "arada", "rastra", "disco", "contratista"],
+    "flete": ["flete", "fletes", "camion", "camiones", "transporte", "acarreo", "chasis"],
+}
+
+# Verbos con los que se anuncia un gasto.
+_RE_GASTO = re.compile(
+    r"\b(gast[eé]|gast[oó]|compr[eé]|compr[oó]|pagu[eé]|pag[oó]|puse|met[ií]|"
+    r"me sali[oó]|sali[oó]|cost[oó]|invert[ií])\b")
+
+# Plata: 1200 · 1.200 · 1,200 · $1200 · usd 1200 · 1200 dolares · 3 mil
+_NUM = r"\d{1,3}(?:[.,]\d{3})+(?:[.,]\d{1,2})?|\d+(?:[.,]\d{1,2})?"
+_NUM_SUELTO = r"\d{1,3}(?:[.,]\d{3})+(?:[.,]\d{1,2})?|\d{3,}(?:[.,]\d{1,2})?"
+
+_RE_PLATA = re.compile(
+    r"(?:us\$|usd|u\$s|\$)\s*(" + _NUM + r")"
+    r"|(" + _NUM + r")\s*(?:mil\b|k\b|usd|u\$s|d[oó]lares|dolares|verdes|palos)"
+    r"|(" + _NUM_SUELTO + r")")
+
+_RE_PESOS = re.compile(r"\bpesos\b|\bar\$|\$ar\b")
+
+_RE_VER_TAREAS = re.compile(
+    r"(qu[eé] (tengo|hay|me toca|tenemos)|mis tareas|tareas pendientes|"
+    r"pendientes|qu[eé] hacer|para hacer hoy|tarea)")
+
+
+def _parsear_plata(texto: str) -> float | None:
+    """Saca el monto de un mensaje. None si no hay uno claro."""
+    m = _RE_PLATA.search(texto)
+    if not m:
+        return None
+    crudo = m.group(1) or m.group(2) or m.group(3)
+    if not crudo:
+        return None
+
+    # El último separador es decimal solo si le siguen 1 o 2 dígitos:
+    # "1.200" es mil doscientos, "1200.50" son mil doscientos con centavos,
+    # y "1.200,50" es las dos cosas a la vez.
+    dec = re.search(r"[.,](\d{1,2})$", crudo)
+    if dec:
+        entero = re.sub(r"[.,]", "", crudo[:dec.start()])
+        valor = float(f"{entero}.{dec.group(1)}")
+    else:
+        valor = float(re.sub(r"[.,]", "", crudo))
+
+    # "3 mil" / "3k" → 3000
+    cola = texto[m.end():m.end() + 6].lower()
+    if m.group(2) and (cola.startswith(" mil") or cola.startswith("mil") or
+                       cola.startswith("k") or cola.startswith(" k")):
+        valor *= 1000
+    elif re.search(r"\b" + re.escape(crudo) + r"\s*(mil|k)\b", texto.lower()):
+        valor *= 1000
+    return valor
+
+
+def _rubro_por_texto(texto: str) -> tuple:
+    """Devuelve (rubro, producto) mirando qué producto se nombró."""
+    n = _norm(texto)
+    for rubro, palabras in _RUBRO_POR_PRODUCTO.items():
+        for p in palabras:
+            if p in n:
+                return rubro.capitalize(), p
+    return "Otros", ""
+
+
+def _parsear_gasto(texto: str, campos: list) -> dict | None:
+    """
+    "gasté 1200 de urea en La Esperanza" → gasto listo para guardar.
+    None si no parece un gasto o falta el monto.
+    """
+    n = _norm(texto)
+    rubro, producto = _rubro_por_texto(texto)
+    anuncia_gasto = bool(_RE_GASTO.search(n))
+
+    # Sin verbo de gasto y sin producto reconocido, no arriesgamos.
+    if not anuncia_gasto and not producto:
+        return None
+
+    if _RE_PESOS.search(n):
+        return None  # en pesos no sabemos convertir sin preguntar
+
+    monto = _parsear_plata(texto)
+    if monto is None or monto <= 0:
+        return None
+
+    # La descripción es lo que va después de "de"/"en" y antes del campo.
+    desc = producto or ""
+    m = re.search(r"\b(?:de|en|para)\s+([a-záéíóúñ0-9%\s\-\.]{3,40})", n)
+    if m and not desc:
+        desc = m.group(1).strip()
+    campo = _buscar_campo(texto, campos)
+
+    return {
+        "gasto": {"rubro": rubro, "descripcion": (desc or producto or "sin detalle")[:300],
+                  "total_de_usd": monto},
+        "campo": campo,
+    }
 
 
 # ── Interpretación de lenguaje natural con Claude ──
