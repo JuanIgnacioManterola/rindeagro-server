@@ -22,49 +22,63 @@ ejemplo de formato).
 
 ---
 
-## 2. Pasos manuales en Meta (los hacés vos, antes de tocar Kapso)
+## 2. Dos caminos distintos — nosotros vamos por el corto
 
-Según `docs.kapso.ai/docs/how-to/whatsapp/connect-whatsapp`, conectar el número
-**no saltea ningún requisito de Meta**. Hay que tener resuelto:
+Esta es la parte que más fácil se confunde, porque la doc de Kapso documenta
+los dos y las páginas se parecen.
 
-1. **Cuenta de Meta / Facebook** con permisos de administrador.
-2. **Meta Business Portfolio** (Business Manager) completo:
-   - razón social,
-   - domicilio físico,
-   - teléfono de la empresa,
-   - **sitio web público con HTTPS** → `https://rindeagro.app` sirve.
-3. **Verificación de empresa** (Business Verification). Es el paso más lento:
-   Meta pide documentación de la sociedad. Arrancalo primero, tarda días.
-4. **WABA** (WhatsApp Business Account) creada o elegida.
-5. **Display name**: el nombre que ven los usuarios ("Rinde.Agro"). Pasa por
-   revisión de Meta. No elijas la opción "solo display name".
-6. **Método de pago cargado en la WABA.** Sin esto no se manda nada en
-   producción.
-7. **Sin incidencias abiertas** en la sección de números ni en la cuenta.
+### Camino largo — "tu infraestructura" / *Connect WhatsApp*
 
-Ojo con dos límites que aparecen en la doc de Kapso:
+Traés tu propio número y tu propia WABA. Ahí **sí** hacen falta Meta Business
+Portfolio completo, **verificación de empresa** (días, con documentación de la
+sociedad), WABA propia, revisión de display name y método de pago cargado en la
+WABA. La doc es explícita: conectar el número *"no saltea ningún requisito de
+Meta"*.
 
-- Un portfolio nuevo arranca con capacidad para **2 números** registrados. Meta
-  lo sube a 20 después de verificar o de llegar a ciertos volúmenes.
-- Aunque el número quede conectado, *"la revisión del display name, la
-  verificación de empresa, la revisión de la WABA, la elegibilidad de pago, la
-  revisión de plantillas y las restricciones por país o cuenta pueden seguir
-  bloqueando el envío en producción"*.
+**No es nuestro caso.** No hay que hacer nada de esto.
+
+### Camino corto — "infraestructura de Kapso" / *Instant setup* ← el nuestro
+
+Kapso opera su propia Meta app y su propia WABA, y te presta un número de su
+pool. En palabras de la doc de infraestructura de Kapso: *"Kapso runs messaging
+and completes onboarding for you"*, y **los clientes no necesitan su propia
+verificación de empresa con Meta** — se conectan a través del Multi-Partner
+Solution de Kapso.
+
+O sea: **no hay verificación de empresa, no hay Business Manager propio, no hay
+WABA propia, no hay método de pago cargado en Meta.** Eso es lo que hace que el
+salto a producción sea cuestión de horas y no de días.
+
+### Lo que sí hace falta
+
+1. **Salir del plan gratis.** El plan free solo da el número de sandbox. Un
+   número pre-verificado del pool está *"disponible en todos los planes"* pero
+   pide *"un depósito chico que va directo a los créditos del proyecto"*.
+2. **Créditos para los mensajes.** El free incluye 2.000 mensajes por mes con
+   un número conectado; de ahí en adelante se paga por mensaje.
+
+### Lo que no me consta
+
+La doc no aclara qué display name queda en un número del pool ni si cambiarlo
+pasa por revisión de Meta. Si el nombre que ven los usuarios importa para el
+test (y probablemente importe: van a ver quién les escribe), preguntale a
+soporte de Kapso antes de provisionar.
 
 ---
 
 ## 3. Provisionar el número en Kapso
 
 Ya está decidido que aceptamos un **+1 provisionado por Kapso** (no hace falta
-número argentino). Eso es el flujo de **Instant setup**
-(`docs.kapso.ai/docs/platform/phone-numbers/instant-setup`): Kapso provisiona el
-número y, cuando hay disponible, usa uno pre-verificado para que no haya que
-hacer la verificación por SMS o llamada. El default de instant setup es US.
+número argentino). Es el flujo de **Instant setup**
+(`docs.kapso.ai/docs/platform/phone-numbers/instant-setup`): Kapso mantiene un
+pool de números pre-verificados y usa uno de ahí, así no hay que verificar la
+línea por SMS ni por llamada. El default de instant setup es US.
 
 Pasos en el panel de Kapso:
 
-1. Provisionar el número de producción (instant setup).
-2. Anotar su **`phone_number_id`**. Es lo que va en `KAPSO_PHONE_NUMBER_ID`.
+1. Poner el depósito / plan que habilita un número del pool.
+2. Provisionar el número de producción (instant setup).
+3. Anotar su **`phone_number_id`**. Es lo que va en `KAPSO_PHONE_NUMBER_ID`.
    Se puede confirmar por API:
    ```
    GET https://api.kapso.ai/platform/v1/whatsapp/phone_numbers
@@ -182,15 +196,21 @@ equivocada, curiosos y spam. El flujo ahora es:
 
 ## 8. Orden recomendado
 
-1. Verificación de empresa en Meta (arrancá por acá, es lo más lento).
-2. Display name + método de pago en la WABA.
-3. Provisionar el número en Kapso (instant setup, +1).
-4. Crear el webhook **para ese número**, con el `secret_key` que ya usás.
-5. Cambiar `KAPSO_PHONE_NUMBER_ID` en Railway y redeploy.
-6. Verificar con `GET /whatsapp/kapso/estado?numeros=1`:
+Ninguno de estos pasos depende de un trámite lento de Meta. En una tarde se
+hace todo menos las plantillas.
+
+1. Poner el depósito en Kapso que habilita un número del pool.
+2. Provisionar el número +1 (instant setup).
+3. Crear el webhook **para ese número**, con el `secret_key` que ya usás.
+4. Cambiar `KAPSO_PHONE_NUMBER_ID` en Railway y redeploy.
+5. Verificar con `GET /whatsapp/kapso/estado?numeros=1`:
    - `en_uso: true` en el número correcto,
    - `status: "CONNECTED"`,
    - `webhook_secret: true` y sin campo `alerta`.
-7. Probar desde un número que **no** esté en la lista vieja del sandbox.
-8. Cargar las 3 plantillas y esperar la aprobación.
+6. Probar desde un número que **no** esté en la lista vieja del sandbox. Esta es
+   la prueba de fuego: si contesta, el objetivo está cumplido.
+7. Confirmar con Kapso qué display name queda y si se puede cambiar.
+8. Cargar las 3 plantillas y esperar la aprobación de Meta (hasta 24 h). Esto
+   es lo único que tarda, y **no bloquea el test con usuarios**: solo afecta a
+   los recordatorios automáticos.
 9. Migrar los jobs del scheduler a plantillas y apagar Twilio.
