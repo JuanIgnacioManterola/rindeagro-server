@@ -568,8 +568,23 @@ async def _wa_identificar(numero: str) -> dict | None:
         "select": "id,nombre,telefono", "telefono": "not.is.null", "limit": "2000",
     })
     for p in perfiles:
-        if kapso.mismo_numero(p.get("telefono") or "", n):
-            return await _wa_contexto(p["id"], p["id"], p.get("nombre") or "", "dueño", None)
+        if not kapso.mismo_numero(p.get("telefono") or "", n):
+            continue
+        # Tener perfil propio no significa ser dueño: un empleado invitado también
+        # se crea una cuenta al aceptar la invitación. Si es miembro del equipo de
+        # alguien, ese es su contexto — igual que hace la app al armar CONTEXTO.
+        membresias = await _sb_get("equipo", {
+            "miembro_id": f"eq.{p['id']}", "activo": "eq.true",
+            "select": "owner_id,rol,nombre_display,permisos", "limit": "1",
+        })
+        if membresias:
+            e = membresias[0]
+            return await _wa_contexto(
+                p["id"], e["owner_id"],
+                e.get("nombre_display") or p.get("nombre") or "",
+                e.get("rol") or "colaborador", e.get("permisos") or {},
+            )
+        return await _wa_contexto(p["id"], p["id"], p.get("nombre") or "", "dueño", None)
 
     miembros = await _sb_get("equipo", {
         "select": "id,owner_id,miembro_id,rol,nombre_display,whatsapp,permisos,activo",
