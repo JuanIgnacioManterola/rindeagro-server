@@ -7,6 +7,8 @@ from datetime import datetime, date, timedelta
 import os
 import json
 import re
+import hmac
+import hashlib
 import time
 from bs4 import BeautifulSoup
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -2540,154 +2542,894 @@ async def _wa_check_alertas_precio():
 
 
 # ══════════════════════════════════════════════
-# MERCADO PAGO — SUSCRIPCIONES
+# MERCADO PAGO — SUSCRIPCIONES (preapproval / débito automático)
+# ══════════════════════════════════════════════
+#
+# Arquitectura (ver CLAUDE.md → "Suscripciones y cobro"):
+#   preapproval SIN plan asociado, status 'pending' → devuelve init_point →
+#   el usuario carga la tarjeta EN EL SITIO DE MERCADO PAGO → MP nos avisa por
+#   webhook. Elegimos preapproval sin plan porque el monto en ARS sale de
+#   USD × dólar BNA vendedor + IVA, o sea que es distinto para cada usuario
+#   según el día del alta: un preapproval_plan es un monto fijo compartido.
+#
+# El WEBHOOK es la única fuente de verdad del plan. El redirect de vuelta a la
+# app (back_url) NO otorga nada: solo muestra "estamos confirmando tu pago".
+#
+# Ninguna de estas rutas ve datos de tarjeta. Todo dato sensible queda en MP.
+
+MP_API = "https://api.mercadopago.com"
+
+# Espejo de PLANES_INFO en index.html. Si tocás precios allá, tocá acá.
+# El límite de hectáreas lo aplica el frontend; acá está solo para el
+# endpoint /mp/planes que alimenta la landing.
+PLANES = {
+    "semilla":     {"nombre": "Semilla",     "usd_mensual": 35,  "limite_hectareas": 500,   "descripcion": "Hasta 500 hectáreas"},
+    "germinacion": {"nombre": "Germinación", "usd_mensual": 50,  "limite_hectareas": 1000,  "descripcion": "De 500 a 1.000 hectáreas"},
+    "floracion":   {"nombre": "Floración",   "usd_mensual": 65,  "limite_hectareas": 2000,  "descripcion": "De 1.000 a 2.000 hectáreas"},
+    "maduracion":  {"nombre": "Maduración",  "usd_mensual": 80,  "limite_hectareas": 5000,  "descripcion": "De 2.000 a 5.000 hectáreas"},
+    "cosecha":     {"nombre": "Cosecha",     "usd_mensual": 110, "limite_hectareas": 10000, "descripcion": "De 5.000 a 10.000 hectáreas"},
+}
+
+IVA_PCT = 21
+DESCUENTO_ANUAL_PCT = 20   # anual = mensual × 12 × 0.8
+DIAS_GRACIA = 10           # días de acceso completo tras un cobro fallido
+
+# Estados de suscripciones.estado que consideramos "viva" (ocupan el índice
+# único parcial idx_suscripciones_una_viva).
+ESTADOS_VIVOS = ("pendiente", "activa", "en_gracia", "impaga", "pausada")
+
+# Orígenes a los que aceptamos volver después del checkout. Evita que alguien
+# nos use de open redirect metiendo su propio back_url en el body.
+ORIGENES_RETORNO = {
+    "https://rindeagro.app",
+    "https://www.rindeagro.app",
+    "https://juanignaciomanterola.github.io",
+    "http://localhost:8787",
+    "http://127.0.0.1:8787",
+}
+
+# UUIDs con acceso a los endpoints /mp/admin/*. Espejo de
+# USUARIOS_ADMIN_ILIMITADOS en index.html.
+ADMIN_USER_IDS = [
+    x.strip() for x in os.environ.get(
+        "ADMIN_USER_IDS", "ea80343b-b31d-4cba-a43e-00c3f0a3fa39"
+    ).split(",") if x.strip()
+]
+
+
+def _mp_token() -> str:
+    return os.environ.get("MP_ACCESS_TOKEN", "")
+
+
+def _mp_secret() -> str:
+    return os.environ.get("MP_WEBHOOK_SECRET", "")
+
+
+def _mp_entorno() -> str:
+    """Los access token de sandbox de MP empiezan con TEST-."""
+    return "test" if _mp_token().startswith("TEST-") else "prod"
+
+
+def _mp_headers(idem: str = "") -> dict:
+    h = {"Authorization": f"Bearer {_mp_token()}", "Content-Type": "application/json"}
+    if idem:
+        h["X-Idempotency-Key"] = idem
+    return h
+
+
+def _ahora_utc() -> datetime:
+    return datetime.now(pytz.UTC)
+
+
+def _iso(d) -> str | None:
+    return d.isoformat() if d else None
+
+
+def _parse_fecha(v):
+    """MP devuelve ISO8601 con offset (2026-09-07T11:00:00.000-04:00)."""
+    if not v:
+        return None
+    try:
+        return datetime.fromisoformat(str(v).replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
+# ── Cotización ───────────────────────────────────────────────────────────────
+
+async def _dolar_venta_bna() -> float:
+    """
+    Dólar DIVISA VENDEDOR del BNA — el mismo que muestra el frontend en las
+    tarjetas de plan (window._dolarVenta()). Sale de la vista
+    v_precio_dolar_actual que llena el cron de Supabase. Si esa vista no
+    responde caemos al scraper genérico para no dejar el checkout muerto.
+    """
+    filas = await _sb_get("v_precio_dolar_actual", {"select": "divisa_venta", "limit": "1"})
+    if filas:
+        try:
+            v = float(filas[0].get("divisa_venta") or 0)
+            if 100 < v < 100000:
+                return round(v, 2)
+        except Exception:
+            pass
+    bna, _ = await fetch_dolar_bna()
+    return float(bna or cache_precios["bna"])
+
+
+def _precio(plan_id: str, periodo: str, bna: float) -> tuple[int, int, int]:
+    """
+    Devuelve (usd_base_sin_iva, usd_con_iva, ars_final).
+
+    El redondeo replica EXACTAMENTE el de renderTarjetasPlanes() en
+    index.html: se redondea el USD con IVA a entero y recién ahí se
+    multiplica por el TC. Si no, el importe que MP debita no coincide con
+    el que el usuario vio en la tarjeta.
+    """
+    p = PLANES[plan_id]
+    mensual = p["usd_mensual"]
+    if periodo == "anual":
+        usd_base = round(mensual * 12 * (1 - DESCUENTO_ANUAL_PCT / 100))
+    else:
+        usd_base = mensual
+    usd_con_iva = round(usd_base * (1 + IVA_PCT / 100))
+    ars = round(usd_con_iva * bna)
+    return int(usd_base), int(usd_con_iva), int(ars)
+
+
+def _frecuencia(periodo: str) -> dict:
+    """
+    Anual = un preapproval cada 12 meses (estándar Stripe/Paddle: una sola
+    rail de pago, se auto-renueva y se cancela sola desde la app). MP
+    Suscripciones no soporta cuotas; si algún día queremos anual en cuotas
+    va por Checkout Pro como proveedor aparte.
+    """
+    return {"frequency": 12 if periodo == "anual" else 1, "frequency_type": "months"}
+
+
+# ── Auth ─────────────────────────────────────────────────────────────────────
+
+async def _auth_user(request: Request) -> dict:
+    """
+    Valida el JWT de Supabase que manda el frontend en Authorization.
+    NUNCA confiamos en un usuario_id que venga en el body: con eso cualquiera
+    le regalaría un plan a otra cuenta (o a la propia).
+    """
+    authz = request.headers.get("authorization", "")
+    if not authz.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="Falta el token de sesión.")
+    token = authz[7:].strip()
+    try:
+        async with httpx.AsyncClient(timeout=10) as c:
+            r = await c.get(
+                f"{_sb_url()}/auth/v1/user",
+                headers={"apikey": _sb_key(), "Authorization": f"Bearer {token}"},
+            )
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"No pudimos validar la sesión: {e}")
+    if r.status_code != 200:
+        raise HTTPException(status_code=401, detail="Sesión inválida o vencida.")
+    u = r.json()
+    if not u.get("id"):
+        raise HTTPException(status_code=401, detail="Sesión inválida.")
+    return u
+
+
+def _validar_retorno(url: str) -> str:
+    """
+    El frontend manda su propio origin+pathname (nunca hardcodeamos la URL de
+    la app — romper eso rompe rindeagro.app). Acá solo verificamos que sea un
+    origen nuestro y le sacamos query y fragment.
+    """
+    from urllib.parse import urlparse
+    if not url:
+        return APP_URL
+    try:
+        p = urlparse(url)
+        origen = f"{p.scheme}://{p.netloc}"
+        if origen not in ORIGENES_RETORNO:
+            print(f"[MP] back_url rechazada (origen no permitido): {url}")
+            return APP_URL
+        return origen + (p.path or "/")
+    except Exception:
+        return APP_URL
+
+
+# ── Estado / plan efectivo ───────────────────────────────────────────────────
+
+def _plan_efectivo(sub: dict | None) -> str:
+    """
+    Qué plan le corresponde HOY al usuario según su suscripción.
+    Espejo de window._planEfectivo() en index.html — si cambiás uno, cambiá
+    el otro.
+    """
+    if not sub:
+        return "gratis"
+    estado = sub.get("estado")
+    plan = sub.get("plan") or "gratis"
+    if estado in ("activa", "en_gracia"):
+        return plan
+    if estado == "cancelada":
+        # Se dio de baja pero ya pagó el período en curso: conserva el plan
+        # hasta que termine. Estándar de la industria.
+        fin = _parse_fecha(sub.get("periodo_fin"))
+        if fin and fin > _ahora_utc():
+            return plan
+    return "gratis"
+
+
+async def _sub_vigente(owner_id: str) -> dict | None:
+    filas = await _sb_get("suscripciones", {
+        "owner_id": f"eq.{owner_id}",
+        "estado": f"in.({','.join(ESTADOS_VIVOS)})",
+        "order": "created_at.desc",
+        "limit": "1",
+    })
+    return filas[0] if filas else None
+
+
+async def _sub_por_preapproval(preapproval_id: str) -> dict | None:
+    filas = await _sb_get("suscripciones", {
+        "proveedor_id": f"eq.{preapproval_id}", "limit": "1",
+    })
+    return filas[0] if filas else None
+
+
+async def _sync_metadata_plan(owner_id: str, sub: dict | None):
+    """
+    Espeja el plan efectivo en auth.users.user_metadata para que el código
+    viejo que lee usuario.user_metadata.plan siga andando. Es un CACHE, no la
+    fuente de verdad: la app calcula el plan desde la tabla suscripciones.
+
+    Leemos primero el user completo y reescribimos el metadata mergeado, para
+    no pisar nombre / telefono / trial_inicio.
+    """
+    plan = _plan_efectivo(sub)
+    try:
+        async with httpx.AsyncClient(timeout=10) as c:
+            r = await c.get(
+                f"{_sb_url()}/auth/v1/admin/users/{owner_id}",
+                headers={"apikey": _sb_key(), "Authorization": f"Bearer {_sb_key()}"},
+            )
+            meta = (r.json().get("user_metadata") or {}) if r.status_code == 200 else {}
+            meta["plan"] = plan
+            meta["suscripcion_estado"] = (sub or {}).get("estado") or "sin_suscripcion"
+            r2 = await c.put(
+                f"{_sb_url()}/auth/v1/admin/users/{owner_id}",
+                headers={
+                    "apikey": _sb_key(),
+                    "Authorization": f"Bearer {_sb_key()}",
+                    "Content-Type": "application/json",
+                },
+                json={"user_metadata": meta},
+            )
+            if r2.status_code not in (200, 201):
+                print(f"[MP] sync metadata {owner_id} HTTP {r2.status_code}: {r2.text[:200]}")
+            else:
+                print(f"[MP] metadata sincronizado: {owner_id} → plan {plan}")
+    except Exception as e:
+        print(f"[MP] sync metadata excepción: {e}")
+
+
+# ══════════════════════════════════════════════
+# POST /mp/suscripcion/crear
 # ══════════════════════════════════════════════
 
-PLANES = {
-    "lote":        {"nombre": "Lote",        "precio_usd": 29,  "precio_usd_anual": 278,  "descripcion": "Hasta 5 campos · Todos los módulos · WhatsApp"},
-    "agronomo":    {"nombre": "Agrónomo",     "precio_usd": 36,  "precio_usd_anual": 346,  "descripcion": "20 productores · Panel multi-productor"},
-    "corporativo": {"nombre": "Corporativo",  "precio_usd": 45,  "precio_usd_anual": 432,  "descripcion": "Campos ilimitados · 5 usuarios"},
+@app.post("/mp/suscripcion/crear")
+async def mp_crear_suscripcion(request: Request):
+    if not _mp_token():
+        raise HTTPException(status_code=503, detail="MP_ACCESS_TOKEN no está configurado en el server.")
+
+    user = await _auth_user(request)
+    owner_id = user["id"]
+    email = user.get("email") or ""
+
+    body    = await request.json()
+    plan_id = (body.get("plan") or "").strip()
+    periodo = (body.get("periodo") or "mensual").strip()
+    retorno = _validar_retorno(body.get("retorno_url") or "")
+
+    if plan_id not in PLANES:
+        raise HTTPException(status_code=400, detail="Plan inválido.")
+    if periodo not in ("mensual", "anual"):
+        raise HTTPException(status_code=400, detail="Período inválido.")
+
+    # Si ya tiene una suscripción cobrando, esto es un cambio de plan.
+    vigente = await _sub_vigente(owner_id)
+    if vigente and vigente.get("estado") in ("activa", "en_gracia", "pausada"):
+        raise HTTPException(
+            status_code=409,
+            detail="Ya tenés una suscripción activa. Usá /mp/suscripcion/cambiar-plan.",
+        )
+
+    bna = await _dolar_venta_bna()
+    usd_base, usd_con_iva, ars = _precio(plan_id, periodo, bna)
+
+    plan = PLANES[plan_id]
+    # Es lo que el usuario ve en el checkout de Mercado Pago y en el resumen
+    # de la tarjeta: marca "Rinde Agro" (con espacio, sin punto).
+    razon = f"Rinde Agro · Plan {plan['nombre']} {'Anual' if periodo == 'anual' else 'Mensual'}"
+    ext_ref = f"{owner_id}|{plan_id}|{periodo}"
+
+    payload = {
+        "reason": razon,
+        "external_reference": ext_ref,
+        "payer_email": email,
+        "back_url": retorno,
+        "status": "pending",   # el usuario carga la tarjeta en el checkout de MP
+        "auto_recurring": {
+            **_frecuencia(periodo),
+            "transaction_amount": float(ars),
+            "currency_id": "ARS",
+        },
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=20) as c:
+            r = await c.post(
+                f"{MP_API}/preapproval",
+                headers=_mp_headers(idem=f"{owner_id}:{plan_id}:{periodo}:{int(time.time())}"),
+                json=payload,
+            )
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"No pudimos contactar a Mercado Pago: {e}")
+
+    if r.status_code not in (200, 201):
+        print(f"[MP] POST /preapproval HTTP {r.status_code}: {r.text[:500]}")
+        raise HTTPException(status_code=502, detail=f"Mercado Pago rechazó la suscripción: {r.text[:300]}")
+
+    mp = r.json()
+    init_point = mp.get("init_point") or mp.get("sandbox_init_point")
+    if not init_point:
+        raise HTTPException(status_code=502, detail="Mercado Pago no devolvió el link de pago.")
+
+    # Cerrar cualquier intento anterior que quedó 'pendiente' (el índice único
+    # parcial deja una sola suscripción viva por usuario).
+    if vigente and vigente.get("estado") == "pendiente":
+        await _sb_patch(f"suscripciones?id=eq.{vigente['id']}",
+                        {"estado": "cancelada", "cancelada_en": _iso(_ahora_utc())})
+
+    fila = await _sb_post("suscripciones", {
+        "owner_id": owner_id,
+        "plan": plan_id,
+        "periodo": periodo,
+        "estado": "pendiente",
+        "proveedor": "mercadopago",
+        "proveedor_id": str(mp.get("id")),
+        "external_reference": ext_ref,
+        "init_point": init_point,
+        "entorno": _mp_entorno(),
+        "importe_ars": ars,
+        "moneda": "ARS",
+        "importe_usd": usd_base,
+        "iva_pct": IVA_PCT,
+        "tc_alta": bna,
+        "raw": mp,
+    })
+
+    print(f"[MP] preapproval {mp.get('id')} creado para {owner_id} · {plan_id}/{periodo} · ARS {ars}")
+
+    return {
+        "ok": True,
+        "init_point": init_point,
+        "preapproval_id": mp.get("id"),
+        "suscripcion_id": (fila or {}).get("id"),
+        "plan": plan_id,
+        "periodo": periodo,
+        "importe_ars": ars,
+        "importe_usd": usd_base,
+        "importe_usd_con_iva": usd_con_iva,
+        "bna": bna,
+        "entorno": _mp_entorno(),
+    }
+
+
+# ══════════════════════════════════════════════
+# POST /mp/suscripcion/cambiar-plan
+# ══════════════════════════════════════════════
+
+@app.post("/mp/suscripcion/cambiar-plan")
+async def mp_cambiar_plan(request: Request):
+    """
+    Mismo período → PUT del monto sobre el preapproval existente (el usuario
+    no vuelve a cargar la tarjeta).
+    Cambio de período (mensual ↔ anual) → hay que cancelar y crear una
+    suscripción nueva, porque la frecuencia no se puede cambiar en caliente.
+    """
+    if not _mp_token():
+        raise HTTPException(status_code=503, detail="MP_ACCESS_TOKEN no está configurado en el server.")
+
+    user     = await _auth_user(request)
+    owner_id = user["id"]
+    body     = await request.json()
+    plan_id  = (body.get("plan") or "").strip()
+    periodo  = (body.get("periodo") or "").strip()
+
+    if plan_id not in PLANES:
+        raise HTTPException(status_code=400, detail="Plan inválido.")
+
+    sub = await _sub_vigente(owner_id)
+    if not sub or sub.get("estado") not in ("activa", "en_gracia", "pausada"):
+        raise HTTPException(status_code=404, detail="No tenés una suscripción activa para cambiar.")
+
+    periodo = periodo or sub.get("periodo") or "mensual"
+    if periodo not in ("mensual", "anual"):
+        raise HTTPException(status_code=400, detail="Período inválido.")
+
+    if periodo != sub.get("periodo"):
+        return {
+            "ok": False,
+            "requiere_nuevo_checkout": True,
+            "detalle": "Cambiar entre mensual y anual necesita dar de baja la suscripción actual y contratar de nuevo.",
+        }
+
+    bna = await _dolar_venta_bna()
+    usd_base, usd_con_iva, ars = _precio(plan_id, periodo, bna)
+
+    try:
+        async with httpx.AsyncClient(timeout=20) as c:
+            r = await c.put(
+                f"{MP_API}/preapproval/{sub['proveedor_id']}",
+                headers=_mp_headers(),
+                json={
+                    "reason": f"Rinde Agro · Plan {PLANES[plan_id]['nombre']} {periodo.capitalize()}",
+                    "auto_recurring": {"transaction_amount": float(ars), "currency_id": "ARS"},
+                },
+            )
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"No pudimos contactar a Mercado Pago: {e}")
+
+    if r.status_code not in (200, 201):
+        print(f"[MP] PUT /preapproval/{sub['proveedor_id']} HTTP {r.status_code}: {r.text[:400]}")
+        raise HTTPException(status_code=502, detail=f"Mercado Pago rechazó el cambio: {r.text[:300]}")
+
+    await _sb_patch(f"suscripciones?id=eq.{sub['id']}", {
+        "plan": plan_id,
+        "importe_ars": ars,
+        "importe_usd": usd_base,
+        "tc_alta": bna,
+        "external_reference": f"{owner_id}|{plan_id}|{periodo}",
+        "raw": r.json(),
+    })
+    actualizada = await _sub_vigente(owner_id)
+    await _sync_metadata_plan(owner_id, actualizada)
+
+    print(f"[MP] {owner_id} cambió a {plan_id}/{periodo} · ARS {ars}")
+    return {"ok": True, "plan": plan_id, "periodo": periodo, "importe_ars": ars, "bna": bna}
+
+
+# ══════════════════════════════════════════════
+# POST /mp/suscripcion/cancelar
+# ══════════════════════════════════════════════
+
+@app.post("/mp/suscripcion/cancelar")
+async def mp_cancelar_suscripcion(request: Request):
+    """
+    Baja autogestionada. MP deja de cobrar ya, pero el usuario conserva el
+    plan hasta el final del período que ya pagó (periodo_fin) — el
+    _plan_efectivo() lo contempla.
+    """
+    if not _mp_token():
+        raise HTTPException(status_code=503, detail="MP_ACCESS_TOKEN no está configurado en el server.")
+
+    user     = await _auth_user(request)
+    owner_id = user["id"]
+    sub      = await _sub_vigente(owner_id)
+    if not sub:
+        raise HTTPException(status_code=404, detail="No tenés una suscripción para dar de baja.")
+
+    pid = sub.get("proveedor_id")
+    if pid:
+        async with httpx.AsyncClient(timeout=20) as c:
+            r = await c.put(f"{MP_API}/preapproval/{pid}", headers=_mp_headers(), json={"status": "cancelled"})
+            # La doc de MP escribe el valor de las dos formas según la página.
+            if r.status_code not in (200, 201):
+                r = await c.put(f"{MP_API}/preapproval/{pid}", headers=_mp_headers(), json={"status": "canceled"})
+            if r.status_code not in (200, 201):
+                print(f"[MP] cancelar {pid} HTTP {r.status_code}: {r.text[:400]}")
+                raise HTTPException(status_code=502, detail=f"Mercado Pago no pudo cancelar: {r.text[:300]}")
+
+    # Si nunca llegó a cobrarse (estado pendiente), la baja es inmediata.
+    fin = _parse_fecha(sub.get("proximo_cobro")) or _parse_fecha(sub.get("periodo_fin"))
+    patch = {"estado": "cancelada", "cancelada_en": _iso(_ahora_utc())}
+    if sub.get("estado") in ("activa", "en_gracia") and fin:
+        patch["periodo_fin"] = _iso(fin)
+    await _sb_patch(f"suscripciones?id=eq.{sub['id']}", patch)
+
+    nueva = {**sub, **patch}
+    await _sync_metadata_plan(owner_id, nueva)
+
+    print(f"[MP] {owner_id} dio de baja la suscripción {pid}")
+    return {
+        "ok": True,
+        "acceso_hasta": patch.get("periodo_fin"),
+        "plan_efectivo": _plan_efectivo(nueva),
+    }
+
+
+# ══════════════════════════════════════════════
+# POST /mp/webhook — fuente de verdad del plan
+# ══════════════════════════════════════════════
+
+def _validar_firma_mp(request: Request, data_id: str) -> bool:
+    """
+    x-signature: 'ts=1742505638683,v1=<hex>'
+    manifest:    'id:<data.id>;request-id:<x-request-id>;ts:<ts>;'
+    HMAC-SHA256 hex con MP_WEBHOOK_SECRET (Tus integraciones → Webhooks).
+    Los tramos cuyo valor no viene se omiten del manifest.
+    """
+    secret = _mp_secret()
+    if not secret:
+        return False
+
+    firma = request.headers.get("x-signature", "")
+    req_id = request.headers.get("x-request-id", "")
+    ts = v1 = ""
+    for parte in firma.split(","):
+        if "=" not in parte:
+            continue
+        k, _, v = parte.partition("=")
+        k, v = k.strip(), v.strip()
+        if k == "ts":
+            ts = v
+        elif k == "v1":
+            v1 = v
+    if not ts or not v1:
+        return False
+
+    manifest = ""
+    if data_id:
+        manifest += f"id:{data_id};"
+    if req_id:
+        manifest += f"request-id:{req_id};"
+    manifest += f"ts:{ts};"
+
+    esperado = hmac.new(secret.encode(), manifest.encode(), hashlib.sha256).hexdigest()
+    return hmac.compare_digest(esperado, v1)
+
+
+async def _mp_get(path: str) -> dict | None:
+    try:
+        async with httpx.AsyncClient(timeout=15) as c:
+            r = await c.get(f"{MP_API}{path}", headers=_mp_headers())
+        if r.status_code == 200:
+            return r.json()
+        print(f"[MP] GET {path} HTTP {r.status_code}: {r.text[:300]}")
+    except Exception as e:
+        print(f"[MP] GET {path} excepción: {e}")
+    return None
+
+
+# Mapa status de MP → estado nuestro. 'pending' se queda esperando la tarjeta.
+_MAP_ESTADO_MP = {
+    "authorized": "activa",
+    "pending":    "pendiente",
+    "paused":     "pausada",
+    "cancelled":  "cancelada",
+    "canceled":   "cancelada",
+    "finished":   "cancelada",
 }
 
 
-@app.post("/mp/crear-suscripcion")
-async def crear_suscripcion(request: Request):
-    MP_ACCESS_TOKEN = os.environ.get("MP_ACCESS_TOKEN", "")
-    SERVER_URL      = os.environ.get("SERVER_URL", "https://rindeagro-server-production.up.railway.app")
+async def _procesar_preapproval(preapproval_id: str):
+    mp = await _mp_get(f"/preapproval/{preapproval_id}")
+    if not mp:
+        return
 
-    if not MP_ACCESS_TOKEN:
-        raise HTTPException(status_code=500, detail="MP_ACCESS_TOKEN no configurado")
+    ext = mp.get("external_reference") or ""
+    partes = ext.split("|")
+    owner_id = partes[0] if partes else ""
+    plan_id  = partes[1] if len(partes) > 1 else ""
+    periodo  = partes[2] if len(partes) > 2 else "mensual"
 
-    body     = await request.json()
-    plan_id  = body.get("plan")
-    usuario_id = body.get("usuario_id")
-    email    = body.get("email")
-    es_anual = body.get("anual", False)
-    cuotas   = int(body.get("cuotas", 1))
-    if not es_anual: cuotas = 1
-    cuotas = max(1, min(12, cuotas))
+    sub = await _sub_por_preapproval(str(preapproval_id))
+    if not sub and not owner_id:
+        print(f"[MP] preapproval {preapproval_id} sin suscripción local ni external_reference — ignorado")
+        return
+    owner_id = owner_id or sub.get("owner_id")
 
-    if plan_id not in PLANES:
-        raise HTTPException(status_code=400, detail="Plan inválido")
+    estado = _MAP_ESTADO_MP.get(mp.get("status"), "pendiente")
+    prox   = _parse_fecha(mp.get("next_payment_date"))
+    ini    = _parse_fecha((mp.get("auto_recurring") or {}).get("start_date")) or _parse_fecha(mp.get("date_created"))
 
-    plan = PLANES[plan_id]
-    bna, _ = await fetch_dolar_bna()
-    bna_val = bna if bna else cache_precios["bna"]
+    patch = {
+        "estado": estado,
+        "proveedor_payer_id": str(mp.get("payer_id") or "") or None,
+        "proximo_cobro": _iso(prox),
+        "periodo_inicio": _iso(ini),
+        "periodo_fin": _iso(prox),
+        "raw": mp,
+    }
+    if estado == "activa":
+        # Volvió a estar al día: se limpia la gracia.
+        patch["gracia_hasta"] = None
+    if estado == "cancelada":
+        patch["cancelada_en"] = _iso(_ahora_utc())
 
-    INTERESES = {1:0, 2:0, 3:0, 4:10, 5:14, 6:18, 7:22, 8:26, 9:30, 10:34, 11:38, 12:42}
-    interes = INTERESES.get(cuotas, 0) if es_anual else 0
-
-    if es_anual:
-        precio_usd = plan["precio_usd_anual"]
-        razon = f"Rinde Agro · Plan {plan['nombre']} Anual"
+    if sub:
+        await _sb_patch(f"suscripciones?id=eq.{sub['id']}", patch)
+    elif plan_id in PLANES:
+        # La suscripción se creó fuera de la app (o perdimos la fila).
+        monto = float((mp.get("auto_recurring") or {}).get("transaction_amount") or 0)
+        await _sb_post("suscripciones", {
+            "owner_id": owner_id, "plan": plan_id, "periodo": periodo,
+            "proveedor": "mercadopago", "proveedor_id": str(preapproval_id),
+            "external_reference": ext, "entorno": _mp_entorno(),
+            "importe_ars": monto, "iva_pct": IVA_PCT, **patch,
+        })
     else:
-        precio_usd = plan["precio_usd"]
-        razon = f"Rinde Agro · Plan {plan['nombre']} Mensual"
+        print(f"[MP] preapproval {preapproval_id}: plan '{plan_id}' desconocido — no se aplica")
+        return
 
-    precio_ars_base = round(precio_usd * bna_val)
-    precio_ars      = round(precio_ars_base * (1 + interes / 100))
+    actual = await _sub_vigente(owner_id) or await _sub_por_preapproval(str(preapproval_id))
+    await _sync_metadata_plan(owner_id, actual)
+    print(f"[MP] preapproval {preapproval_id} → {estado} (usuario {owner_id}, plan {plan_id})")
 
-    async with httpx.AsyncClient(timeout=15) as client:
-        if es_anual:
-            r = await client.post(
-                "https://api.mercadopago.com/checkout/preferences",
-                headers={"Authorization": f"Bearer {MP_ACCESS_TOKEN}", "Content-Type": "application/json"},
-                json={
-                    "items": [{"title": razon, "quantity": 1, "unit_price": float(precio_ars), "currency_id": "ARS"}],
-                    "payer": {"email": email} if email else {},
-                    "external_reference": f"{usuario_id}|{plan_id}|anual|{cuotas}c",
-                    "back_urls": {
-                        "success": "https://juanignaciomanterola.github.io/Rindeagro",
-                        "failure": "https://juanignaciomanterola.github.io/Rindeagro",
-                        "pending": "https://juanignaciomanterola.github.io/Rindeagro",
-                    },
-                    "auto_return": "approved",
-                    "payment_methods": {"installments": cuotas, "default_installments": cuotas},
-                },
-            )
-        else:
-            r = await client.post(
-                "https://api.mercadopago.com/preapproval_plan",
-                headers={"Authorization": f"Bearer {MP_ACCESS_TOKEN}", "Content-Type": "application/json"},
-                json={
-                    "reason": razon,
-                    "external_reference": f"{usuario_id}|{plan_id}|mensual",
-                    "auto_recurring": {
-                        "frequency": 1, "frequency_type": "months",
-                        "transaction_amount": precio_ars, "currency_id": "ARS",
-                    },
-                    "back_url": "https://juanignaciomanterola.github.io/Rindeagro",
-                    "notification_url": f"{SERVER_URL}/mp/webhook",
-                    "payment_methods_allowed": {
-                        "payment_types": [{"id": "credit_card"}, {"id": "debit_card"}]
-                    },
-                },
-            )
 
-        print(f"MP response {r.status_code}: {r.text[:300]}")
-        if r.status_code not in (200, 201):
-            raise HTTPException(status_code=500, detail=f"Error MP: {r.text}")
+async def _procesar_pago_autorizado(pago_id: str):
+    """
+    subscription_authorized_payment: cada cobro del débito automático.
+    Alimenta el historial (comprobantes) y dispara la gracia si rebota.
+    """
+    mp = await _mp_get(f"/authorized_payments/{pago_id}")
+    if not mp:
+        return
 
-        data = r.json()
-        init_point = data.get("init_point") or data.get("sandbox_init_point")
-        if not init_point:
-            raise HTTPException(status_code=500, detail="MP no devolvió URL de pago")
+    preapproval_id = str(mp.get("preapproval_id") or "")
+    sub = await _sub_por_preapproval(preapproval_id) if preapproval_id else None
+    if not sub:
+        print(f"[MP] authorized_payment {pago_id} sin suscripción local (preapproval {preapproval_id})")
+        return
 
-        return {
-            "ok": True, "init_point": init_point, "plan": plan_id,
-            "precio_usd": precio_usd, "precio_ars": precio_ars,
-            "bna": bna_val, "anual": es_anual, "cuotas": cuotas,
-        }
+    pago   = mp.get("payment") or {}
+    estado_mp = (pago.get("status") or mp.get("status") or "").lower()
+    estado = {
+        "approved": "aprobado", "processed": "aprobado",
+        "rejected": "rechazado", "cancelled": "cancelado", "canceled": "cancelado",
+        "refunded": "reintegrado", "charged_back": "reintegrado",
+    }.get(estado_mp, "pendiente")
+
+    tarjeta = (pago.get("card") or {})
+    await _sb_upsert("suscripcion_pagos", {
+        "owner_id": sub["owner_id"],
+        "suscripcion_id": sub["id"],
+        "proveedor": "mercadopago",
+        "proveedor_pago_id": str(pago.get("id") or pago_id),
+        "proveedor_preapproval_id": preapproval_id,
+        "estado": estado,
+        "importe": float(mp.get("transaction_amount") or pago.get("transaction_amount") or 0),
+        "moneda": mp.get("currency_id") or "ARS",
+        "fecha": _iso(_parse_fecha(mp.get("date_created")) or _ahora_utc()),
+        "periodo_desde": _iso(_parse_fecha(mp.get("debit_date"))),
+        "metodo": pago.get("payment_method_id"),
+        "ultimos4": (tarjeta.get("last_four_digits") or None),
+        "motivo_rechazo": pago.get("status_detail") if estado == "rechazado" else None,
+        "raw": mp,
+    }, on_conflict="proveedor_pago_id")
+
+    ahora = _ahora_utc()
+    if estado == "aprobado":
+        await _sb_patch(f"suscripciones?id=eq.{sub['id']}", {"estado": "activa", "gracia_hasta": None})
+        # Releer el preapproval para tomar el next_payment_date real: el
+        # authorized_payment solo trae next_retry_date, que existe cuando el
+        # cobro rebota, no cuando sale bien.
+        await _procesar_preapproval(preapproval_id)
+        return
+    elif estado == "rechazado":
+        # Primer rebote: arranca la ventana de gracia (acceso completo).
+        # Si ya estaba en gracia, se respeta la fecha original.
+        if sub.get("estado") == "activa" or not sub.get("gracia_hasta"):
+            await _sb_patch(f"suscripciones?id=eq.{sub['id']}", {
+                "estado": "en_gracia",
+                "gracia_hasta": _iso(ahora + timedelta(days=DIAS_GRACIA)),
+            })
+            print(f"[MP] cobro rechazado en {sub['id']} → gracia {DIAS_GRACIA} días")
+
+    actual = await _sub_por_preapproval(preapproval_id)
+    await _sync_metadata_plan(sub["owner_id"], actual)
 
 
 @app.post("/mp/webhook")
 async def mp_webhook(request: Request):
-    MP_ACCESS_TOKEN = os.environ.get("MP_ACCESS_TOKEN", "")
-    body = await request.json()
-    print(f"[MP Webhook] {json.dumps(body)}")
+    # data.id llega por querystring en la mayoría de las notificaciones y en
+    # el body en el resto. El manifest de la firma usa el de la querystring.
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
 
-    tipo    = body.get("type")
-    data_id = body.get("data", {}).get("id")
+    data_id = request.query_params.get("data.id") or str((body.get("data") or {}).get("id") or "")
+    if data_id and data_id.isalnum() and not data_id.isdigit():
+        data_id = data_id.lower()
 
-    if tipo == "subscription_preapproval" and data_id:
-        async with httpx.AsyncClient(timeout=10) as client:
-            r = await client.get(
-                f"https://api.mercadopago.com/preapproval/{data_id}",
-                headers={"Authorization": f"Bearer {MP_ACCESS_TOKEN}"},
-            )
-            if r.status_code == 200:
-                sus    = r.json()
-                estado = sus.get("status")
-                ref    = sus.get("external_reference", "")
-                if "|" in ref:
-                    usuario_id, plan_id = ref.split("|", 1)
-                    await _sb_patch(
-                        f"perfiles?id=eq.{usuario_id}",
-                        {
-                            "plan": plan_id if estado == "authorized" else "semilla",
-                            "suscripcion_mp_id": data_id,
-                            "suscripcion_estado": estado,
-                        },
-                    )
-                    print(f"[MP] Usuario {usuario_id} → plan {plan_id} ({estado})")
+    tipo = (request.query_params.get("type") or body.get("type") or body.get("topic") or "").strip()
+
+    if not _mp_secret():
+        # Sin secreto no podemos distinguir una notificación real de una
+        # falsificada, y esto otorga planes pagos. Devolvemos 200 para que MP
+        # no reintente en loop, pero NO tocamos nada.
+        print("[MP][WEBHOOK] ⚠️ MP_WEBHOOK_SECRET no configurado — notificación ignorada por seguridad")
+        return {"ok": True, "ignorado": "sin MP_WEBHOOK_SECRET"}
+
+    if not _validar_firma_mp(request, data_id):
+        print(f"[MP][WEBHOOK] firma inválida (type={tipo} id={data_id})")
+        raise HTTPException(status_code=401, detail="Firma inválida")
+
+    print(f"[MP][WEBHOOK] {tipo} · data.id={data_id}")
+
+    try:
+        if tipo == "subscription_preapproval" and data_id:
+            await _procesar_preapproval(data_id)
+        elif tipo == "subscription_authorized_payment" and data_id:
+            await _procesar_pago_autorizado(data_id)
+        elif tipo == "subscription_preapproval_plan":
+            pass  # no usamos planes preaprobados
+        elif tipo == "payment":
+            pass  # los cobros de suscripción llegan por authorized_payment
+        else:
+            print(f"[MP][WEBHOOK] topic no manejado: {tipo}")
+    except Exception as e:
+        # Nunca devolvemos 500: MP reintentaría y ya guardamos el log.
+        print(f"[MP][WEBHOOK] excepción procesando {tipo}/{data_id}: {e}")
 
     return {"ok": True}
 
 
+# ══════════════════════════════════════════════
+# GET /mp/suscripcion — estado para la app
+# ══════════════════════════════════════════════
+
+@app.get("/mp/suscripcion")
+async def mp_estado_suscripcion(request: Request):
+    """
+    El frontend lee la tabla directo con _restGet (RLS filtra por auth.uid()).
+    Este endpoint existe para diagnóstico y para clientes que no sean la web.
+    """
+    user = await _auth_user(request)
+    sub  = await _sub_vigente(user["id"])
+    return {
+        "ok": True,
+        "suscripcion": sub,
+        "plan_efectivo": _plan_efectivo(sub),
+        "dias_gracia": DIAS_GRACIA,
+    }
+
+
 @app.get("/mp/planes")
 async def get_planes():
-    bna, _ = await fetch_dolar_bna()
-    bna_val = bna if bna else cache_precios["bna"]
-    planes_con_ars = {
-        id: {
-            **plan,
-            "precio_ars":        round(plan["precio_usd"] * bna_val),
-            "precio_ars_anual":  round(plan["precio_usd_anual"] * bna_val),
-            "bna": bna_val,
+    bna = await _dolar_venta_bna()
+    salida = {}
+    for pid, p in PLANES.items():
+        usd_m, usd_m_iva, ars_m = _precio(pid, "mensual", bna)
+        usd_a, usd_a_iva, ars_a = _precio(pid, "anual", bna)
+        salida[pid] = {
+            **p,
+            "precio_usd": usd_m, "precio_ars": ars_m,
+            "precio_usd_anual": usd_a, "precio_ars_anual": ars_a,
         }
-        for id, plan in PLANES.items()
+    return {"ok": True, "planes": salida, "bna": bna, "iva_pct": IVA_PCT,
+            "descuento_anual_pct": DESCUENTO_ANUAL_PCT, "entorno": _mp_entorno()}
+
+
+@app.get("/mp/diagnostico")
+async def mp_diagnostico():
+    """Chequeo rápido de que Railway tenga las env vars y que MP responda."""
+    out = {
+        "MP_ACCESS_TOKEN": bool(_mp_token()),
+        "MP_WEBHOOK_SECRET": bool(_mp_secret()),
+        "entorno": _mp_entorno(),
+        "dias_gracia": DIAS_GRACIA,
+        "admins": len(ADMIN_USER_IDS),
     }
-    return {"ok": True, "planes": planes_con_ars, "bna": bna_val}
+    if _mp_token():
+        r = await _mp_get("/users/me")
+        out["mp_cuenta"] = {"id": r.get("id"), "nickname": r.get("nickname"),
+                            "site_id": r.get("site_id")} if r else "sin respuesta"
+    for t in ("suscripciones", "suscripcion_pagos"):
+        try:
+            async with httpx.AsyncClient(timeout=8) as c:
+                rr = await c.get(f"{_sb_url()}/rest/v1/{t}", headers=_sb_headers(), params={"limit": "1"})
+            out[t] = {"status": rr.status_code, "ok": rr.status_code == 200}
+        except Exception as e:
+            out[t] = {"ok": False, "error": str(e)}
+    return out
+
+
+# ══════════════════════════════════════════════
+# Reajuste manual por movimiento del dólar (admin)
+# ══════════════════════════════════════════════
+# Política elegida: el monto en ARS queda FIJO desde el alta. Cuando el dólar
+# se despega, estos endpoints te listan las suscripciones desfasadas y te
+# dejan actualizarlas a mano. Nada automático que le cambie el débito al
+# cliente sin que vos lo decidas.
+
+async def _exigir_admin(request: Request) -> dict:
+    user = await _auth_user(request)
+    if user["id"] not in ADMIN_USER_IDS:
+        raise HTTPException(status_code=403, detail="Solo administradores.")
+    return user
+
+
+@app.get("/mp/admin/desfasaje")
+async def mp_admin_desfasaje(request: Request, umbral: float = 10.0):
+    await _exigir_admin(request)
+    bna = await _dolar_venta_bna()
+    filas = await _sb_get("suscripciones", {
+        "estado": "in.(activa,en_gracia,pausada)",
+        "select": "id,owner_id,plan,periodo,importe_ars,importe_usd,tc_alta,proximo_cobro",
+        "order": "created_at.asc",
+    })
+    out = []
+    for f in filas:
+        if f.get("plan") not in PLANES:
+            continue
+        _, _, ars_hoy = _precio(f["plan"], f.get("periodo") or "mensual", bna)
+        actual = float(f.get("importe_ars") or 0)
+        if actual <= 0:
+            continue
+        dif_pct = round((ars_hoy - actual) / actual * 100, 2)
+        if abs(dif_pct) >= umbral:
+            out.append({**f, "importe_ars_hoy": ars_hoy, "diferencia_pct": dif_pct})
+    return {"ok": True, "bna": bna, "umbral": umbral, "desfasadas": out, "total": len(out)}
+
+
+@app.post("/mp/admin/reajustar")
+async def mp_admin_reajustar(request: Request):
+    await _exigir_admin(request)
+    body = await request.json()
+    ids  = body.get("suscripcion_ids") or []
+    if not isinstance(ids, list) or not ids:
+        raise HTTPException(status_code=400, detail="Mandá suscripcion_ids: [...]")
+
+    bna = await _dolar_venta_bna()
+    resultados = []
+    for sid in ids:
+        filas = await _sb_get("suscripciones", {"id": f"eq.{sid}", "limit": "1"})
+        if not filas:
+            resultados.append({"id": sid, "ok": False, "detalle": "no existe"})
+            continue
+        sub = filas[0]
+        if sub.get("plan") not in PLANES:
+            resultados.append({"id": sid, "ok": False, "detalle": "plan desconocido"})
+            continue
+        usd_base, _, ars = _precio(sub["plan"], sub.get("periodo") or "mensual", bna)
+        async with httpx.AsyncClient(timeout=20) as c:
+            r = await c.put(
+                f"{MP_API}/preapproval/{sub['proveedor_id']}",
+                headers=_mp_headers(),
+                json={"auto_recurring": {"transaction_amount": float(ars), "currency_id": "ARS"}},
+            )
+        if r.status_code in (200, 201):
+            await _sb_patch(f"suscripciones?id=eq.{sid}",
+                            {"importe_ars": ars, "importe_usd": usd_base, "tc_alta": bna})
+            resultados.append({"id": sid, "ok": True, "importe_ars": ars})
+        else:
+            print(f"[MP] reajuste {sid} HTTP {r.status_code}: {r.text[:300]}")
+            resultados.append({"id": sid, "ok": False, "detalle": r.text[:200]})
+    return {"ok": True, "bna": bna, "resultados": resultados}
+
+
+# ══════════════════════════════════════════════
+# Job diario: vencer la gracia
+# ══════════════════════════════════════════════
+
+async def _suscripciones_vencer_gracia():
+    """
+    MP no nos avisa cuando se agota la paciencia: pasa en_gracia → impaga
+    cuando gracia_hasta quedó atrás. A partir de ahí la app entra en solo
+    lectura (los datos siguen todos visibles y exportables).
+    """
+    ahora = _ahora_utc()
+    filas = await _sb_get("suscripciones", {
+        "estado": "eq.en_gracia",
+        "gracia_hasta": f"lt.{ahora.isoformat()}",
+        "select": "id,owner_id,plan,periodo,estado,periodo_fin",
+    })
+    for f in filas:
+        await _sb_patch(f"suscripciones?id=eq.{f['id']}", {"estado": "impaga"})
+        await _sync_metadata_plan(f["owner_id"], {**f, "estado": "impaga"})
+        print(f"[MP] gracia vencida: suscripción {f['id']} → impaga")
+    if filas:
+        print(f"[MP] {len(filas)} suscripción(es) pasaron a impaga")
 
 
 # ══════════════════════════════════════════════
@@ -2793,8 +3535,16 @@ async def startup_event():
         CronTrigger(day_of_week="sat", hour=9, minute=0, timezone=AR_TZ),
         id="resumen_semanal", replace_existing=True,
     )
+    # Job 4 — Suscripciones: vencer la ventana de gracia. Diario 6:00 AR.
+    # MP no nos avisa cuando se agota la paciencia; este job pasa
+    # en_gracia → impaga y sincroniza el plan efectivo.
+    scheduler.add_job(
+        _suscripciones_vencer_gracia,
+        CronTrigger(hour=6, minute=0, timezone=AR_TZ),
+        id="suscripciones_vencer_gracia", replace_existing=True,
+    )
     scheduler.start()
-    print("[SCHEDULER] Iniciado con 3 jobs activos")
+    print("[SCHEDULER] Iniciado con 4 jobs activos")
 
     if kapso.configurado() and not os.environ.get("KAPSO_WEBHOOK_SECRET"):
         print("[KAPSO] ⚠️  KAPSO_WEBHOOK_SECRET sin configurar: /whatsapp/kapso "
