@@ -7,6 +7,7 @@ from datetime import datetime, date, timedelta
 import os
 import json
 import re
+import time
 from bs4 import BeautifulSoup
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -67,6 +68,27 @@ async def _sb_get(table: str, params: dict = None) -> list:
     except Exception as e:
         print(f"[SB GET {table}] excepción: {e}")
     return []
+
+async def _sb_get_todo(table: str, params: dict, pagina: int = 1000) -> list:
+    """
+    _sb_get paginado. PostgREST corta en 1000 filas por default, así que una
+    query "traeme todo" que crezca con los usuarios se trunca sin avisar.
+    Requiere que `params` traiga un `order` estable o las páginas se solapan.
+    """
+    filas, offset = [], 0
+    while True:
+        p = dict(params)
+        p["limit"] = str(pagina)
+        p["offset"] = str(offset)
+        lote = await _sb_get(table, p) or []
+        filas.extend(lote)
+        if len(lote) < pagina:
+            return filas
+        offset += pagina
+        if offset >= 100_000:
+            print(f"[SB GET TODO {table}] corte de seguridad en {offset} filas")
+            return filas
+
 
 async def _sb_post(table: str, payload: dict) -> dict:
     try:
@@ -552,24 +574,92 @@ async def _wa_contexto(user_id, owner_id, nombre, rol, permisos) -> dict:
     }
 
 
+# `perfiles.telefono` y `equipo.whatsapp` los tipea el usuario a mano, así que
+# están guardados en cualquier formato ('+54 9 2944 56-5308', '02944565308').
+# No se puede filtrar por número en la query: hay que normalizar y comparar.
+#
+# Antes eso se resolvía en cada mensaje entrante trayendo hasta 2000 perfiles y
+# 2000 filas de equipo. Con el número de sandbox y cinco usuarios daba igual;
+# con un número de producción son dos consultas enormes por mensaje y, peor, el
+# que se registra pasada la fila 2000 nunca es reconocido. Ahora se arma un
+# índice normalizado en memoria y se refresca cada pocos minutos.
+
+_WA_DIR: dict = {}            # número normalizado → {"tipo", "fila"}
+_WA_DIR_TS: float = 0.0       # time.monotonic() del último armado
+_WA_DIR_TTL = 300             # segundos de vida del índice
+_WA_DIR_PISO_REFRESH = 20     # piso entre refrescos forzados por un miss
+_WA_DIR_LOCK = asyncio.Lock()
+
+
+async def _wa_construir_directorio() -> dict:
+    """Índice {número normalizado → dueño o miembro de equipo}."""
+    indice = {}
+
+    # El equipo primero y los perfiles después, a propósito: si alguien está en
+    # las dos tablas gana el perfil, que es de donde sale el contexto de dueño.
+    miembros = await _sb_get_todo("equipo", {
+        "select": "id,owner_id,miembro_id,rol,nombre_display,whatsapp,permisos,activo",
+        "whatsapp": "not.is.null", "order": "id.asc",
+    })
+    for e in miembros:
+        if e.get("activo") is False:
+            continue
+        n = kapso.normalizar_numero(e.get("whatsapp") or "")
+        if n:
+            indice[n] = {"tipo": "equipo", "fila": e}
+
+    perfiles = await _sb_get_todo("perfiles", {
+        "select": "id,nombre,telefono", "telefono": "not.is.null", "order": "id.asc",
+    })
+    for p in perfiles:
+        n = kapso.normalizar_numero(p.get("telefono") or "")
+        if n:
+            indice[n] = {"tipo": "perfil", "fila": p}
+
+    return indice
+
+
+async def _wa_buscar_en_directorio(n: str) -> dict | None:
+    global _WA_DIR, _WA_DIR_TS
+
+    async with _WA_DIR_LOCK:
+        if not _WA_DIR or time.monotonic() - _WA_DIR_TS > _WA_DIR_TTL:
+            _WA_DIR = await _wa_construir_directorio()
+            _WA_DIR_TS = time.monotonic()
+            print(f"[WA DIR] índice armado: {len(_WA_DIR)} números")
+
+    hit = _WA_DIR.get(n)
+    if hit:
+        return hit
+
+    # Puede ser alguien que se registró hace un minuto y todavía no entró al
+    # índice. Lo reconstruimos una vez, con un piso de tiempo para que un número
+    # desconocido que insiste no nos haga escanear la base a cada mensaje.
+    async with _WA_DIR_LOCK:
+        if time.monotonic() - _WA_DIR_TS > _WA_DIR_PISO_REFRESH:
+            _WA_DIR = await _wa_construir_directorio()
+            _WA_DIR_TS = time.monotonic()
+            print(f"[WA DIR] índice rearmado por miss: {len(_WA_DIR)} números")
+        return _WA_DIR.get(n)
+
+
 async def _wa_identificar(numero: str) -> dict | None:
     """
     Resuelve quién es el que escribe: dueño de una cuenta o miembro de un equipo.
 
     Compara con los teléfonos normalizados, no con el texto guardado: los
     perfiles tienen '+5492944565308' y WhatsApp manda '542944565308'.
-    Por eso traemos las filas y comparamos acá en vez de filtrar en la query.
     """
     n = kapso.normalizar_numero(numero)
     if not n:
         return None
 
-    perfiles = await _sb_get("perfiles", {
-        "select": "id,nombre,telefono", "telefono": "not.is.null", "limit": "2000",
-    })
-    for p in perfiles:
-        if not kapso.mismo_numero(p.get("telefono") or "", n):
-            continue
+    hit = await _wa_buscar_en_directorio(n)
+    if not hit:
+        return None
+
+    if hit["tipo"] == "perfil":
+        p = hit["fila"]
         # Tener perfil propio no significa ser dueño: un empleado invitado también
         # se crea una cuenta al aceptar la invitación. Si es miembro del equipo de
         # alguien, ese es su contexto — igual que hace la app al armar CONTEXTO.
@@ -586,20 +676,12 @@ async def _wa_identificar(numero: str) -> dict | None:
             )
         return await _wa_contexto(p["id"], p["id"], p.get("nombre") or "", "dueño", None)
 
-    miembros = await _sb_get("equipo", {
-        "select": "id,owner_id,miembro_id,rol,nombre_display,whatsapp,permisos,activo",
-        "whatsapp": "not.is.null", "limit": "2000",
-    })
-    for e in miembros:
-        if e.get("activo") is False:
-            continue
-        if kapso.mismo_numero(e.get("whatsapp") or "", n):
-            return await _wa_contexto(
-                e.get("miembro_id"), e["owner_id"],
-                e.get("nombre_display") or "", e.get("rol") or "colaborador",
-                e.get("permisos") or {},
-            )
-    return None
+    e = hit["fila"]
+    return await _wa_contexto(
+        e.get("miembro_id"), e["owner_id"],
+        e.get("nombre_display") or "", e.get("rol") or "colaborador",
+        e.get("permisos") or {},
+    )
 
 
 def _wa_puede(ident: dict, modulo: str, nivel: str = "ver") -> bool:
@@ -1638,6 +1720,34 @@ def _extraer_nota(texto: str) -> str:
 
 # ── Router principal ──────────────────────────
 
+# Con el número de sandbox solo escribían los cinco de siempre. Con un número
+# de producción escribe cualquiera: equivocados, curiosos, spam. A cada uno le
+# contestamos una vez y después lo dejamos pasar, así no le mandamos el mismo
+# texto veinte veces ni pagamos veinte conversaciones.
+_WA_DESCONOCIDOS: dict = {}          # número → time.monotonic() del último aviso
+_WA_DESCONOCIDO_SILENCIO = 6 * 3600  # segundos hasta volver a contestarle
+_WA_DESCONOCIDOS_MAX = 2000
+
+
+def _wa_corresponde_avisar(numero: str) -> bool:
+    """True si a este número desconocido le toca el mensaje de bienvenida."""
+    ahora = time.monotonic()
+    # Ojo con el default: time.monotonic() arranca cerca de cero cuando el
+    # contenedor se acaba de levantar, así que un `.get(numero, 0.0)` haría que
+    # durante las primeras 6 horas de cada deploy nadie nuevo reciba respuesta.
+    ultimo = _WA_DESCONOCIDOS.get(numero)
+    if ultimo is not None and ahora - ultimo < _WA_DESCONOCIDO_SILENCIO:
+        return False
+    if len(_WA_DESCONOCIDOS) >= _WA_DESCONOCIDOS_MAX:
+        # Se descarta el cuarto más viejo en vez de vaciar todo: si no, alcanza
+        # con inundarlo de números nuevos para que vuelva a contestarle a todos.
+        viejos = sorted(_WA_DESCONOCIDOS.items(), key=lambda kv: kv[1])
+        for k, _ in viejos[:_WA_DESCONOCIDOS_MAX // 4]:
+            _WA_DESCONOCIDOS.pop(k, None)
+    _WA_DESCONOCIDOS[numero] = ahora
+    return True
+
+
 async def _kapso_procesar(m) -> None:
     numero = m.desde
     if not numero:
@@ -1649,11 +1759,22 @@ async def _kapso_procesar(m) -> None:
 
     ident = await _wa_identificar(numero)
     if not ident:
-        await kapso.enviar_texto(
-            numero,
-            "Tu número todavía no está vinculado a una cuenta de Rinde.Agro.\n\n"
-            f"Entrá a {APP_URL}, andá a *Mi Plan* y cargá este número en tu perfil.",
-        )
+        # El mensaje viejo daba por hecho que ya tenían cuenta. En producción
+        # escribe también gente que todavía no se registró, así que cubrimos
+        # los tres casos posibles en vez de mandarlos a un menú que no ven.
+        if _wa_corresponde_avisar(numero):
+            await kapso.enviar_texto(
+                numero,
+                "¡Hola! Soy el asistente de *Rinde.Agro* 🌾\n\n"
+                "No encontré ninguna cuenta con este número.\n\n"
+                f"• ¿Todavía no tenés cuenta? Creála en {APP_URL} y volvé a escribirme.\n"
+                "• ¿Ya tenés cuenta? Entrá a *Mi Plan* y cargá este número en tu "
+                "perfil para que te reconozca.\n"
+                "• ¿Te sumaron a un equipo? Pedile al dueño de la cuenta que cargue "
+                "tu número en *Mi equipo*.",
+            )
+        else:
+            print(f"[KAPSO←] {numero} desconocido y ya avisado, no contesto")
         return
 
     accion = m.accion or ""
@@ -1737,7 +1858,11 @@ async def kapso_webhook(request: Request):
     el procesamiento va en background y la respuesta sale enseguida.
     """
     body_crudo = await request.body()
-    firma = request.headers.get("x-webhook-signature", "")
+    # Un webhook de tipo 'kapso' firma en X-Webhook-Signature; uno de tipo
+    # 'meta' usa X-Hub-Signature-256. Aceptamos los dos para que el webhook que
+    # se cree para el número de producción funcione sea del tipo que sea.
+    firma = (request.headers.get("x-webhook-signature", "")
+             or request.headers.get("x-hub-signature-256", ""))
     if not kapso.firma_valida(body_crudo, firma):
         print("[KAPSO←] firma inválida, descartado")
         raise HTTPException(status_code=401, detail="firma inválida")
@@ -1766,16 +1891,46 @@ async def kapso_webhook(request: Request):
 
 
 @app.get("/whatsapp/kapso/estado")
-async def kapso_estado():
-    """Diagnóstico rápido: ¿está todo configurado?"""
-    return {
+async def kapso_estado(numeros: bool = False):
+    """
+    Diagnóstico rápido: ¿está todo configurado?
+
+    Con ?numeros=1 además consulta la Platform API de Kapso y lista los números
+    conectados al proyecto. Es la forma de verificar el cambio a producción sin
+    adivinar: el `phone_number_id` del número que quieras usar es exactamente lo
+    que tiene que valer KAPSO_PHONE_NUMBER_ID.
+    """
+    pnid = os.environ.get("KAPSO_PHONE_NUMBER_ID", "")
+    salida = {
         "api_key": bool(os.environ.get("KAPSO_API_KEY")),
-        "phone_number_id": os.environ.get("KAPSO_PHONE_NUMBER_ID", "") or None,
+        "phone_number_id": pnid or None,
         "webhook_secret": bool(os.environ.get("KAPSO_WEBHOOK_SECRET")),
         "supabase": bool(_sb_url() and _sb_key()),
         "openai": bool(os.environ.get("OPENAI_API_KEY")),
         "app_url": APP_URL,
+        "directorio_wa": {"numeros_indexados": len(_WA_DIR),
+                          "armado_hace_seg": round(time.monotonic() - _WA_DIR_TS)
+                          if _WA_DIR_TS else None},
     }
+    if not salida["webhook_secret"]:
+        salida["alerta"] = ("KAPSO_WEBHOOK_SECRET sin configurar: el webhook "
+                            "acepta cualquier POST. Obligatorio en producción.")
+
+    if numeros:
+        conectados = await kapso.listar_numeros()
+        salida["numeros_conectados"] = [
+            {
+                "phone_number_id": n.get("phone_number_id") or n.get("id"),
+                "display_phone_number": n.get("display_phone_number"),
+                "display_name": n.get("display_name") or n.get("verified_name"),
+                "status": n.get("status"),
+                "quality_rating": n.get("quality_rating"),
+                "business_account_id": n.get("business_account_id"),
+                "en_uso": str(n.get("phone_number_id") or n.get("id") or "") == pnid,
+            }
+            for n in conectados if isinstance(n, dict)
+        ]
+    return salida
 
 
 # ══════════════════════════════════════════════
@@ -2640,6 +2795,10 @@ async def startup_event():
     )
     scheduler.start()
     print("[SCHEDULER] Iniciado con 3 jobs activos")
+
+    if kapso.configurado() and not os.environ.get("KAPSO_WEBHOOK_SECRET"):
+        print("[KAPSO] ⚠️  KAPSO_WEBHOOK_SECRET sin configurar: /whatsapp/kapso "
+              "acepta cualquier POST. Configuralo antes de salir a producción.")
 
 
 if __name__ == "__main__":
