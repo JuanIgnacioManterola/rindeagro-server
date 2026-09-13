@@ -7,6 +7,9 @@ from datetime import datetime, date, timedelta
 import os
 import json
 import re
+import hashlib
+import hmac
+import secrets
 import time
 from bs4 import BeautifulSoup
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -240,7 +243,9 @@ async def _manejar_stop_activar(numero: str, texto: str) -> str | None:
     """Devuelve respuesta si el mensaje es STOP/ACTIVAR, None si no aplica."""
     n = _norm(texto)
     if n in STOP_WORDS or any(sw in n for sw in STOP_WORDS):
-        rows = await _sb_get("perfiles", {"telefono": f"eq.{numero}", "select": "id"})
+        rows = await _sb_get("perfiles", {
+            "telefono": f"eq.{numero}", "telefono_verificado": "eq.true", "select": "id",
+        })
         if rows:
             await _sb_patch(
                 f"wa_preferencias_notificaciones?user_id=eq.{rows[0]['id']}",
@@ -252,7 +257,9 @@ async def _manejar_stop_activar(numero: str, texto: str) -> str | None:
             "Si querés volver a activarlos escribí *ACTIVAR* en cualquier momento."
         )
     if n in ACTIVAR_WORDS or any(aw in n for aw in ACTIVAR_WORDS):
-        rows = await _sb_get("perfiles", {"telefono": f"eq.{numero}", "select": "id"})
+        rows = await _sb_get("perfiles", {
+            "telefono": f"eq.{numero}", "telefono_verificado": "eq.true", "select": "id",
+        })
         if rows:
             await _sb_patch(
                 f"wa_preferencias_notificaciones?user_id=eq.{rows[0]['id']}",
@@ -555,6 +562,317 @@ async def _sb_storage_subir(bucket: str, path: str, contenido: bytes, content_ty
     return ""
 
 
+# ══════════════════════════════════════════════
+# VERIFICACIÓN DEL NÚMERO DE WHATSAPP
+# ══════════════════════════════════════════════
+# Antes el usuario tipeaba su número al registrarse y le creíamos. Un dígito mal
+# tipeado alcanzaba para que el bot le sirviera los datos de un productor a otra
+# persona. Ahora hay que probar que el número es tuyo.
+#
+# Camino principal — OTP inverso: la web muestra "escribile VINCULAR <código> al
+# bot". El que escribe demuestra que tiene el teléfono en la mano, no consume
+# plantillas de Meta y de paso abre la ventana de 24 h de conversación.
+#
+# Fallback — OTP saliente: el bot manda 6 dígitos al número cargado y el usuario
+# los tipea en la web (endpoints /whatsapp/verificacion/*).
+#
+# La invitación de un operario prueba que a alguien lo invitaron; esto prueba que
+# el número es suyo. Hacen falta las dos y son cosas distintas: el operario que
+# entra por link también tiene que verificar.
+
+# Alfabeto sin I/O/0/1: el código se dicta y se copia a mano, no puede tener
+# caracteres que se confundan entre sí.
+_VERIF_ALFABETO = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+VERIF_LARGO             = 6
+VERIF_VIGENCIA_MIN      = 15   # ventana corta: el código se muere solo
+VERIF_MAX_INTENTOS_FILA = 5    # intentos contra un mismo código (OTP saliente)
+VERIF_MAX_INTENTOS_NUM  = 8    # intentos por número entrante (OTP inverso)
+VERIF_VENTANA_MIN       = 15   # ventana del rate limit por número
+VERIF_BLOQUEO_MIN       = 60   # cuánto queda bloqueado el número al pasarse
+
+# "VINCULAR A1B2C3", "vincular: a1b2c3", "código 123456", "verificar A1B2C3".
+# El código puede venir con espacios, puntos o guiones en el medio: el que lo
+# copia del celular o lo dicta por teléfono lo parte como se le ocurre.
+# _verif_hash limpia todo lo que no sea alfanumérico antes de comparar.
+# El separador entre la palabra y el código es obligatorio: sin eso, "VINCULAR"
+# a secas se parseaba como keyword "VINCULA" + código "R".
+_RE_VINCULAR = re.compile(
+    r"^\s*(?:vincul\w*|verific\w*|c[oó]digo)(?:\s+|\s*[:\-]\s*)"
+    r"([A-Za-z0-9][A-Za-z0-9\s.\-]{2,14})\s*$",
+    re.IGNORECASE,
+)
+# El comando pelado, sin código: contestamos con instrucciones en vez de nada.
+_RE_VINCULAR_SOLO = re.compile(r"^\s*(?:vincul\w*|verific\w*)\s*$", re.IGNORECASE)
+
+
+def _verif_hash(user_id: str, codigo: str) -> str:
+    """
+    sha256(user_id + ':' + código en mayúsculas).
+
+    Meter el user_id adentro del material hasheado hace que una tabla arcoíris
+    sobre 32^6 códigos no sirva de nada y que un hash no se pueda mover de una
+    fila a otra. El frontend calcula exactamente lo mismo (index.html →
+    _verifHash) porque es él quien genera el código del flujo inverso.
+    """
+    limpio = re.sub(r"[^A-Za-z0-9]", "", codigo or "").upper()
+    return hashlib.sha256(f"{user_id}:{limpio}".encode()).hexdigest()
+
+
+def _verif_generar_codigo(solo_digitos: bool = False) -> str:
+    if solo_digitos:
+        return "".join(secrets.choice("0123456789") for _ in range(VERIF_LARGO))
+    return "".join(secrets.choice(_VERIF_ALFABETO) for _ in range(VERIF_LARGO))
+
+
+def _ts(valor) -> datetime | None:
+    """Parsea un timestamp de Postgres a datetime con tz. None si no se puede."""
+    if not valor:
+        return None
+    try:
+        s = str(valor).replace("Z", "+00:00")
+        d = datetime.fromisoformat(s)
+        return d if d.tzinfo else pytz.utc.localize(d)
+    except Exception:
+        return None
+
+
+def _ahora() -> datetime:
+    return datetime.now(pytz.utc)
+
+
+# ── Rate limiting por número entrante ─────────
+# Vive en Supabase y no en memoria del proceso: Railway reinicia seguido y un
+# contador en RAM se reseteaba con cada deploy, que es justo lo que un atacante
+# necesitaría. La tabla wa_verificacion_intentos tiene RLS prendida y cero
+# policies, así que solo la toca service_role.
+
+async def _verif_bloqueado(numero: str) -> datetime | None:
+    """Devuelve hasta cuándo está bloqueado el número, o None si puede probar."""
+    rows = await _sb_get("wa_verificacion_intentos", {"numero": f"eq.{numero}", "limit": "1"})
+    if not rows:
+        return None
+    hasta = _ts(rows[0].get("bloqueado_hasta"))
+    return hasta if hasta and hasta > _ahora() else None
+
+
+async def _verif_sumar_fallo(numero: str) -> bool:
+    """Suma un intento fallido. True si con este quedó bloqueado."""
+    ahora = _ahora()
+    rows = await _sb_get("wa_verificacion_intentos", {"numero": f"eq.{numero}", "limit": "1"})
+    intentos, inicio = 1, ahora
+    if rows:
+        prev = _ts(rows[0].get("ventana_inicio"))
+        # Fuera de la ventana el contador arranca de cero: no queremos bloquear a
+        # alguien por errores repartidos a lo largo de una semana.
+        if prev and (ahora - prev).total_seconds() < VERIF_VENTANA_MIN * 60:
+            intentos = int(rows[0].get("intentos") or 0) + 1
+            inicio = prev
+    bloquear = intentos >= VERIF_MAX_INTENTOS_NUM
+    await _sb_upsert("wa_verificacion_intentos", {
+        "numero": numero,
+        "intentos": intentos,
+        "ventana_inicio": inicio.isoformat(),
+        "bloqueado_hasta": (ahora + timedelta(minutes=VERIF_BLOQUEO_MIN)).isoformat() if bloquear else None,
+        "actualizado_en": ahora.isoformat(),
+    }, on_conflict="numero")
+    return bloquear
+
+
+async def _verif_limpiar_fallos(numero: str) -> None:
+    await _sb_patch(f"wa_verificacion_intentos?numero=eq.{numero}", {
+        "intentos": 0,
+        "ventana_inicio": _ahora().isoformat(),
+        "bloqueado_hasta": None,
+        "actualizado_en": _ahora().isoformat(),
+    })
+
+
+# ── Núcleo de la verificación ─────────────────
+
+async def _verif_duenio_actual(numero_norm: str) -> str | None:
+    """
+    Devuelve el user_id que ya tiene verificado ese número, o None.
+
+    Compara normalizado y no con un filtro en la query por el mismo motivo que
+    _wa_identificar: los perfiles guardan '+5492944565308' y WhatsApp manda
+    '542944565308'.
+    """
+    verificados = await _sb_get("perfiles", {
+        "telefono_verificado": "eq.true", "telefono": "not.is.null",
+        "select": "id,telefono", "limit": "2000",
+    })
+    for p in verificados:
+        if kapso.mismo_numero(p.get("telefono") or "", numero_norm):
+            return p.get("id")
+    return None
+
+
+async def _verif_marcar_perfil(user_id: str, telefono: str) -> bool:
+    """Marca el perfil como verificado con el número dado. Solo service_role puede."""
+    await _sb_patch(f"perfiles?id=eq.{user_id}", {
+        "telefono": telefono,
+        "telefono_verificado": True,
+        "telefono_verificado_en": _ahora().isoformat(),
+    })
+    rows = await _sb_get("perfiles", {"id": f"eq.{user_id}", "select": "telefono_verificado", "limit": "1"})
+    return bool(rows and rows[0].get("telefono_verificado"))
+
+
+async def _verif_consumir_inverso(numero: str, codigo: str) -> tuple[str, dict]:
+    """
+    Procesa un "VINCULAR <código>" entrante.
+
+    Devuelve (resultado, extra) con resultado en:
+      ok | invalido | bloqueado | ocupado | error
+
+    Ojo con una decisión de diseño: el número que queda verificado es el del
+    REMITENTE, no el que el usuario había tipeado en la web. Es lo que arregla
+    el problema original — si se equivocó en un dígito, mandar el código desde
+    su teléfono real corrige el perfil solo. El código dura 15 minutos, es de un
+    solo uso y vive únicamente en la sesión autenticada del propio usuario.
+    """
+    n = kapso.normalizar_numero(numero)
+    limpio = re.sub(r"[^A-Za-z0-9]", "", codigo or "")
+    if not n or len(limpio) < 4:
+        return "invalido", {}
+
+    bloqueado = await _verif_bloqueado(n)
+    if bloqueado:
+        return "bloqueado", {"hasta": bloqueado}
+
+    pendientes = await _sb_get("verificaciones_telefono", {
+        "usado": "eq.false",
+        "expira_en": f"gt.{_ahora().isoformat()}",
+        "select": "id,user_id,telefono,telefono_display,codigo_hash,metodo",
+        "limit": "500",
+    })
+
+    fila = None
+    for row in pendientes:
+        esperado = _verif_hash(row.get("user_id") or "", codigo)
+        if hmac.compare_digest(esperado, row.get("codigo_hash") or ""):
+            fila = row
+            break
+
+    if not fila:
+        recien_bloqueado = await _verif_sumar_fallo(n)
+        return ("bloqueado" if recien_bloqueado else "invalido"), {}
+
+    user_id = fila["user_id"]
+
+    # Un número verificado pertenece a una sola cuenta. Si ya es de otra, hay que
+    # desvincularlo de allá primero — si no, el bot no sabría a quién servirle.
+    duenio = await _verif_duenio_actual(n)
+    if duenio and duenio != user_id:
+        await _verif_sumar_fallo(n)
+        return "ocupado", {}
+
+    if not await _verif_marcar_perfil(user_id, n):
+        return "error", {}
+
+    await _sb_patch(f"verificaciones_telefono?id=eq.{fila['id']}", {
+        "usado": True,
+        "usado_en": _ahora().isoformat(),
+        "verificado_desde": n,
+    })
+    # Cualquier otro código vivo del mismo usuario queda sin efecto: ya verificó.
+    await _sb_patch(
+        f"verificaciones_telefono?user_id=eq.{user_id}&usado=eq.false",
+        {"usado": True, "usado_en": _ahora().isoformat()},
+    )
+    await _verif_limpiar_fallos(n)
+    _wa_dir_invalidar()
+
+    cargado = kapso.normalizar_numero(fila.get("telefono") or "")
+    return "ok", {
+        "user_id": user_id,
+        "numero": n,
+        "difiere": bool(cargado and cargado != n),
+        "cargado": fila.get("telefono_display") or fila.get("telefono") or "",
+    }
+
+
+async def _verif_responder(numero: str, resultado: str, extra: dict) -> None:
+    """Contesta por WhatsApp el resultado de un intento de vinculación."""
+    if resultado == "ok":
+        msg = "✅ Listo, tu número quedó verificado.\n\nYa podés usarme para cargar gastos, lluvias y tareas."
+        if extra.get("difiere"):
+            cargado = extra.get("cargado") or "el que habías cargado"
+            msg += (f"\n\n⚠️ Ojo: en tu perfil figuraba *{cargado}*, que no es este número. "
+                    "Lo corregí por el número desde el que me escribiste.")
+        await kapso.enviar_texto(numero, msg)
+    elif resultado == "bloqueado":
+        await kapso.enviar_texto(
+            numero,
+            "Demasiados intentos fallidos. Esperá una hora y pedí un código nuevo "
+            f"desde {APP_URL} → *Mi plan*.",
+        )
+    elif resultado == "ocupado":
+        await kapso.enviar_texto(
+            numero,
+            "Este número ya está verificado en otra cuenta de Rinde Agro.\n\n"
+            "Entrá a esa cuenta y desvinculalo desde *Mi plan*, o escribinos a "
+            "rindeagro.contacto@gmail.com si perdiste el acceso.",
+        )
+    elif resultado == "error":
+        await kapso.enviar_texto(numero, "Se me complicó guardar la verificación. Probá de nuevo en un minuto.")
+    else:
+        await kapso.enviar_texto(
+            numero,
+            "Ese código no me sirve — puede estar vencido, ya usado o mal copiado.\n\n"
+            f"Entrá a {APP_URL} → *Mi plan* y generá uno nuevo. Duran "
+            f"{VERIF_VIGENCIA_MIN} minutos.",
+        )
+
+
+async def _verif_manejar_comando(numero: str, texto: str) -> bool:
+    """
+    Si el mensaje es un VINCULAR, lo procesa y devuelve True.
+
+    Se llama ANTES de identificar al usuario: el que todavía no verificó no
+    existe para el resto del bot, así que este es su único camino de entrada.
+    """
+    if not texto:
+        return False
+
+    if _RE_VINCULAR_SOLO.match(texto):
+        await kapso.enviar_texto(
+            numero,
+            f"Para vincular tu número entrá a {APP_URL} → *Mi plan* → *Verificar mi WhatsApp*, "
+            "y escribime el código que te muestra:\n\n*VINCULAR ABC123*",
+        )
+        return True
+
+    m = _RE_VINCULAR.match(texto)
+    if not m:
+        return False
+
+    resultado, extra = await _verif_consumir_inverso(numero, m.group(1))
+    print(f"[VERIF] numero={numero} resultado={resultado}")
+    await _verif_responder(numero, resultado, extra)
+    return True
+
+
+
+def _wa_dir_invalidar() -> None:
+    """
+    Fuerza el rearmado del índice _WA_DIR en el próximo mensaje.
+
+    Se llama apenas alguien verifica o desvincula su número: sin esto el usuario
+    manda su código, le decimos "listo", y durante todo el TTL el bot lo sigue
+    viendo sin verificar.
+
+    Se vacía el diccionario en vez de poner _WA_DIR_TS en 0, a propósito: el
+    chequeo de vigencia es `time.monotonic() - _WA_DIR_TS > TTL`, y monotonic()
+    arranca cerca de cero en un contenedor recién levantado. Con TS=0, durante
+    los primeros 5 minutos después de cada deploy la invalidación no hacía nada.
+    `if not _WA_DIR` rearma siempre, sin importar el reloj.
+    """
+    global _WA_DIR, _WA_DIR_TS
+    _WA_DIR = {}
+    _WA_DIR_TS = 0.0
+
+
 # ── Identidad ─────────────────────────────────
 
 async def _wa_contexto(user_id, owner_id, nombre, rol, permisos) -> dict:
@@ -595,6 +913,12 @@ async def _wa_construir_directorio() -> dict:
     """Índice {número normalizado → dueño o miembro de equipo}."""
     indice = {}
 
+    perfiles = await _sb_get_todo("perfiles", {
+        "select": "id,nombre,telefono,telefono_verificado",
+        "telefono": "not.is.null", "order": "id.asc",
+    })
+    perfil_por_id = {p["id"]: p for p in perfiles if p.get("id")}
+
     # El equipo primero y los perfiles después, a propósito: si alguien está en
     # las dos tablas gana el perfil, que es de donde sale el contexto de dueño.
     miembros = await _sb_get_todo("equipo", {
@@ -605,12 +929,22 @@ async def _wa_construir_directorio() -> dict:
         if e.get("activo") is False:
             continue
         n = kapso.normalizar_numero(e.get("whatsapp") or "")
-        if n:
-            indice[n] = {"tipo": "equipo", "fila": e}
+        if not n:
+            continue
+        # equipo.whatsapp lo carga alguien a mano y nunca pasó por una
+        # verificación, así que por sí solo no prueba nada. Lo aceptamos únicamente
+        # si el perfil del miembro está verificado con ESE mismo número — es decir,
+        # si de todos modos habría entrado por el índice de perfiles.
+        pm = perfil_por_id.get(e.get("miembro_id"))
+        if not pm or not pm.get("telefono_verificado"):
+            continue
+        if kapso.normalizar_numero(pm.get("telefono") or "") != n:
+            continue
+        indice[n] = {"tipo": "equipo", "fila": e}
 
-    perfiles = await _sb_get_todo("perfiles", {
-        "select": "id,nombre,telefono", "telefono": "not.is.null", "order": "id.asc",
-    })
+    # Los perfiles entran verificados o no: al que está sin verificar hay que
+    # poder contestarle "mandame el código" en vez de tratarlo como un extraño.
+    # El guard de verdad está en _wa_identificar.
     for p in perfiles:
         n = kapso.normalizar_numero(p.get("telefono") or "")
         if n:
@@ -647,6 +981,13 @@ async def _wa_identificar(numero: str) -> dict | None:
     """
     Resuelve quién es el que escribe: dueño de una cuenta o miembro de un equipo.
 
+    GUARD DURO: solo devuelve un contexto usable si el número está VERIFICADO en
+    el perfil. Antes alcanzaba con que alguien lo hubiera tipeado en el registro,
+    y un dígito mal puesto hacía que el bot le sirviera los datos de un productor
+    a otra persona. Cuando el perfil existe pero está sin verificar devuelve
+    {"verificado": False, ...} —sin un solo dato de la cuenta— para poder
+    contestarle cómo verificar en vez de tratarlo como un desconocido.
+
     Compara con los teléfonos normalizados, no con el texto guardado: los
     perfiles tienen '+5492944565308' y WhatsApp manda '542944565308'.
     """
@@ -660,6 +1001,8 @@ async def _wa_identificar(numero: str) -> dict | None:
 
     if hit["tipo"] == "perfil":
         p = hit["fila"]
+        if not p.get("telefono_verificado"):
+            return {"verificado": False, "user_id": p.get("id"), "nombre": p.get("nombre") or ""}
         # Tener perfil propio no significa ser dueño: un empleado invitado también
         # se crea una cuenta al aceptar la invitación. Si es miembro del equipo de
         # alguien, ese es su contexto — igual que hace la app al armar CONTEXTO.
@@ -669,19 +1012,25 @@ async def _wa_identificar(numero: str) -> dict | None:
         })
         if membresias:
             e = membresias[0]
-            return await _wa_contexto(
+            ctx = await _wa_contexto(
                 p["id"], e["owner_id"],
                 e.get("nombre_display") or p.get("nombre") or "",
                 e.get("rol") or "colaborador", e.get("permisos") or {},
             )
-        return await _wa_contexto(p["id"], p["id"], p.get("nombre") or "", "dueño", None)
+        else:
+            ctx = await _wa_contexto(p["id"], p["id"], p.get("nombre") or "", "dueño", None)
+        ctx["verificado"] = True
+        return ctx
 
+    # Los hits de tipo "equipo" ya salen verificados del índice.
     e = hit["fila"]
-    return await _wa_contexto(
+    ctx = await _wa_contexto(
         e.get("miembro_id"), e["owner_id"],
         e.get("nombre_display") or "", e.get("rol") or "colaborador",
         e.get("permisos") or {},
     )
+    ctx["verificado"] = True
+    return ctx
 
 
 def _wa_puede(ident: dict, modulo: str, nivel: str = "ver") -> bool:
@@ -1757,7 +2106,34 @@ async def _kapso_procesar(m) -> None:
     except Exception:
         pass
 
+    texto_crudo = (m.texto or "").strip()
+
+    # VINCULAR va ANTES de identificar: el que todavía no verificó no existe para
+    # el resto del bot, así que este es su único camino de entrada.
+    if await _verif_manejar_comando(numero, texto_crudo):
+        return
+
     ident = await _wa_identificar(numero)
+
+    # Número conocido pero sin verificar: no le damos un solo dato de la cuenta,
+    # solo el modo de probar que el teléfono es suyo.
+    if ident and not ident.get("verificado"):
+        # Mismo silencio que al desconocido: si insiste, no le repetimos el aviso
+        # en cada mensaje.
+        if _wa_corresponde_avisar(numero):
+            nombre_v = (ident.get("nombre") or "").strip().split(" ")[0]
+            await kapso.enviar_texto(
+                numero,
+                (f"Hola {nombre_v} 👋\n\n" if nombre_v else "¡Hola! 👋\n\n") +
+                "Este número figura en una cuenta de Rinde Agro pero todavía no está "
+                "verificado, así que no puedo mostrarte ni cargarte nada.\n\n"
+                f"Entrá a {APP_URL} → *Mi plan* → *Verificar mi WhatsApp* y escribime "
+                "el código que te muestra. Es un mensaje tipo *VINCULAR ABC123*.",
+            )
+        else:
+            print(f"[KAPSO←] {numero} sin verificar y ya avisado, no contesto")
+        return
+
     if not ident:
         # El mensaje viejo daba por hecho que ya tenían cuenta. En producción
         # escribe también gente que todavía no se registró, así que cubrimos
@@ -1768,10 +2144,10 @@ async def _kapso_procesar(m) -> None:
                 "¡Hola! Soy el asistente de *Rinde Agro* 🌾\n\n"
                 "No encontré ninguna cuenta con este número.\n\n"
                 f"• ¿Todavía no tenés cuenta? Creála en {APP_URL} y volvé a escribirme.\n"
-                "• ¿Ya tenés cuenta? Entrá a *Mi Plan* y cargá este número en tu "
-                "perfil para que te reconozca.\n"
-                "• ¿Te sumaron a un equipo? Pedile al dueño de la cuenta que cargue "
-                "tu número en *Mi equipo*.",
+                "• ¿Ya tenés cuenta? Entrá a *Mi plan*, cargá este número y verificalo: "
+                "te va a dar un código para escribirme acá.\n"
+                "• ¿Te sumaron a un equipo? Aceptá la invitación y verificá tu número "
+                "desde *Mi plan*.",
             )
         else:
             print(f"[KAPSO←] {numero} desconocido y ya avisado, no contesto")
@@ -1888,6 +2264,194 @@ async def kapso_webhook(request: Request):
         asyncio.create_task(_kapso_procesar(m))
 
     return {"ok": True, "recibidos": len(mensajes)}
+
+
+# ══════════════════════════════════════════════
+# VERIFICACIÓN — ENDPOINTS (fallback OTP saliente)
+# ══════════════════════════════════════════════
+# El camino principal es el inverso: el usuario le escribe VINCULAR <código> al
+# bot y no hace falta ningún endpoint. Esto es para el que prefiere que le
+# llegue el código y tipearlo en la web.
+#
+# Van por el server y no directo a Supabase porque marcar telefono_verificado
+# está reservado a service_role (trigger tg_perfiles_guard_verificacion): si el
+# frontend pudiera hacerlo solo, todo el mecanismo sería decorativo.
+
+VERIF_MAX_ENVIOS_HORA = 5   # códigos salientes por usuario por hora
+
+
+async def _auth_usuario(request: Request) -> dict:
+    """Resuelve el usuario dueño del JWT del header Authorization. 401 si no."""
+    auth = request.headers.get("authorization", "")
+    token = auth[7:].strip() if auth[:7].lower() == "bearer " else ""
+    if not token:
+        raise HTTPException(status_code=401, detail="falta el token de sesión")
+    try:
+        async with httpx.AsyncClient(timeout=10) as c:
+            r = await c.get(
+                f"{_sb_url()}/auth/v1/user",
+                headers={"apikey": _sb_key(), "Authorization": f"Bearer {token}"},
+            )
+    except Exception as e:
+        print(f"[AUTH] excepción: {e}")
+        raise HTTPException(status_code=503, detail="no pude validar la sesión")
+    if r.status_code != 200:
+        raise HTTPException(status_code=401, detail="sesión inválida o vencida")
+    u = r.json() or {}
+    if not u.get("id"):
+        raise HTTPException(status_code=401, detail="sesión inválida")
+    return u
+
+
+async def _verif_envios_recientes(user_id: str) -> int:
+    desde = (_ahora() - timedelta(hours=1)).isoformat()
+    rows = await _sb_get("verificaciones_telefono", {
+        "user_id": f"eq.{user_id}", "metodo": "eq.saliente",
+        "created_at": f"gt.{desde}", "select": "id", "limit": "50",
+    })
+    return len(rows)
+
+
+@app.post("/whatsapp/verificacion/enviar")
+async def verificacion_enviar(request: Request):
+    """Manda un código de 6 dígitos por WhatsApp al número que pide el usuario."""
+    u = await _auth_usuario(request)
+    user_id = u["id"]
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    crudo = (body.get("telefono") or "").strip()
+    if not crudo:
+        rows = await _sb_get("perfiles", {"id": f"eq.{user_id}", "select": "telefono", "limit": "1"})
+        crudo = (rows[0].get("telefono") if rows else "") or ""
+    numero = kapso.normalizar_numero(crudo)
+    if not numero or len(numero) < 10:
+        raise HTTPException(status_code=400, detail="El número no parece válido. Revisá el código de país.")
+
+    duenio = await _verif_duenio_actual(numero)
+    if duenio and duenio != user_id:
+        raise HTTPException(
+            status_code=409,
+            detail="Ese número ya está verificado en otra cuenta. Desvinculalo de allá primero.",
+        )
+
+    if await _verif_envios_recientes(user_id) >= VERIF_MAX_ENVIOS_HORA:
+        raise HTTPException(
+            status_code=429,
+            detail="Pediste demasiados códigos. Esperá una hora o escribinos el código por WhatsApp.",
+        )
+
+    codigo = _verif_generar_codigo(solo_digitos=True)
+    creada = await _sb_post("verificaciones_telefono", {
+        "user_id": user_id,
+        "telefono": numero,
+        "telefono_display": crudo,
+        "codigo_hash": _verif_hash(user_id, codigo),
+        "metodo": "saliente",
+        "expira_en": (_ahora() + timedelta(minutes=VERIF_VIGENCIA_MIN)).isoformat(),
+    })
+    if not creada:
+        raise HTTPException(status_code=503, detail="No pude generar el código. Probá de nuevo.")
+
+    enviado = await kapso.enviar_texto(
+        numero,
+        f"Tu código de verificación de Rinde Agro es *{codigo}*.\n\n"
+        f"Tipealo en la web. Vence en {VERIF_VIGENCIA_MIN} minutos.\n"
+        "Si no lo pediste vos, ignorá este mensaje.",
+    )
+    if not enviado:
+        # Fuera de la ventana de 24 h Meta rechaza el texto libre. No es un bug
+        # del código: le decimos al usuario que use el camino inverso, que
+        # justamente no tiene esa limitación.
+        raise HTTPException(
+            status_code=502,
+            detail="No pude mandarte el mensaje. Usá el otro método: escribinos el código por WhatsApp.",
+        )
+    return {"ok": True, "expira_en_min": VERIF_VIGENCIA_MIN}
+
+
+@app.post("/whatsapp/verificacion/confirmar")
+async def verificacion_confirmar(request: Request):
+    """Valida el código de 6 dígitos que el usuario tipeó en la web."""
+    u = await _auth_usuario(request)
+    user_id = u["id"]
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    codigo = (body.get("codigo") or "").strip()
+    if not codigo:
+        raise HTTPException(status_code=400, detail="Falta el código.")
+
+    pendientes = await _sb_get("verificaciones_telefono", {
+        "user_id": f"eq.{user_id}", "metodo": "eq.saliente", "usado": "eq.false",
+        "expira_en": f"gt.{_ahora().isoformat()}",
+        "select": "id,telefono,codigo_hash,intentos",
+        "order": "created_at.desc", "limit": "10",
+    })
+    if not pendientes:
+        raise HTTPException(status_code=400, detail="No tenés ningún código vigente. Pedí uno nuevo.")
+
+    esperado = _verif_hash(user_id, codigo)
+    fila = next((f for f in pendientes
+                 if hmac.compare_digest(esperado, f.get("codigo_hash") or "")), None)
+
+    if not fila:
+        # Se le suma el intento al código más nuevo, que es el que estaba usando.
+        activo = pendientes[0]
+        intentos = int(activo.get("intentos") or 0) + 1
+        quemado = intentos >= VERIF_MAX_INTENTOS_FILA
+        await _sb_patch(f"verificaciones_telefono?id=eq.{activo['id']}", {
+            "intentos": intentos,
+            **({"usado": True, "usado_en": _ahora().isoformat()} if quemado else {}),
+        })
+        if quemado:
+            raise HTTPException(status_code=429, detail="Demasiados intentos. Pedí un código nuevo.")
+        raise HTTPException(
+            status_code=400,
+            detail=f"Código incorrecto. Te quedan {VERIF_MAX_INTENTOS_FILA - intentos} intentos.",
+        )
+
+    numero = fila.get("telefono") or ""
+    duenio = await _verif_duenio_actual(numero)
+    if duenio and duenio != user_id:
+        raise HTTPException(
+            status_code=409,
+            detail="Ese número ya está verificado en otra cuenta. Desvinculalo de allá primero.",
+        )
+
+    if not await _verif_marcar_perfil(user_id, numero):
+        raise HTTPException(status_code=503, detail="No pude guardar la verificación. Probá de nuevo.")
+
+    await _sb_patch(
+        f"verificaciones_telefono?user_id=eq.{user_id}&usado=eq.false",
+        {"usado": True, "usado_en": _ahora().isoformat(), "verificado_desde": numero},
+    )
+    _wa_dir_invalidar()
+    return {"ok": True, "telefono": numero}
+
+
+@app.post("/whatsapp/verificacion/desvincular")
+async def verificacion_desvincular(request: Request):
+    """
+    Suelta el número del perfil del usuario que llama.
+
+    Hace falta para poder mover un número de una cuenta a otra: el índice único
+    de perfiles verificados no deja tener el mismo número en dos lados.
+    """
+    u = await _auth_usuario(request)
+    await _sb_patch(f"perfiles?id=eq.{u['id']}", {
+        "telefono_verificado": False,
+        "telefono_verificado_en": None,
+    })
+    await _sb_patch(
+        f"verificaciones_telefono?user_id=eq.{u['id']}&usado=eq.false",
+        {"usado": True, "usado_en": _ahora().isoformat()},
+    )
+    _wa_dir_invalidar()
+    return {"ok": True}
 
 
 @app.get("/whatsapp/kapso/estado")
@@ -2146,6 +2710,29 @@ async def procesar_mensaje_whatsapp(numero: str, texto: str, media_url: str, med
     n = _norm(texto_final)
     print(f"[DEBUG procesar] texto_final={repr(texto_final)} n={repr(n)}")
 
+    # ── 1.b VINCULAR — antes de identificar, igual que en el flujo de Kapso ────
+    if _RE_VINCULAR_SOLO.match(texto_final):
+        return (f"Para vincular tu número entrá a {APP_URL} → Mi plan → Verificar mi WhatsApp "
+                "y escribinos el código que te muestra: VINCULAR ABC123")
+    m_vinc = _RE_VINCULAR.match(texto_final)
+    if m_vinc:
+        resultado, extra = await _verif_consumir_inverso(numero, m_vinc.group(1))
+        print(f"[VERIF twilio] numero={numero} resultado={resultado}")
+        if resultado == "ok":
+            aviso = "✅ Listo, tu número quedó verificado. Ya podés usarme."
+            if extra.get("difiere"):
+                aviso += (f"\n\n⚠️ En tu perfil figuraba {extra.get('cargado')}, que no es este "
+                          "número. Lo corregí por el número desde el que me escribiste.")
+            return aviso
+        if resultado == "bloqueado":
+            return "Demasiados intentos fallidos. Esperá una hora y generá un código nuevo."
+        if resultado == "ocupado":
+            return "Este número ya está verificado en otra cuenta. Desvinculalo de allá primero."
+        if resultado == "error":
+            return "No pude guardar la verificación. Probá de nuevo en un minuto."
+        return (f"Ese código no me sirve — puede estar vencido, ya usado o mal copiado.\n"
+                f"Generá uno nuevo en {APP_URL} → Mi plan. Duran {VERIF_VIGENCIA_MIN} minutos.")
+
     # ── 2. Comandos de menú puro → responder sin necesitar Supabase ─────
     if n in MENU_WORDS:
         print(f"[DEBUG procesar] → es MENU_WORD, retorna menú")
@@ -2157,12 +2744,17 @@ async def procesar_mensaje_whatsapp(numero: str, texto: str, media_url: str, med
         return MENU_TEXT
 
     # ── 4. Identificar usuario ──────────────────────────────────────────
-    rows = await _sb_get("perfiles", {"telefono": f"eq.{numero}", "select": "id,nombre,campos(id,nombre)"})
-    print(f"[DEBUG procesar] perfiles encontrados: {len(rows)} — ids={[r.get('id') for r in rows]}")
+    # telefono_verificado=eq.true es el mismo guard que en el flujo de Kapso: un
+    # número cargado a mano no prueba que sea de quien escribe.
+    rows = await _sb_get("perfiles", {
+        "telefono": f"eq.{numero}", "telefono_verificado": "eq.true",
+        "select": "id,nombre,campos(id,nombre)",
+    })
+    print(f"[DEBUG procesar] perfiles verificados: {len(rows)} — ids={[r.get('id') for r in rows]}")
     if not rows:
         return (
-            f"⚠️ Tu número {numero} no está vinculado a ninguna cuenta Rinde Agro.\n"
-            "Ingresá a rindeagro.lat y vinculá tu WhatsApp en Configuración."
+            f"⚠️ Tu número {numero} no está vinculado y verificado en ninguna cuenta de Rinde Agro.\n"
+            f"Entrá a {APP_URL} → Mi plan → Verificar mi WhatsApp y escribinos el código."
         )
     usuario = rows[0]
     campos = usuario.get("campos") or []
@@ -2339,7 +2931,11 @@ async def cargar_en_supabase(datos: dict, usuario: dict, sb_url: str, sb_key: st
 async def _wa_get_destinatarios(flag: str) -> list[dict]:
     """
     Devuelve lista de {user_id, numero_whatsapp, nombre} de usuarios que tienen
-    la preferencia `flag` activada y activo=true, con WhatsApp vinculado.
+    la preferencia `flag` activada y activo=true, con WhatsApp VERIFICADO.
+
+    La verificación importa tanto acá como en los mensajes entrantes: el resumen
+    semanal lleva plata, rindes y nombres de campos. Mandárselo al número que
+    alguien tipeó mal es filtrar los datos de un productor a un desconocido.
     """
     prefs = await _sb_get(
         "wa_preferencias_notificaciones",
@@ -2353,8 +2949,10 @@ async def _wa_get_destinatarios(flag: str) -> list[dict]:
         uid = p.get("user_id")
         if not uid:
             continue
-        rows = await _sb_get("perfiles", {"id": f"eq.{uid}", "select": "id,nombre,telefono"})
-        if rows and rows[0].get("telefono"):
+        rows = await _sb_get("perfiles", {
+            "id": f"eq.{uid}", "select": "id,nombre,telefono,telefono_verificado",
+        })
+        if rows and rows[0].get("telefono") and rows[0].get("telefono_verificado"):
             destinatarios.append({
                 "user_id": uid,
                 "numero":  rows[0]["telefono"],
