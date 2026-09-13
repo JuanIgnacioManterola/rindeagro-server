@@ -23,6 +23,9 @@ from dataclasses import dataclass, field
 import httpx
 
 BASE_URL = "https://api.kapso.ai/meta/whatsapp/v24.0"
+# La Platform API es otra base: sirve para consultar los números conectados
+# al proyecto (útil para verificar a qué número está apuntando el server).
+PLATFORM_URL = "https://api.kapso.ai/platform/v1"
 
 # Límites de la plataforma de WhatsApp (Meta), no de Kapso.
 MAX_BOTONES        = 3
@@ -169,6 +172,35 @@ async def enviar_lista(numero: str, texto: str, boton_texto: str, filas: list,
     })
 
 
+async def enviar_plantilla(numero: str, nombre: str, idioma: str = "es_AR",
+                           parametros: list = None) -> dict:
+    """
+    Manda un message template aprobado por Meta.
+
+    Hace falta para cualquier mensaje que arranquemos nosotros pasadas 24 horas
+    del último mensaje del usuario: fuera de esa ventana Meta rechaza el texto
+    libre y solo acepta plantillas (los recordatorios y el resumen semanal caen
+    justo en ese caso).
+
+    parametros: los {{1}}, {{2}}... del body, en orden. Se mandan como texto.
+    """
+    componentes = []
+    if parametros:
+        componentes.append({
+            "type": "body",
+            "parameters": [{"type": "text", "text": str(v)} for v in parametros],
+        })
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": normalizar_numero(numero),
+        "type": "template",
+        "template": {"name": nombre, "language": {"code": idioma}},
+    }
+    if componentes:
+        payload["template"]["components"] = componentes
+    return await _post(payload)
+
+
 async def marcar_leido(message_id: str, escribiendo: bool = False) -> dict:
     """
     Marca el mensaje como leído. Con escribiendo=True muestra 'escribiendo…'
@@ -203,6 +235,33 @@ async def descargar_media(url: str) -> bytes:
 
 
 # ══════════════════════════════════════════════════════════════
+# PLATFORM API — NÚMEROS CONECTADOS
+# ══════════════════════════════════════════════════════════════
+
+async def listar_numeros() -> list:
+    """
+    Números de WhatsApp conectados al proyecto de Kapso.
+
+    Sirve para verificar sin adivinar a qué número está apuntando el server:
+    el `phone_number_id` que devuelve acá es el que va en KAPSO_PHONE_NUMBER_ID.
+    Devuelve [] si falla, así el endpoint de diagnóstico nunca rompe.
+    """
+    if not _api_key():
+        return []
+    try:
+        async with httpx.AsyncClient(timeout=15) as c:
+            r = await c.get(f"{PLATFORM_URL}/whatsapp/phone_numbers",
+                            headers={"X-API-Key": _api_key()})
+            if r.status_code == 200:
+                data = r.json()
+                return data.get("data", data) if isinstance(data, dict) else data
+            print(f"[KAPSO numeros] HTTP {r.status_code}: {r.text[:200]}")
+    except Exception as e:
+        print(f"[KAPSO numeros] excepción: {e}")
+    return []
+
+
+# ══════════════════════════════════════════════════════════════
 # WEBHOOK — FIRMA
 # ══════════════════════════════════════════════════════════════
 
@@ -210,15 +269,22 @@ def firma_valida(body_crudo: bytes, firma: str) -> bool:
     """
     Valida el HMAC-SHA256 que Kapso manda en X-Webhook-Signature.
 
-    Si no hay secret configurado devolvemos True: permite levantar el webhook
-    y probar antes de configurar el secret. Apenas se setea KAPSO_WEBHOOK_SECRET
-    la validación pasa a ser obligatoria.
+    Si no hay secret configurado devolvemos True, pero avisando fuerte por log.
+    Con el número de sandbox eso era inofensivo; con un número de producción la
+    URL del webhook es pública y sin secret cualquiera puede postear mensajes
+    falsos. Setear KAPSO_WEBHOOK_SECRET no es opcional en producción.
     """
     secret = _webhook_secret()
     if not secret:
+        print("[KAPSO←] ⚠️  KAPSO_WEBHOOK_SECRET sin configurar: el webhook "
+              "acepta cualquier POST. Configuralo antes de salir a producción.")
         return True
     if not firma:
         return False
+
+    # Los webhooks de tipo 'meta' firman con el prefijo 'sha256='.
+    if firma.startswith("sha256="):
+        firma = firma[7:]
 
     esperada = hmac.new(secret.encode(), body_crudo, hashlib.sha256).hexdigest()
     if hmac.compare_digest(firma, esperada):
