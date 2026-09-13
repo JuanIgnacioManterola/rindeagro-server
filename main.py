@@ -15,7 +15,7 @@ import pytz
 
 import kapso
 
-app = FastAPI(title="RindeAgro Server", version="2.0.0")
+app = FastAPI(title="Rinde Agro Server", version="2.0.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -217,7 +217,7 @@ async def _wa_clear_conv(numero: str):
 # ══════════════════════════════════════════════
 
 MENU_TEXT = (
-    "🌾 *RindeAgro* - ¿Qué querés hacer?\n\n"
+    "🌾 *Rinde Agro* - ¿Qué querés hacer?\n\n"
     "1️⃣ Cargar gasto\n"
     "2️⃣ Registrar lluvia\n"
     "3️⃣ Ver mis tareas pendientes\n"
@@ -248,7 +248,7 @@ async def _manejar_stop_activar(numero: str, texto: str) -> str | None:
             )
         await _wa_clear_conv(numero)
         return (
-            "✅ Listo, no vas a recibir más mensajes de RindeAgro.\n\n"
+            "✅ Listo, no vas a recibir más mensajes de Rinde Agro.\n\n"
             "Si querés volver a activarlos escribí *ACTIVAR* en cualquier momento."
         )
     if n in ACTIVAR_WORDS or any(aw in n for aw in ACTIVAR_WORDS):
@@ -1520,7 +1520,7 @@ ESQUEMA_INTENCION = {
     "additionalProperties": False,
 }
 
-INSTRUCCIONES_CLAUDE = """Sos el asistente de Rinde.Agro, una app de gestión agropecuaria argentina, \
+INSTRUCCIONES_CLAUDE = """Sos el asistente de Rinde Agro, una app de gestión agropecuaria argentina, \
 atendiendo por WhatsApp a productores y a sus empleados de campo.
 
 Tu trabajo es leer un mensaje escrito como habla la gente en el campo y decidir qué acción corresponde.
@@ -1765,7 +1765,7 @@ async def _kapso_procesar(m) -> None:
         if _wa_corresponde_avisar(numero):
             await kapso.enviar_texto(
                 numero,
-                "¡Hola! Soy el asistente de *Rinde.Agro* 🌾\n\n"
+                "¡Hola! Soy el asistente de *Rinde Agro* 🌾\n\n"
                 "No encontré ninguna cuenta con este número.\n\n"
                 f"• ¿Todavía no tenés cuenta? Creála en {APP_URL} y volvé a escribirme.\n"
                 "• ¿Ya tenés cuenta? Entrá a *Mi Plan* y cargá este número en tu "
@@ -2161,7 +2161,7 @@ async def procesar_mensaje_whatsapp(numero: str, texto: str, media_url: str, med
     print(f"[DEBUG procesar] perfiles encontrados: {len(rows)} — ids={[r.get('id') for r in rows]}")
     if not rows:
         return (
-            f"⚠️ Tu número {numero} no está vinculado a ninguna cuenta RindeAgro.\n"
+            f"⚠️ Tu número {numero} no está vinculado a ninguna cuenta Rinde Agro.\n"
             "Ingresá a rindeagro.lat y vinculá tu WhatsApp en Configuración."
         )
     usuario = rows[0]
@@ -2385,7 +2385,7 @@ async def _wa_recordatorio_admins():
     print("[SCHEDULER] Recordatorio admins")
     destinatarios = await _wa_get_destinatarios("recordatorio_admin")
     mensaje = (
-        "📊 *RindeAgro* - Recordatorio semanal\n\n"
+        "📊 *Rinde Agro* - Recordatorio semanal\n\n"
         "Mañana recibís tu resumen de la semana.\n"
         "¿Te olvidaste de cargar algo?\n\n"
         "1️⃣ Cargar gasto\n"
@@ -2530,7 +2530,7 @@ async def _wa_check_alertas_precio():
         return
 
     mensaje = (
-        f"🔔 *Alerta de precio RindeAgro*\n\n"
+        f"🔔 *Alerta de precio Rinde Agro*\n\n"
         f"Precio actual de *Soja*: USD {precio_actual}/t\n\n"
         "¿Querés revisar tus márgenes? Entrá a rindeagro.lat"
     )
@@ -2579,10 +2579,10 @@ async def crear_suscripcion(request: Request):
 
     if es_anual:
         precio_usd = plan["precio_usd_anual"]
-        razon = f"RindeAgro · Plan {plan['nombre']} Anual"
+        razon = f"Rinde Agro · Plan {plan['nombre']} Anual"
     else:
         precio_usd = plan["precio_usd"]
-        razon = f"RindeAgro · Plan {plan['nombre']} Mensual"
+        razon = f"Rinde Agro · Plan {plan['nombre']} Mensual"
 
     precio_ars_base = round(precio_usd * bna_val)
     precio_ars      = round(precio_ars_base * (1 + interes / 100))
