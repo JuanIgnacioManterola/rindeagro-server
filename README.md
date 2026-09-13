@@ -1,6 +1,6 @@
-# RindeAgro Server
+# Rinde Agro Server
 
-Servidor backend para RindeAgro. Maneja:
+Servidor backend para Rinde Agro. Maneja:
 - 📈 Precios de cereales (scraping BCR Rosario)
 - 💵 Dólar BNA
 - 📱 Carga de datos por WhatsApp (texto, audio, PDF)
