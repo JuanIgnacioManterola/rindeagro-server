@@ -1027,6 +1027,19 @@ async def _kapso_texto_libre(ident: dict, numero: str, texto: str,
     # Gasto dicho en criollo, sin IA: "gasté 1200 de urea en La Esperanza"
     if _wa_puede(ident, "gastos", "editar"):
         parseado = _parsear_gasto(texto, ident.get("campos") or [])
+        # Si no reconocimos el producto ("orea" en vez de urea, por la
+        # transcripción del audio) y hay IA, que decida Claude el rubro en vez
+        # de mandarlo derecho a "otros".
+        # Lo mismo con los pesos: Claude entiende "300, eh, 300 mil" o "300 lucas".
+        if parseado and os.environ.get("ANTHROPIC_API_KEY") and (
+                parseado.get("ars") or not _rubro_por_texto(texto)[1]):
+            parseado = None
+        if parseado and parseado.get("ars"):
+            ars = parseado["gasto"]["total_de_usd"]
+            tc = await _dolar_venta()
+            parseado["gasto"]["total_de_usd"] = round(ars / tc, 2)
+            parseado["gasto"]["descripcion"] = (
+                f"{parseado['gasto']['descripcion']} (ARS {_miles(ars)} al BNA ${_miles(tc)})")
         if parseado:
             datos = {"gasto": parseado["gasto"]}
             campo = parseado.get("campo")
@@ -1256,15 +1269,16 @@ _RE_GASTO = re.compile(
     r"me sali[oó]|sali[oó]|cost[oó]|invert[ií])\b")
 
 # Plata: 1200 · 1.200 · 1,200 · $1200 · usd 1200 · 1200 dolares · 3 mil
-_NUM = r"\d{1,3}(?:[.,]\d{3})+(?:[.,]\d{1,2})?|\d+(?:[.,]\d{1,2})?"
-_NUM_SUELTO = r"\d{1,3}(?:[.,]\d{3})+(?:[.,]\d{1,2})?|\d{3,}(?:[.,]\d{1,2})?"
+# Miles con punto, coma o espacio ("100 000" es como transcribe los audios).
+_NUM = r"\d{1,3}(?:[., ]\d{3})+(?:[.,]\d{1,2})?|\d+(?:[.,]\d{1,2})?"
+_NUM_SUELTO = r"\d{1,3}(?:[., ]\d{3})+(?:[.,]\d{1,2})?|\d{3,}(?:[.,]\d{1,2})?"
 
 _RE_PLATA = re.compile(
     r"(?:us\$|usd|u\$s|\$)\s*(" + _NUM + r")"
     r"|(" + _NUM + r")\s*(?:mil\b|k\b|usd|u\$s|d[oó]lar(?:es)?\b|verdes|palos)"
     r"|(" + _NUM_SUELTO + r")")
 
-_RE_PESOS = re.compile(r"\bpesos\b|\bar\$|\$ar\b")
+_RE_PESOS = re.compile(r"\bpesos\b|\bar\$|\$ar\b|\bars\b|\blucas\b")
 
 _RE_VER_TAREAS = re.compile(
     r"(qu[eé] (tengo|hay|me toca|tenemos)|mis tareas|tareas pendientes|"
@@ -1285,10 +1299,10 @@ def _parsear_plata(texto: str) -> float | None:
     # y "1.200,50" es las dos cosas a la vez.
     dec = re.search(r"[.,](\d{1,2})$", crudo)
     if dec:
-        entero = re.sub(r"[.,]", "", crudo[:dec.start()])
+        entero = re.sub(r"[., ]", "", crudo[:dec.start()])
         valor = float(f"{entero}.{dec.group(1)}")
     else:
-        valor = float(re.sub(r"[.,]", "", crudo))
+        valor = float(re.sub(r"[., ]", "", crudo))
 
     # "3 mil" / "3k" → 3000
     cola = texto[m.end():m.end() + 6].lower()
@@ -1329,8 +1343,7 @@ def _parsear_gasto(texto: str, campos: list) -> dict | None:
     if not anuncia_gasto and not producto:
         return None
 
-    if _RE_PESOS.search(n):
-        return None  # en pesos no sabemos convertir sin preguntar
+    en_pesos = bool(_RE_PESOS.search(n))
 
     monto = _parsear_plata(texto)
     if monto is None or monto <= 0:
@@ -1347,6 +1360,7 @@ def _parsear_gasto(texto: str, campos: list) -> dict | None:
         "gasto": {"rubro": rubro, "descripcion": (desc or producto or "sin detalle")[:300],
                   "total_de_usd": monto},
         "campo": campo,
+        "ars": en_pesos,   # si es True, total_de_usd todavía está en pesos
     }
 
 
@@ -1368,12 +1382,13 @@ ESQUEMA_INTENCION = {
         "campo_id":        {"type": ["string", "null"]},
         "rubro":           {"type": ["string", "null"]},
         "monto_usd":       {"type": ["number", "null"]},
+        "monto_ars":       {"type": ["number", "null"]},
         "descripcion":     {"type": ["string", "null"]},
         "mm":              {"type": ["number", "null"]},
         "nombre_invitado": {"type": ["string", "null"]},
         "confianza":       {"type": "string", "enum": ["alta", "media", "baja"]},
     },
-    "required": ["accion", "tarea_id", "nota", "campo_id", "rubro", "monto_usd",
+    "required": ["accion", "tarea_id", "nota", "campo_id", "rubro", "monto_usd", "monto_ars",
                  "descripcion", "mm", "nombre_invitado", "confianza"],
     "additionalProperties": False,
 }
@@ -1401,9 +1416,34 @@ Reglas:
 - Si menciona un campo o una tarea de forma aproximada ("la loma", "lo del silo"), resolvé al ID que \
 corresponda.
 - Si hay una tarea en foco y el mensaje habla de "la tarea", "esto" o "la", se refiere a esa.
-- Los montos son en dólares salvo que diga pesos. Si dice pesos, dejá monto_usd en null.
+- Los montos son en dólares salvo que diga pesos. Si dice pesos, poné el número en monto_ars y dejá \
+monto_usd en null: la conversión la hace el sistema. "300 lucas" o "300 mil pesos" son 300000.
+- Si la persona se corrige ("300, eh, 300 mil"), tomá el último número que dice.
 - confianza baja si estás adivinando. Ante la duda, poné baja: preferimos preguntar antes que cargar mal.
 - No inventes datos que el mensaje no dice."""
+
+
+def _miles(v: float) -> str:
+    """100000 → '100.000' (como se escriben los pesos en Argentina)."""
+    return f"{round(float(v)):,}".replace(",", ".")
+
+
+_DOLAR_CACHE = {"valor": None, "ts": 0.0}
+
+
+async def _dolar_venta() -> float:
+    """Dólar BNA divisa vendedor (el que usa la web para egresos). Cachea 30 min."""
+    if _DOLAR_CACHE["valor"] and time.monotonic() - _DOLAR_CACHE["ts"] < 1800:
+        return _DOLAR_CACHE["valor"]
+    try:
+        rows = await _sb_get("v_precio_dolar_actual", {"select": "divisa_venta", "limit": "1"})
+        v = float((rows or [{}])[0].get("divisa_venta") or 0)
+        if v > 100:
+            _DOLAR_CACHE.update(valor=v, ts=time.monotonic())
+            return v
+    except Exception as e:
+        print(f"[DOLAR] error leyendo v_precio_dolar_actual: {e}")
+    return float(cache_precios.get("bna") or 1400)
 
 
 def _contexto_para_claude(ident: dict, tareas: list, tarea_activa: dict = None) -> str:
@@ -1512,13 +1552,24 @@ async def _kapso_aplicar_intencion(ident: dict, numero: str, intencion: dict) ->
             float(intencion["mm"]))
         return True
 
-    if accion == "gasto" and intencion.get("monto_usd") is not None:
+    if accion == "gasto" and (intencion.get("monto_usd") is not None
+                              or intencion.get("monto_ars") is not None):
         if not _wa_puede(ident, "gastos", "editar"):
             return False
+        descripcion = intencion.get("descripcion") or ""
+        if intencion.get("monto_usd") is not None:
+            usd = float(intencion["monto_usd"])
+        else:
+            # En pesos: lo pasamos a dólares con el BNA vendedor del día, el
+            # mismo que usa la web para los egresos, y lo dejamos anotado.
+            ars = float(intencion["monto_ars"])
+            tc = await _dolar_venta()
+            usd = round(ars / tc, 2)
+            descripcion = (f"{descripcion} (ARS {_miles(ars)} al BNA ${_miles(tc)})").strip()
         datos = {"gasto": {
             "rubro": (intencion.get("rubro") or "Otros").capitalize(),
-            "descripcion": intencion.get("descripcion") or "",
-            "total_de_usd": float(intencion["monto_usd"]),
+            "descripcion": descripcion,
+            "total_de_usd": usd,
         }}
         cid = intencion.get("campo_id")
         if cid in ids_campos:
