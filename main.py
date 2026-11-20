@@ -763,32 +763,39 @@ async def _kapso_gasto_desde_archivo(ident: dict, numero: str, m) -> None:
         await kapso.enviar_texto(numero, "No pude bajar el archivo. ¿Me lo reenviás?")
         return
 
+    nombre_arch = m.media_nombre or ("factura.pdf" if m.es_pdf else "factura.jpg")
+    path = f"{ident['owner_id']}/{int(datetime.utcnow().timestamp())}_{nombre_arch}"
+
     items = await _ocr_factura(contenido, m.media_tipo)
-    if items is None:
-        await kapso.enviar_texto(
-            numero,
-            "Todavía no puedo leer facturas automáticamente 😕\n\n"
-            "Decime el monto en dólares y qué compraste, por ejemplo "
-            "_gasté 1200 dólares de urea_, y lo cargo.",
-        )
-        return
     if not items:
-        await kapso.enviar_texto(
-            numero,
-            "No encontré renglones de insumos en ese documento 🤔\n\n"
-            "Probá con una foto más nítida, o decime el monto y lo cargo a mano.",
-        )
+        # No se pudo leer (o no tiene renglones de insumos): igual guardamos la
+        # foto y la adjuntamos al gasto que carguen a mano, así queda en la web.
+        url = await _sb_storage_subir("insumos-facturas", path, contenido, m.media_tipo)
+        datos = {"gasto": {"factura_url": url, "factura_path": path, "factura_tipo": "factura"}}
+        motivo = ("No pude leer los renglones de la factura 🤔" if items is not None
+                  else "Todavía no puedo leer facturas automáticamente 😕")
+        if await _kapso_pedir_campo(ident, numero, "k_gasto_campo", datos,
+                                    f"{motivo}\n\nGuardé la foto 📎 y la cargamos a mano. "
+                                    "¿A qué campo va?"):
+            return
+        await _wa_set_conv(numero, "k_gasto_rubro", datos)
+        await _kapso_pedir_rubro(numero)
         return
 
+    # El subtotal impreso de cada renglón manda: recalcular cantidad x precio
+    # falla cuando el precio es por bidón/bolsa y la cantidad en litros/kg
+    # (1 bidón de 20 L a USD 60 daba USD 1200 en vez de 60).
     total = 0.0
     for it in items:
+        sub = it.get("subtotal_usd")
+        if sub is not None:
+            total += float(sub)
+            continue
         cant = float(it.get("cantidad") or 0)
         pu = it.get("precio_unitario")
         if pu is not None:
             total += cant * float(pu)
 
-    nombre_arch = m.media_nombre or ("factura.pdf" if m.es_pdf else "factura.jpg")
-    path = f"{ident['owner_id']}/{int(datetime.utcnow().timestamp())}_{nombre_arch}"
     url = await _sb_storage_subir("insumos-facturas", path, contenido, m.media_tipo)
 
     principal = items[0]
