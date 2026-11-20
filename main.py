@@ -1,6 +1,5 @@
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, Response
 import httpx
 import asyncio
 from datetime import datetime, date, timedelta
@@ -14,6 +13,7 @@ from apscheduler.triggers.cron import CronTrigger
 import pytz
 
 import kapso
+import plantillas_wa
 
 app = FastAPI(title="Rinde Agro Server", version="2.0.0")
 app.add_middleware(
@@ -126,34 +126,6 @@ async def _sb_upsert(table: str, payload: dict, on_conflict: str = "") -> list:
 
 
 # ══════════════════════════════════════════════
-# HELPERS — Twilio WhatsApp (mensajes proactivos)
-# ══════════════════════════════════════════════
-
-async def _wa_enviar(numero: str, mensaje: str) -> bool:
-    """Envía un mensaje WhatsApp outbound via Twilio (no es respuesta webhook)."""
-    try:
-        sid   = os.environ.get("TWILIO_ACCOUNT_SID", "")
-        token = os.environ.get("TWILIO_AUTH_TOKEN", "")
-        from_ = os.environ.get("TWILIO_WHATSAPP_FROM", "")
-        if not all([sid, token, from_]):
-            print(f"[WA→] Twilio no configurado, mensaje no enviado a {numero}")
-            return False
-        from twilio.rest import Client
-        client = Client(sid, token)
-        await asyncio.to_thread(
-            client.messages.create,
-            from_=from_,
-            to=f"whatsapp:{numero}",
-            body=mensaje,
-        )
-        print(f"[WA→] {numero}: {mensaje[:60]}")
-        return True
-    except Exception as e:
-        print(f"[WA→] Error enviando a {numero}: {e}")
-        return False
-
-
-# ══════════════════════════════════════════════
 # WHATSAPP — ESTADO DE CONVERSACIÓN
 # ══════════════════════════════════════════════
 
@@ -236,164 +208,6 @@ def _norm(texto: str) -> str:
     return texto.strip().lower()
 
 
-async def _manejar_stop_activar(numero: str, texto: str) -> str | None:
-    """Devuelve respuesta si el mensaje es STOP/ACTIVAR, None si no aplica."""
-    n = _norm(texto)
-    if n in STOP_WORDS or any(sw in n for sw in STOP_WORDS):
-        rows = await _sb_get("perfiles", {"telefono": f"eq.{numero}", "select": "id"})
-        if rows:
-            await _sb_patch(
-                f"wa_preferencias_notificaciones?user_id=eq.{rows[0]['id']}",
-                {"activo": False},
-            )
-        await _wa_clear_conv(numero)
-        return (
-            "✅ Listo, no vas a recibir más mensajes de Rinde Agro.\n\n"
-            "Si querés volver a activarlos escribí *ACTIVAR* en cualquier momento."
-        )
-    if n in ACTIVAR_WORDS or any(aw in n for aw in ACTIVAR_WORDS):
-        rows = await _sb_get("perfiles", {"telefono": f"eq.{numero}", "select": "id"})
-        if rows:
-            await _sb_patch(
-                f"wa_preferencias_notificaciones?user_id=eq.{rows[0]['id']}",
-                {"activo": True},
-            )
-        return "✅ Notificaciones reactivadas. ¡Bienvenido de vuelta! 🌾"
-    return None
-
-
-async def _procesar_flujo(conv: dict, texto: str, usuario: dict) -> str:
-    """Procesa el siguiente paso según el estado actual de la conversación."""
-    estado  = conv["estado"]
-    datos   = conv.get("datos_parciales") or {}
-    numero  = conv["numero_whatsapp"]
-    n       = _norm(texto)
-    campos  = usuario.get("campos", [])
-
-    # Cancelar en cualquier momento
-    if n in {"0", "cancelar", "cancel", "salir"}:
-        await _wa_clear_conv(numero)
-        return f"❌ Cancelado.\n\n{MENU_TEXT}"
-
-    # ── FLUJO GASTO ──────────────────────────────
-    if estado == "gasto_campo":
-        campo = _buscar_campo(texto, campos)
-        if not campo:
-            lista = ", ".join(c["nombre"] for c in campos) or "ninguno"
-            return f"⚠️ No encontré ese campo. Tus campos: {lista}\n\n¿En qué campo fue el gasto?"
-        datos.update({"campo_id": campo["id"], "campo_nombre": campo["nombre"]})
-        await _wa_set_conv(numero, "gasto_rubro", datos)
-        return "¿Qué rubro?\n\n" + "\n".join(f"• {r}" for r in RUBROS)
-
-    if estado == "gasto_rubro":
-        datos["rubro"] = _buscar_rubro(texto)
-        await _wa_set_conv(numero, "gasto_monto", datos)
-        return "¿Cuánto gastaste? (escribí solo el número en USD, ej: *45*)"
-
-    if estado == "gasto_monto":
-        monto = _extraer_numero(texto)
-        if monto is None:
-            return "No entendí el monto. Escribí solo el número, ej: *45*"
-        datos["monto"] = monto
-        await _wa_set_conv(numero, "gasto_descripcion", datos)
-        return "¿Qué producto o descripción? (ej: Glifosato 4L, urea, soja DM 4210...)"
-
-    if estado == "gasto_descripcion":
-        datos["descripcion"] = texto.strip()
-        ok, msg = await _guardar_gasto(datos, usuario)
-        await _wa_clear_conv(numero)
-        return f"{msg}\n\n{MENU_TEXT}"
-
-    # ── FLUJO LLUVIA ─────────────────────────────
-    if estado == "lluvia_campo":
-        campo = _buscar_campo(texto, campos)
-        if not campo:
-            lista = ", ".join(c["nombre"] for c in campos) or "ninguno"
-            return f"⚠️ No encontré ese campo. Tus campos: {lista}\n\n¿En qué campo llovió?"
-        datos.update({"campo_id": campo["id"], "campo_nombre": campo["nombre"]})
-        await _wa_set_conv(numero, "lluvia_mm", datos)
-        return "¿Cuántos mm registraste?"
-
-    if estado == "lluvia_mm":
-        mm = _extraer_numero(texto)
-        if mm is None:
-            return "No entendí la cantidad. Escribí solo el número, ej: *18*"
-        datos["mm"] = mm
-        ok, msg = await _guardar_lluvia(datos, usuario)
-        await _wa_clear_conv(numero)
-        return f"{msg}\n\n{MENU_TEXT}"
-
-    # ── FLUJO COMPLETAR TAREA ────────────────────
-    if estado == "tarea_completar":
-        tareas = datos.get("tareas", [])
-        try:
-            idx = int(n) - 1
-            if 0 <= idx < len(tareas):
-                tarea = tareas[idx]
-                await _completar_tarea(tarea["id"])
-                await _wa_clear_conv(numero)
-                return f"✅ Tarea completada: _{tarea['descripcion']}_\n\n{MENU_TEXT}"
-            return f"Número inválido. Escribí un número del 1 al {len(tareas)}."
-        except ValueError:
-            return f"Respondé con el número de la tarea (1–{len(tareas)})."
-
-    # Estado desconocido → resetear
-    await _wa_clear_conv(numero)
-    return MENU_TEXT
-
-
-async def _procesar_opcion_menu(opcion: str, usuario: dict, numero: str) -> str:
-    """Arranca el sub-flujo de la opción elegida en el menú principal."""
-    campos = usuario.get("campos") or []
-    print(f"[DEBUG _procesar_opcion_menu] opcion={repr(opcion)} campos={[c.get('nombre') for c in campos]} numero={numero}")
-
-    if opcion == "1":  # Gasto
-        if not campos:
-            print(f"[DEBUG _procesar_opcion_menu] → sin campos, retorna advertencia")
-            return "⚠️ No tenés campos registrados. Ingresá a rindeagro.lat para crear uno."
-        if len(campos) == 1:
-            datos = {"campo_id": campos[0]["id"], "campo_nombre": campos[0]["nombre"]}
-            print(f"[DEBUG _procesar_opcion_menu] → 1 campo, seteando estado=gasto_rubro datos={datos}")
-            await _wa_set_conv(numero, "gasto_rubro", datos)
-            return f"Campo: *{campos[0]['nombre']}*\n\n¿Qué rubro?\n\n" + "\n".join(f"• {r}" for r in RUBROS)
-        print(f"[DEBUG _procesar_opcion_menu] → {len(campos)} campos, seteando estado=gasto_campo")
-        await _wa_set_conv(numero, "gasto_campo", {})
-        return "¿En qué campo fue el gasto?\n\n" + "\n".join(f"• {c['nombre']}" for c in campos)
-
-    elif opcion == "2":  # Lluvia
-        if not campos:
-            return "⚠️ No tenés campos registrados."
-        if len(campos) == 1:
-            datos = {"campo_id": campos[0]["id"], "campo_nombre": campos[0]["nombre"]}
-            await _wa_set_conv(numero, "lluvia_mm", datos)
-            return f"Campo: *{campos[0]['nombre']}*\n\n¿Cuántos mm registraste?"
-        await _wa_set_conv(numero, "lluvia_campo", {})
-        return "¿En qué campo llovió?\n\n" + "\n".join(f"• {c['nombre']}" for c in campos)
-
-    elif opcion == "3":  # Ver tareas
-        tareas = await _get_tareas_pendientes(usuario["id"])
-        if not tareas:
-            return f"✅ No tenés tareas pendientes.\n\n{MENU_TEXT}"
-        lineas = [f"{i+1}. {t['descripcion']}" + (f" — _{t['campo_nombre']}_" if t.get("campo_nombre") else "")
-                  for i, t in enumerate(tareas[:10])]
-        return "📋 *Tareas pendientes:*\n\n" + "\n".join(lineas) + f"\n\n{MENU_TEXT}"
-
-    elif opcion == "4":  # Completar tarea
-        tareas = await _get_tareas_pendientes(usuario["id"])
-        if not tareas:
-            return f"✅ No tenés tareas pendientes.\n\n{MENU_TEXT}"
-        await _wa_set_conv(numero, "tarea_completar", {"tareas": tareas[:10]})
-        lineas = [f"{i+1}. {t['descripcion']}" + (f" — _{t['campo_nombre']}_" if t.get("campo_nombre") else "")
-                  for i, t in enumerate(tareas[:10])]
-        return "📋 *¿Cuál completaste?* Respondé con el número:\n\n" + "\n".join(lineas)
-
-    elif opcion == "0":
-        await _wa_clear_conv(numero)
-        return "👋 Hasta luego. Escribí *hola* o *menú* cuando quieras."
-
-    return f"No entendí esa opción.\n\n{MENU_TEXT}"
-
-
 # ── Helpers de flujo ────────────────────────
 
 def _buscar_campo(texto: str, campos: list) -> dict | None:
@@ -419,74 +233,12 @@ def _extraer_numero(texto: str) -> float | None:
             pass
     return None
 
-async def _guardar_gasto(datos: dict, usuario: dict) -> tuple[bool, str]:
-    try:
-        payload = {
-            "campo_id":    datos["campo_id"],
-            "usuario_id":  usuario["id"],
-            "rubro":       datos.get("rubro", "Otros"),
-            "descripcion": datos.get("descripcion", ""),
-            "fecha":       date.today().isoformat(),
-            "total_de_usd": float(datos.get("monto", 0)),
-            "fuente":      "whatsapp",
-        }
-        await _sb_post("gastos", payload)
-        return True, (
-            f"✅ Guardado. Gasto de *USD {datos.get('monto')}* en "
-            f"{datos.get('rubro', '')} ({datos.get('descripcion', '')}) "
-            f"en *{datos.get('campo_nombre', 'tu campo')}*."
-        )
-    except Exception as e:
-        print(f"Error guardando gasto: {e}")
-        return False, "⚠️ Error al guardar el gasto. Intentá de nuevo."
-
-async def _guardar_lluvia(datos: dict, usuario: dict) -> tuple[bool, str]:
-    try:
-        payload = {
-            "campo_id":   datos["campo_id"],
-            "usuario_id": usuario["id"],
-            "mm":         float(datos["mm"]),
-            "fecha":      date.today().isoformat(),
-            "fuente":     "whatsapp",
-        }
-        await _sb_post("lluvias", payload)
-        return True, f"✅ Guardado. *{datos['mm']}mm* registrados en *{datos.get('campo_nombre', 'tu campo')}*."
-    except Exception as e:
-        print(f"Error guardando lluvia: {e}")
-        return False, "⚠️ Error al guardar. Intentá de nuevo."
-
-async def _get_tareas_pendientes(user_id: str) -> list:
-    try:
-        rows = await _sb_get("tareas", {
-            "usuario_id": f"eq.{user_id}",
-            "completada":  "eq.false",
-            "select":      "id,descripcion,campos(nombre)",
-            "order":       "creado_en.asc",
-            "limit":       "10",
-        })
-        result = []
-        for t in rows:
-            campo_nombre = ""
-            if isinstance(t.get("campos"), dict):
-                campo_nombre = t["campos"].get("nombre", "")
-            result.append({"id": t["id"], "descripcion": t.get("descripcion", "Sin título"), "campo_nombre": campo_nombre})
-        return result
-    except Exception as e:
-        print(f"Error obteniendo tareas: {e}")
-        return []
-
-async def _completar_tarea(tarea_id: str):
-    await _sb_patch(
-        f"tareas?id=eq.{tarea_id}",
-        {"completada": True, "completado_en": datetime.utcnow().isoformat()},
-    )
-
 
 # ══════════════════════════════════════════════
 # WHATSAPP VÍA KAPSO — identidad, flujos y webhook
 # ══════════════════════════════════════════════
 #
-# Canal nuevo, en paralelo al de Twilio (POST /whatsapp), que queda intacto.
+# Único canal de WhatsApp (Twilio se dio de baja).
 # Kapso es un proxy de la Cloud API oficial de Meta: soporta botones y listas
 # interactivas, y transcribe los audios antes de mandarnos el webhook.
 #
@@ -1795,6 +1547,23 @@ async def _kapso_procesar(m) -> None:
         await kapso.enviar_texto(numero, "Avisos reactivados 🌾")
         return
 
+    # Botón "No recibir más" de las plantillas: igual que escribir STOP.
+    if accion == "stop":
+        await _sb_patch(f"wa_preferencias_notificaciones?user_id=eq.{ident['user_id']}", {"activo": False})
+        await _wa_clear_conv(numero)
+        await kapso.enviar_texto(
+            numero,
+            "Listo, no te mando más avisos.\n\nEscribí *ACTIVAR* cuando quieras volver.",
+        )
+        return
+    if accion == "resumen":
+        await _wa_clear_conv(numero)
+        if ident.get("es_dueño") or ident.get("rol") == "administrador":
+            await _kapso_ver_resumen(ident, numero)
+        else:
+            await _kapso_menu(ident, numero)
+        return
+
     # Botones y listas que valen en cualquier momento
     if accion == "menu" or n in SALUDOS_WA:
         await _wa_clear_conv(numero)
@@ -1930,6 +1699,10 @@ async def kapso_estado(numeros: bool = False):
             }
             for n in conectados if isinstance(n, dict)
         ]
+        # Las plantillas de los avisos automáticos: hasta que estén APPROVED,
+        # los recordatorios solo llegan a quien escribió en las últimas 24 h.
+        estados = {p.get("name"): p.get("status") for p in await kapso.listar_plantillas()}
+        salida["plantillas"] = {n: estados.get(n, "NO_CREADA") for n in plantillas_wa.PLANTILLAS}
     return salida
 
 
@@ -2103,127 +1876,7 @@ async def get_precios():
     }
 
 
-# ══════════════════════════════════════════════
-# ENDPOINT: POST /whatsapp
-# Recibe mensajes de Twilio WhatsApp
-# ══════════════════════════════════════════════
-
-@app.post("/whatsapp")
-async def whatsapp_webhook(request: Request):
-    form = await request.form()
-    from_number = form.get("From", "").replace("whatsapp:", "")
-    body        = form.get("Body", "").strip()
-    media_url   = form.get("MediaUrl0", "")
-    media_type  = form.get("MediaContentType0", "")
-    print(f"[WA] De: {from_number} | Mensaje: {body[:100]} | Media: {media_type}")
-    response_text = await procesar_mensaje_whatsapp(from_number, body, media_url, media_type)
-    twiml = (
-        '<?xml version="1.0" encoding="UTF-8"?>\n'
-        f"<Response><Message>{response_text}</Message></Response>"
-    )
-    return Response(content=twiml, media_type="application/xml")
-
-
-async def procesar_mensaje_whatsapp(numero: str, texto: str, media_url: str, media_type: str) -> str:
-    """Punto central de procesamiento de mensajes WhatsApp entrantes."""
-    OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
-    print(f"[DEBUG procesar] numero={numero} texto_raw={repr(texto)} media_type={repr(media_type)}")
-
-    # ── 0. STOP / ACTIVAR (no bloquea aunque Supabase falle) ───────────
-    stop_resp = await _manejar_stop_activar(numero, texto)
-    if stop_resp:
-        return stop_resp
-
-    # ── 1. Transcribir audio / PDF antes de cualquier routing ──────────
-    texto_final = texto
-    if media_url and "audio" in media_type and OPENAI_API_KEY:
-        texto_final = await transcribir_audio(media_url, OPENAI_API_KEY) or texto
-    if media_url and "pdf" in media_type:
-        texto_final = await extraer_pdf(media_url) or texto
-    if not texto_final:
-        return "No entendí el mensaje. Podés escribir, mandar audio o adjuntar un PDF."
-
-    n = _norm(texto_final)
-    print(f"[DEBUG procesar] texto_final={repr(texto_final)} n={repr(n)}")
-
-    # ── 2. Comandos de menú puro → responder sin necesitar Supabase ─────
-    if n in MENU_WORDS:
-        print(f"[DEBUG procesar] → es MENU_WORD, retorna menú")
-        return MENU_TEXT
-
-    # ── 3. Validar que Supabase esté configurado ────────────────────────
-    if not _sb_url() or not _sb_key():
-        print(f"[DEBUG procesar] ⚠️ SUPABASE_URL o SUPABASE_SERVICE_KEY no configurados")
-        return MENU_TEXT
-
-    # ── 4. Identificar usuario ──────────────────────────────────────────
-    rows = await _sb_get("perfiles", {"telefono": f"eq.{numero}", "select": "id,nombre,campos(id,nombre)"})
-    print(f"[DEBUG procesar] perfiles encontrados: {len(rows)} — ids={[r.get('id') for r in rows]}")
-    if not rows:
-        return (
-            f"⚠️ Tu número {numero} no está vinculado a ninguna cuenta Rinde Agro.\n"
-            "Ingresá a rindeagro.lat y vinculá tu WhatsApp en Configuración."
-        )
-    usuario = rows[0]
-    campos = usuario.get("campos") or []
-    print(f"[DEBUG procesar] usuario.id={usuario.get('id')} campos={[c.get('nombre') for c in campos]}")
-
-    # ── 5. ¿Hay una conversación activa en curso? ───────────────────────
-    conv = await _wa_get_conv(numero)
-    print(f"[DEBUG procesar] conversación activa: {conv is not None} — estado={conv.get('estado') if conv else None}")
-    if conv:
-        print(f"[DEBUG procesar] → entra a _procesar_flujo")
-        return await _procesar_flujo(conv, texto_final, usuario)
-
-    # ── 6. Selección de opción del menú principal ───────────────────────
-    print(f"[DEBUG procesar] sin conv activa — n={repr(n)} es_opcion={n in {'1','2','3','4','0'}}")
-    if n in {"1", "2", "3", "4", "0"}:
-        print(f"[DEBUG procesar] → entra a _procesar_opcion_menu(opcion={n})")
-        return await _procesar_opcion_menu(n, usuario, numero)
-
-    # ── 7. Mensaje libre → intentar con IA; si no → menú ───────────────
-    if OPENAI_API_KEY and len(texto_final) > 8:
-        resultado = await interpretar_con_ia(texto_final, usuario, OPENAI_API_KEY)
-        if resultado and resultado.get("confianza") in ("alta", "media"):
-            return await cargar_en_supabase(resultado, usuario, _sb_url(), _sb_key())
-
-    print(f"[DEBUG procesar] → sin match, retorna menú")
-    return MENU_TEXT
-
-
 # ── Audio / PDF / IA ──────────────────────────
-
-async def transcribir_audio(media_url: str, api_key: str) -> str:
-    try:
-        async with httpx.AsyncClient(timeout=30) as client:
-            audio_resp = await client.get(media_url)
-            audio_bytes = audio_resp.content
-            r = await client.post(
-                "https://api.openai.com/v1/audio/transcriptions",
-                headers={"Authorization": f"Bearer {api_key}"},
-                files={"file": ("audio.ogg", audio_bytes, "audio/ogg")},
-                data={"model": "whisper-1", "language": "es"},
-            )
-            if r.status_code == 200:
-                return r.json().get("text", "")
-    except Exception as e:
-        print(f"Whisper error: {e}")
-    return ""
-
-
-async def extraer_pdf(media_url: str) -> str:
-    try:
-        import io
-        async with httpx.AsyncClient(timeout=20) as client:
-            pdf_resp = await client.get(media_url)
-            pdf_bytes = pdf_resp.content
-        import pdfplumber
-        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-            texto = "\n".join(p.extract_text() or "" for p in pdf.pages[:5])
-        return texto[:3000]
-    except Exception as e:
-        print(f"PDF error: {e}")
-    return ""
 
 
 async def interpretar_con_ia(texto: str, usuario: dict, api_key: str) -> dict:
@@ -2265,73 +1918,6 @@ Respondé SOLO con JSON válido, sin explicaciones. Formato:
     return None
 
 
-async def cargar_en_supabase(datos: dict, usuario: dict, sb_url: str, sb_key: str) -> str:
-    headers = {
-        "apikey": sb_key,
-        "Authorization": f"Bearer {sb_key}",
-        "Content-Type": "application/json",
-        "Prefer": "return=representation",
-    }
-    campo_id = None
-    campo_nombre = datos.get("campo_nombre")
-    if campo_nombre:
-        for c in usuario.get("campos", []):
-            if campo_nombre.lower() in c["nombre"].lower():
-                campo_id = c["id"]
-                break
-    if not campo_id and len(usuario.get("campos", [])) == 1:
-        campo_id    = usuario["campos"][0]["id"]
-        campo_nombre = usuario["campos"][0]["nombre"]
-
-    tipo = datos.get("tipo")
-    d    = datos.get("datos", {})
-    resp = datos.get("respuesta_usuario", "")
-
-    async with httpx.AsyncClient(timeout=10) as client:
-        try:
-            if tipo == "gasto" and campo_id:
-                payload = {
-                    "campo_id": campo_id, "usuario_id": usuario["id"],
-                    "rubro": d.get("rubro", "otros"), "descripcion": d.get("descripcion", ""),
-                    "fecha": d.get("fecha") or date.today().isoformat(),
-                    "total_de_usd": float(d.get("total_usd", 0)),
-                    "cantidad": d.get("cantidad"), "unidad": d.get("unidad"),
-                    "precio_unitario": d.get("precio_unitario"), "fuente": "whatsapp",
-                }
-                r = await client.post(f"{sb_url}/rest/v1/gastos", headers=headers, json=payload)
-                if r.status_code in (200, 201):
-                    return f"✅ {resp}\n\n_Gasto cargado en {campo_nombre or 'tu campo'}_"
-
-            elif tipo == "lluvia" and campo_id:
-                payload = {
-                    "campo_id": campo_id, "usuario_id": usuario["id"],
-                    "mm": float(d.get("mm", 0)), "fecha": d.get("fecha") or date.today().isoformat(),
-                    "fuente": "whatsapp",
-                }
-                r = await client.post(f"{sb_url}/rest/v1/lluvias", headers=headers, json=payload)
-                if r.status_code in (200, 201):
-                    return f"✅ {resp}\n\n_Lluvia registrada en {campo_nombre}_"
-
-            elif tipo == "rendimiento" and campo_id:
-                payload = {"rendimiento": float(d.get("rendimiento_tha", 0))}
-                if d.get("precio_usd_t"):
-                    payload["precio_venta"] = float(d["precio_usd_t"])
-                r = await client.patch(f"{sb_url}/rest/v1/campos?id=eq.{campo_id}", headers=headers, json=payload)
-                if r.status_code in (200, 204):
-                    return f"✅ {resp}\n\n_Rendimiento actualizado en {campo_nombre}_"
-
-            else:
-                if not campo_id:
-                    return f"⚠️ No pude identificar el campo. Tus campos: {', '.join(c['nombre'] for c in usuario.get('campos', []))}"
-                return "⚠️ No entendí el tipo de dato. Podés cargar: gastos, lluvias o rendimientos."
-
-        except Exception as e:
-            print(f"Supabase insert error: {e}")
-            return "⚠️ Error al guardar. Intentá de nuevo."
-
-    return "⚠️ No se pudo guardar el dato."
-
-
 # ══════════════════════════════════════════════
 # WHATSAPP — NOTIFICACIONES AUTOMÁTICAS (scheduler)
 # ══════════════════════════════════════════════
@@ -2363,147 +1949,182 @@ async def _wa_get_destinatarios(flag: str) -> list[dict]:
     return destinatarios
 
 
+async def _wa_aviso(numero: str, plantilla: str, parametros: list, texto: str,
+                    botones: list) -> bool:
+    """
+    Manda un mensaje que arrancamos nosotros (no es respuesta a nada).
+
+    Primero intenta con la plantilla aprobada por Meta, que es lo único que se
+    puede mandar fuera de la ventana de 24 horas. Si falla (la plantilla
+    todavía no está aprobada, o la rechazaron), cae a texto con botones: eso
+    solo llega si la persona nos escribió en las últimas 24 horas, pero es
+    mejor que no mandar nada mientras se aprueban las plantillas.
+
+    botones: [(id, título)] — el id es lo que vuelve en el webhook cuando lo
+    tocan, igual en la plantilla y en el fallback, así el flujo es uno solo.
+    """
+    r = await kapso.enviar_plantilla(
+        numero, plantilla, parametros=parametros,
+        botones_payload=[b[0] for b in botones],
+    )
+    if r:
+        return True
+    print(f"[WA aviso] plantilla '{plantilla}' falló para {numero}, pruebo texto")
+    r = await kapso.enviar_botones(numero, texto, botones[:kapso.MAX_BOTONES])
+    return bool(r)
+
+
+def _wa_nombre_corto(nombre: str) -> str:
+    return (nombre or "").strip().split(" ")[0] or "¿cómo va?"
+
+
 async def _wa_recordatorio_operarios():
     """Job 1 — L/M/V 17:30 AR: recordatorio para operarios."""
     print("[SCHEDULER] Recordatorio operarios")
-    destinatarios = await _wa_get_destinatarios("recordatorio_operario")
-    mensaje = (
-        "📋 ¿Registraste todo lo de hoy?\n\n"
-        "Si falta algo mandame un mensaje ahora.\n\n"
-        "1️⃣ Cargar gasto\n"
-        "2️⃣ Registrar lluvia\n"
-        "3️⃣ Ver tareas pendientes\n\n"
-        "Respondé *STOP* para no recibir más recordatorios."
-    )
-    for d in destinatarios:
-        await _wa_enviar(d["numero"], mensaje)
-        await asyncio.sleep(0.5)  # evitar rate limit de Twilio
+    plantilla = plantillas_wa.PLANTILLAS["recordatorio_operario"]
+    for d in await _wa_get_destinatarios("recordatorio_operario"):
+        nombre = _wa_nombre_corto(d["nombre"])
+        await _wa_aviso(
+            d["numero"], "recordatorio_operario", [nombre],
+            plantilla["texto"].replace("{{1}}", nombre),
+            plantilla["botones"],
+        )
+        await asyncio.sleep(0.3)
 
 
 async def _wa_recordatorio_admins():
     """Job 2 — V 12:30 AR: recordatorio para administradores."""
     print("[SCHEDULER] Recordatorio admins")
-    destinatarios = await _wa_get_destinatarios("recordatorio_admin")
-    mensaje = (
-        "📊 *Rinde Agro* - Recordatorio semanal\n\n"
-        "Mañana recibís tu resumen de la semana.\n"
-        "¿Te olvidaste de cargar algo?\n\n"
-        "1️⃣ Cargar gasto\n"
-        "2️⃣ Registrar lluvia"
-    )
-    for d in destinatarios:
-        await _wa_enviar(d["numero"], mensaje)
-        await asyncio.sleep(0.5)
+    plantilla = plantillas_wa.PLANTILLAS["recordatorio_admin"]
+    for d in await _wa_get_destinatarios("recordatorio_admin"):
+        nombre = _wa_nombre_corto(d["nombre"])
+        await _wa_aviso(
+            d["numero"], "recordatorio_admin", [nombre],
+            plantilla["texto"].replace("{{1}}", nombre),
+            plantilla["botones"],
+        )
+        await asyncio.sleep(0.3)
+
+
+def _wa_rango_semana(hoy: date = None) -> tuple:
+    """(lunes de esta semana, hoy, texto legible '17 al 22 de nov')."""
+    hoy = hoy or datetime.now(AR_TZ).date()
+    lunes = hoy - timedelta(days=hoy.weekday())
+    meses = ["ene", "feb", "mar", "abr", "may", "jun",
+             "jul", "ago", "sep", "oct", "nov", "dic"]
+    return lunes, hoy, f"{lunes.day} al {hoy.day} de {meses[hoy.month - 1]}"
+
+
+async def _wa_armar_resumen(uid: str) -> dict | None:
+    """
+    Calcula el resumen de la semana de un dueño de cuenta.
+
+    Devuelve {"texto": detalle completo, "rango", "gastos_usd", "lluvia_mm"} o
+    None si no se encontró el perfil. El detalle se manda recién cuando la
+    persona toca "Ver resumen" en la plantilla: la plantilla de Meta no admite
+    saltos de línea en las variables, así que el resumen largo no entra ahí.
+    """
+    lunes, hoy, rango = _wa_rango_semana()
+    desde = lunes.isoformat()
+
+    perfiles = await _sb_get("perfiles", {"id": f"eq.{uid}", "select": "nombre,campos(id,nombre)"})
+    if not perfiles:
+        return None
+    perfil = perfiles[0]
+    campos = perfil.get("campos") or []
+
+    lineas_lluvias, total_mm = [], 0.0
+    total_gastos, rubros = 0.0, {}
+    for campo in campos:
+        lluvias = await _sb_get("lluvias", {
+            "campo_id": f"eq.{campo['id']}", "fecha": f"gte.{desde}", "select": "mm",
+        })
+        if lluvias:
+            mm = sum(float(l.get("mm") or 0) for l in lluvias)
+            total_mm += mm
+            lineas_lluvias.append(f"{campo['nombre']}: {mm:.0f} mm")
+
+        gastos = await _sb_get("gastos", {
+            "campo_id": f"eq.{campo['id']}", "fecha": f"gte.{desde}",
+            "select": "total_de_usd,rubro",
+        })
+        for g in gastos:
+            monto = float(g.get("total_de_usd") or 0)
+            rubro = g.get("rubro") or "Otros"
+            total_gastos += monto
+            rubros[rubro] = rubros.get(rubro, 0) + monto
+
+    # La tabla tareas no tiene `completada` (boolean): el estado va en `estado`
+    # y la fecha en `completada_at`, igual que en _kapso_tarea_completar.
+    tareas_ok = await _sb_get("tareas", {
+        "owner_id": f"eq.{uid}",
+        "estado": "eq.completada",
+        "completada_at": f"gte.{desde}T00:00:00",
+        "select": "id",
+    })
+
+    lineas = [f"📊 *Resumen semanal — {perfil.get('nombre') or 'Rinde Agro'}*",
+              f"Semana del {rango}", ""]
+    lineas.append("🌧️ *Lluvias*")
+    lineas.extend(lineas_lluvias or ["Sin registros esta semana"])
+    lineas.append("")
+    lineas.append("💰 *Gastos registrados*")
+    if total_gastos > 0:
+        lineas.append(f"Total: USD {total_gastos:,.0f}")
+        for rubro, monto in sorted(rubros.items(), key=lambda x: -x[1]):
+            lineas.append(f"{rubro}: USD {monto:,.0f}")
+    else:
+        lineas.append("Sin gastos registrados")
+    lineas.append("")
+    lineas.append("✅ *Tareas completadas*")
+    n = len(tareas_ok)
+    lineas.append(f"{n} tarea{'s' if n != 1 else ''} lista{'s' if n != 1 else ''}"
+                  if n else "Ninguna completada esta semana")
+    lineas.append("")
+    precios = cache_precios["cereales"]
+    lineas.append("📈 *Precios hoy*")
+    lineas.append(f"Soja: USD {precios.get('soja', '-')}/t")
+    lineas.append(f"Maíz: USD {precios.get('maiz', '-')}/t")
+    lineas.append(f"Trigo: USD {precios.get('trigo', '-')}/t")
+    lineas.append("")
+    lineas.append("Que tengas una buena semana 🌾")
+
+    return {
+        "texto": "\n".join(lineas),
+        "rango": rango,
+        "gastos_usd": total_gastos,
+        "lluvia_mm": total_mm,
+    }
 
 
 async def _wa_resumen_semanal():
-    """Job 3 — Sábados 9:00 AR: resumen semanal por campo para cada admin."""
+    """Job 3 — Sábados 9:00 AR: aviso de resumen semanal para cada admin."""
     print("[SCHEDULER] Resumen semanal")
-    destinatarios = await _wa_get_destinatarios("resumen_semanal")
-    if not destinatarios:
-        return
-
-    hoy          = date.today()
-    inicio_semana = (hoy - timedelta(days=hoy.weekday())).isoformat()  # lunes
-    fin_semana    = hoy.isoformat()
-    fecha_desde   = f"{inicio_semana}T00:00:00"
-    fecha_hasta   = f"{fin_semana}T23:59:59"
-
-    # Formatear rango de fechas legible
-    dias_semana   = ["lun", "mar", "mié", "jue", "vie", "sáb", "dom"]
-    meses         = ["ene","feb","mar","abr","may","jun","jul","ago","sep","oct","nov","dic"]
-    d_ini = hoy - timedelta(days=hoy.weekday())
-    rango = f"{d_ini.day} al {hoy.day} de {meses[hoy.month - 1]}"
-
-    precios = cache_precios["cereales"]
-
-    for dest in destinatarios:
-        uid = dest["user_id"]
-
-        # Campos del usuario
-        campos_rows = await _sb_get("perfiles", {"id": f"eq.{uid}", "select": "nombre,campos(id,nombre)"})
-        if not campos_rows:
+    plantilla = plantillas_wa.PLANTILLAS["resumen_semanal"]
+    for d in await _wa_get_destinatarios("resumen_semanal"):
+        resumen = await _wa_armar_resumen(d["user_id"])
+        if not resumen:
             continue
-        perfil = campos_rows[0]
-        nombre_org = perfil.get("nombre", "")
-        campos = perfil.get("campos") or []
-
-        # Lluvias de la semana por campo
-        lineas_lluvias = []
-        for campo in campos:
-            lluvias = await _sb_get("lluvias", {
-                "campo_id": f"eq.{campo['id']}",
-                "fecha":    f"gte.{inicio_semana}",
-                "select":   "mm,fecha",
-            })
-            if lluvias:
-                total_mm = sum(float(l.get("mm", 0)) for l in lluvias)
-                lineas_lluvias.append(f"{campo['nombre']}: {total_mm:.0f}mm")
-
-        # Gastos de la semana
-        total_gastos  = 0.0
-        rubros_gastos: dict[str, float] = {}
-        for campo in campos:
-            gastos = await _sb_get("gastos", {
-                "campo_id":  f"eq.{campo['id']}",
-                "fecha":     f"gte.{inicio_semana}",
-                "select":    "total_de_usd,rubro",
-            })
-            for g in gastos:
-                monto = float(g.get("total_de_usd", 0))
-                rubro = g.get("rubro", "Otros")
-                total_gastos += monto
-                rubros_gastos[rubro] = rubros_gastos.get(rubro, 0) + monto
-
-        # Tareas completadas esta semana
-        tareas_ok = await _sb_get("tareas", {
-            "usuario_id":   f"eq.{uid}",
-            "completada":   "eq.true",
-            "completado_en": f"gte.{fecha_desde}",
-            "select":       "id",
-        })
-
-        # Armar mensaje
-        lineas = [
-            f"📊 *Resumen semanal - {nombre_org}*",
-            f"Semana del {rango}",
-            "",
+        params = [
+            _wa_nombre_corto(d["nombre"]),
+            resumen["rango"],
+            f"USD {resumen['gastos_usd']:,.0f}",
+            f"{resumen['lluvia_mm']:.0f} mm",
         ]
+        texto = plantilla["texto"]
+        for i, v in enumerate(params, 1):
+            texto = texto.replace(f"{{{{{i}}}}}", v)
+        await _wa_aviso(d["numero"], "resumen_semanal", params, texto, plantilla["botones"])
+        await asyncio.sleep(0.5)
 
-        # Lluvias
-        if lineas_lluvias:
-            lineas.append("🌧️ *Lluvias*")
-            lineas.extend(lineas_lluvias)
-        else:
-            lineas.append("🌧️ *Lluvias*\nSin registros esta semana")
-        lineas.append("")
 
-        # Gastos
-        lineas.append("💰 *Gastos registrados*")
-        if total_gastos > 0:
-            lineas.append(f"Total: USD {total_gastos:,.0f}")
-            for rubro, monto in sorted(rubros_gastos.items(), key=lambda x: -x[1]):
-                lineas.append(f"{rubro}: USD {monto:,.0f}")
-        else:
-            lineas.append("Sin gastos registrados")
-        lineas.append("")
-
-        # Tareas
-        lineas.append("✅ *Tareas completadas*")
-        n_tareas = len(tareas_ok)
-        lineas.append(f"{n_tareas} tarea{'s' if n_tareas != 1 else ''} marcada{'s' if n_tareas != 1 else ''} como lista{'s' if n_tareas != 1 else ''}" if n_tareas else "Ninguna completada esta semana")
-        lineas.append("")
-
-        # Precios
-        lineas.append("📈 *Precios hoy*")
-        lineas.append(f"Soja: USD {precios.get('soja', '-')}/t")
-        lineas.append(f"Maíz: USD {precios.get('maiz', '-')}/t")
-        lineas.append(f"Trigo: USD {precios.get('trigo', '-')}/t")
-        lineas.append("")
-        lineas.append("Que tengas una buena semana 🌾")
-
-        await _wa_enviar(dest["numero"], "\n".join(lineas))
-        await asyncio.sleep(1)
+async def _kapso_ver_resumen(ident: dict, numero: str) -> None:
+    """Cuando tocan 'Ver resumen': el detalle completo, ya dentro de la ventana de 24h."""
+    resumen = await _wa_armar_resumen(ident["owner_id"])
+    if not resumen:
+        await kapso.enviar_texto(numero, "No pude armar el resumen ahora. Probá en un rato.")
+        return
+    await kapso.enviar_botones(numero, resumen["texto"], [("menu", "Cargar algo")])
 
 
 async def _wa_check_alertas_precio():
@@ -2517,26 +2138,26 @@ async def _wa_check_alertas_precio():
         return
 
     ultimo = cache_precios.get("ultimo_precio_alerta", {}).get("soja")
-    if ultimo:
-        cambio_pct = abs(precio_actual - ultimo) / ultimo * 100
-        if cambio_pct < 2:
-            return  # cambio menor al 2%, no alertar
-
-    # Actualizar precio de referencia
-    cache_precios.setdefault("ultimo_precio_alerta", {})["soja"] = precio_actual
-
-    destinatarios = await _wa_get_destinatarios("alerta_precio")
-    if not destinatarios:
+    if not ultimo:
+        # Primera lectura desde que arrancó el server: queda como referencia.
+        # Antes alertaba en cada deploy, sin que nada se hubiera movido.
+        cache_precios.setdefault("ultimo_precio_alerta", {})["soja"] = precio_actual
+        return
+    cambio_pct = (precio_actual - ultimo) / ultimo * 100
+    if abs(cambio_pct) < 2:
         return
 
-    mensaje = (
-        f"🔔 *Alerta de precio Rinde Agro*\n\n"
-        f"Precio actual de *Soja*: USD {precio_actual}/t\n\n"
-        "¿Querés revisar tus márgenes? Entrá a rindeagro.lat"
-    )
-    for d in destinatarios:
-        await _wa_enviar(d["numero"], mensaje)
-        await asyncio.sleep(0.5)
+    cache_precios["ultimo_precio_alerta"]["soja"] = precio_actual
+
+    plantilla = plantillas_wa.PLANTILLAS["alerta_precio"]
+    cambio = f"{'subió' if cambio_pct > 0 else 'bajó'} {abs(cambio_pct):.1f}%"
+    for d in await _wa_get_destinatarios("alerta_precio"):
+        params = [_wa_nombre_corto(d["nombre"]), cambio, f"{precio_actual:,.0f}"]
+        texto = plantilla["texto"]
+        for i, v in enumerate(params, 1):
+            texto = texto.replace(f"{{{{{i}}}}}", v)
+        await _wa_aviso(d["numero"], "alerta_precio", params, texto, plantilla["botones"])
+        await asyncio.sleep(0.3)
 
 
 # ══════════════════════════════════════════════

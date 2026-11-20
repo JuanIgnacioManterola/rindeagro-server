@@ -51,11 +51,18 @@ salto a producción sea cuestión de horas y no de días.
 
 ### Lo que sí hace falta
 
-1. **Salir del plan gratis.** El plan free solo da el número de sandbox. Un
-   número pre-verificado del pool está *"disponible en todos los planes"* pero
-   pide *"un depósito chico que va directo a los créditos del proyecto"*.
-2. **Créditos para los mensajes.** El free incluye 2.000 mensajes por mes con
-   un número conectado; de ahí en adelante se paga por mensaje.
+Planes de Kapso (kapso.com/pricing, revisado 2026-11-20):
+
+| Plan | Precio | Mensajes/mes | Números |
+|---|---|---|---|
+| Free | US$0 | 2.000 | 1 (incluye **un** número +1 pre-verificado, sin depósito) |
+| Pro | US$25/mes | 100.000 | 3 |
+
+A eso se suma lo que cobra Meta por mensaje según categoría y país.
+
+- El número gratis del plan Free se puede reclamar **una sola vez por usuario**,
+  en el primer proyecto. Si se borra, el reemplazo pide depósito.
+- Un número que no manda mensajes de producción en 30 días se libera solo.
 
 ### Lo que no me consta
 
@@ -152,34 +159,32 @@ Estas son las que tenés que setear vos. **No las toqué.**
 Regla de Meta: fuera de la **ventana de 24 horas** desde el último mensaje del
 usuario, no se puede mandar texto libre. Solo plantillas aprobadas.
 
-Todo lo que el bot contesta *como respuesta* a un mensaje entrante cae dentro de
-la ventana y **no necesita plantilla**: menú, tareas, carga de gastos, lluvias,
-OCR de facturas. Eso funciona el día uno.
+Todo lo que el bot contesta *como respuesta* cae dentro de la ventana y **no
+necesita plantilla**: menú, tareas, gastos, lluvias, OCR de facturas.
 
-Lo que **sí** necesita plantilla es lo que arrancamos nosotros. Hoy son los tres
-jobs del scheduler en `main.py`:
+Lo que arrancamos nosotros sale **todo por Kapso** (Twilio se dio de baja) con
+estas plantillas, definidas en `plantillas_wa.py`:
 
-| Job | Cuándo | Plantilla sugerida | Categoría |
+| Plantilla | Job | Cuándo | Botones |
 |---|---|---|---|
-| `_wa_recordatorio_operarios` | L/M/V 17:30 | `recordatorio_operario` | Utility |
-| `_wa_recordatorio_admins` | V 12:30 | `recordatorio_admin` | Utility |
-| `_wa_resumen_semanal` | Sáb 9:00 | `resumen_semanal` | Utility |
+| `recordatorio_operario` | `_wa_recordatorio_operarios` | L/M/V 17:30 | Cargar gasto · Registrar lluvia · Ver tareas · No recibir más |
+| `recordatorio_admin` | `_wa_recordatorio_admins` | V 12:30 | Cargar gasto · Registrar lluvia · No recibir más |
+| `resumen_semanal` | `_wa_resumen_semanal` | Sáb 9:00 | Ver resumen · No recibir más |
+| `alerta_precio` | `_wa_check_alertas_precio` | soja se mueve ≥2% | No recibir más |
 
-Elegí **Utility**, no Marketing: son recordatorios operativos de un servicio que
-el usuario ya contrató. Marcar mal la categoría es una de las causas de rechazo
-que lista la doc de Kapso. La revisión de Meta suele tardar hasta 24 horas.
+Todas en `es_AR`, categoría **Utility**.
 
-**Estado actual en el código:** `kapso.enviar_plantilla()` ya existe y está
-testeada, pero **los tres jobs siguen mandando por Twilio** (`_wa_enviar`). No
-los migré a propósito: migrarlos hoy los rompería en silencio, porque sin
-plantillas aprobadas Meta rechaza el envío fuera de la ventana de 24h. El orden
-correcto es:
-
-1. Crear y aprobar las 3 plantillas.
-2. Recién ahí cambiar `_wa_enviar` para que use `kapso.enviar_plantilla(...)`.
-3. Dar de baja Twilio.
-
----
+- **Darlas de alta:** `KAPSO_API_KEY=... KAPSO_PHONE_NUMBER_ID=... python3 crear_plantillas.py`.
+  Se puede correr varias veces: saltea las que ya existen y muestra el estado.
+- **Ver si están aprobadas:** `GET /whatsapp/kapso/estado?numeros=1` → campo `plantillas`.
+- **Mientras no estén aprobadas** el envío cae a texto con botones
+  (`_wa_aviso`), que solo le llega a quien escribió en las últimas 24 h. No rompe
+  nada, solo llega a menos gente.
+- **El resumen semanal es en dos pasos** porque Meta no acepta saltos de línea en
+  las variables: la plantilla trae los totales y el botón *Ver resumen* manda el
+  detalle por campo (ya dentro de la ventana de 24 h).
+- **Cambiar un texto** = crear la plantilla de nuevo con otro nombre (`_v2`):
+  Meta no deja editar una aprobada.
 
 ## 7. Qué pasa cuando escribe alguien que no conocemos
 
@@ -210,7 +215,7 @@ hace todo menos las plantillas.
 6. Probar desde un número que **no** esté en la lista vieja del sandbox. Esta es
    la prueba de fuego: si contesta, el objetivo está cumplido.
 7. Confirmar con Kapso qué display name queda y si se puede cambiar.
-8. Cargar las 3 plantillas y esperar la aprobación de Meta (hasta 24 h). Esto
-   es lo único que tarda, y **no bloquea el test con usuarios**: solo afecta a
-   los recordatorios automáticos.
-9. Migrar los jobs del scheduler a plantillas y apagar Twilio.
+8. Correr `crear_plantillas.py` y esperar la aprobación de Meta (hasta 24 h).
+   No bloquea el test con usuarios: solo afecta a los avisos automáticos.
+9. Pedir el display name **Rinde Agro** (Connected numbers → número → Profile).
+   Meta lo revisa en 24-48 h.

@@ -3,7 +3,7 @@
 Servidor backend para Rinde Agro. Maneja:
 - 📈 Precios de cereales (scraping BCR Rosario)
 - 💵 Dólar BNA
-- 📱 Carga de datos por WhatsApp (texto, audio, PDF)
+- 📱 Bot de WhatsApp vía Kapso (gastos, lluvias, tareas, facturas, avisos)
 
 ---
 
@@ -12,7 +12,8 @@ Servidor backend para Rinde Agro. Maneja:
 | Método | Ruta | Descripción |
 |--------|------|-------------|
 | GET | /precios | Precios de cereales y dólar BNA |
-| POST | /whatsapp | Webhook de Twilio (mensajes WhatsApp) |
+| POST | /whatsapp/kapso | Webhook de Kapso (mensajes WhatsApp) |
+| GET | /whatsapp/kapso/estado | Diagnóstico de WhatsApp (`?numeros=1` lista números y plantillas) |
 | GET | /health | Estado del servidor |
 
 ---
@@ -35,13 +36,13 @@ En tu proyecto Railway → Settings → Variables, agregar:
 SUPABASE_URL=https://kmfydetiwatnwwzjnhyq.supabase.co
 SUPABASE_SERVICE_KEY=<tu service role key de Supabase>
 OPENAI_API_KEY=<tu API key de OpenAI>
-TWILIO_ACCOUNT_SID=<de Twilio console>
-TWILIO_AUTH_TOKEN=<de Twilio console>
+KAPSO_API_KEY=<project API key de Kapso>
+KAPSO_PHONE_NUMBER_ID=<id del número de WhatsApp>
+KAPSO_WEBHOOK_SECRET=<secret del webhook>
 ```
 
-### Paso 4 — Conectar Twilio
-1. En Twilio Console → Messaging → WhatsApp Sandbox
-2. Webhook URL: https://tu-app.railway.app/whatsapp
+### Paso 4 — Conectar WhatsApp
+Ver `WHATSAPP_PRODUCCION.md`.
 
 ---
 
