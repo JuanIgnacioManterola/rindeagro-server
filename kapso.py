@@ -387,7 +387,9 @@ class MensajeWA:
 
     @property
     def tiene_media(self) -> bool:
-        return bool(self.media_url)
+        # Un audio trae archivo, pero Kapso ya lo transcribió en `texto`: para
+        # el bot es un mensaje escrito. Si no, caía en el flujo de facturas.
+        return bool(self.media_url) and self.tipo != "audio"
 
     @property
     def es_imagen(self) -> bool:
