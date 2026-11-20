@@ -752,6 +752,23 @@ async def _ocr_factura(contenido: bytes, mime: str) -> list | None:
     return None
 
 
+RUBROS_FACTURA = {"herbicidas", "fungicidas", "insecticidas", "fertilizantes", "semillas"}
+
+
+def _rubro_de_factura(tipo) -> str:
+    t = _norm(str(tipo or ""))
+    return t if t in RUBROS_FACTURA else "otros"
+
+
+def _subtotal_renglon(it: dict) -> float:
+    """El subtotal impreso manda; si no viene, cantidad x precio (en la misma unidad)."""
+    if it.get("subtotal_usd") is not None:
+        return float(it["subtotal_usd"])
+    if it.get("precio_unitario") is not None:
+        return float(it.get("cantidad") or 0) * float(it["precio_unitario"])
+    return 0.0
+
+
 async def _kapso_gasto_desde_archivo(ident: dict, numero: str, m) -> None:
     """Foto o PDF de una factura → gasto cargado."""
     if not _wa_puede(ident, "gastos", "editar"):
@@ -782,36 +799,36 @@ async def _kapso_gasto_desde_archivo(ident: dict, numero: str, m) -> None:
         await _kapso_pedir_rubro(numero)
         return
 
-    # El subtotal impreso de cada renglón manda: recalcular cantidad x precio
-    # falla cuando el precio es por bidón/bolsa y la cantidad en litros/kg
-    # (1 bidón de 20 L a USD 60 daba USD 1200 en vez de 60).
-    total = 0.0
-    for it in items:
-        sub = it.get("subtotal_usd")
-        if sub is not None:
-            total += float(sub)
-            continue
-        cant = float(it.get("cantidad") or 0)
-        pu = it.get("precio_unitario")
-        if pu is not None:
-            total += cant * float(pu)
-
     url = await _sb_storage_subir("insumos-facturas", path, contenido, m.media_tipo)
 
-    principal = items[0]
-    datos = {
-        "gasto": {
-            "rubro": (principal.get("tipo") or "otros").capitalize(),
-            "descripcion": ", ".join(str(i.get("nombre") or "") for i in items[:4])[:300],
-            "total_de_usd": round(total, 2),
-            "cantidad": principal.get("cantidad"),
-            "unidad": principal.get("unidad"),
-            "precio_unitario": principal.get("precio_unitario"),
+    # Un gasto por rubro: una factura con glifosato y urea son dos gastos
+    # (herbicidas y fertilizantes), así cada uno cae en su rubro en la web.
+    # Lo que no se pueda clasificar va a "otros".
+    por_rubro: dict = {}
+    for it in items:
+        rubro = _rubro_de_factura(it.get("tipo"))
+        g = por_rubro.setdefault(rubro, {"rubro": rubro, "nombres": [], "total": 0.0,
+                                         "items": []})
+        g["nombres"].append(str(it.get("nombre") or "insumo"))
+        g["total"] += _subtotal_renglon(it)
+        g["items"].append(it)
+
+    gastos = []
+    for g in por_rubro.values():
+        gasto = {
+            "rubro": g["rubro"],
+            "descripcion": ", ".join(g["nombres"][:4])[:300],
+            "total_de_usd": round(g["total"], 2),
             "factura_url": url,
             "factura_path": path,
             "factura_tipo": "factura",
         }
-    }
+        if len(g["items"]) == 1:   # con un solo producto, guardamos el detalle
+            it = g["items"][0]
+            gasto.update({k: it.get(k) for k in ("cantidad", "unidad", "precio_unitario")})
+        gastos.append(gasto)
+    total = sum(g["total_de_usd"] for g in gastos)
+    datos = {"gastos": gastos}
 
     resumen = ["Leí la factura 👇", ""]
     for it in items[:4]:
@@ -824,6 +841,9 @@ async def _kapso_gasto_desde_archivo(ident: dict, numero: str, m) -> None:
     if total > 0:
         resumen.append("")
         resumen.append(f"*USD {_num(round(total, 2))}*")
+    if len(gastos) > 1:
+        resumen.append("_Lo separo en " + ", ".join(
+            f"{g['rubro'].capitalize()} USD {_num(g['total_de_usd'])}" for g in gastos) + "._")
 
     if await _kapso_pedir_campo(ident, numero, "k_gasto_campo", datos,
                                 "\n".join(resumen) + "\n\n¿A qué campo lo cargo?"):
@@ -832,6 +852,9 @@ async def _kapso_gasto_desde_archivo(ident: dict, numero: str, m) -> None:
 
 
 async def _kapso_guardar_gasto(ident: dict, numero: str, datos: dict) -> None:
+    if datos.get("gastos"):
+        await _kapso_guardar_gastos_factura(ident, numero, datos)
+        return
     g = dict(datos.get("gasto") or {})
     campo_id = datos.get("campo_id")
     campo_nombre = datos.get("campo_nombre") or ""
@@ -868,6 +891,33 @@ async def _kapso_guardar_gasto(ident: dict, numero: str, datos: dict) -> None:
         lineas.append(f"USD {_num(payload['usd_ha'])}/ha")
     if g.get("factura_url"):
         lineas.append("\n_La factura quedó adjunta._")
+    await kapso.enviar_botones(numero, "\n".join(lineas), [("menu", "Cargar otra cosa")])
+
+
+async def _kapso_guardar_gastos_factura(ident: dict, numero: str, datos: dict) -> None:
+    """Una factura → un gasto por rubro, todos con la factura adjunta."""
+    campo_id = datos.get("campo_id")
+    ha = next((float(c.get("hectareas") or 0) for c in ident.get("campos", [])
+               if c["id"] == campo_id), 0.0)
+    lineas = [f"✅ Cargado en *{datos.get('campo_nombre') or ''}*"]
+    for g in datos["gastos"]:
+        payload = {
+            "campo_id": campo_id,
+            "usuario_id": ident["owner_id"],
+            "rubro": (g.get("rubro") or "otros").lower(),
+            "fecha": datetime.now(AR_TZ).date().isoformat(),
+            "total_de_usd": g.get("total_de_usd") or 0,
+            "descripcion": g.get("descripcion") or "",
+        }
+        for k in ("cantidad", "unidad", "precio_unitario", "factura_url", "factura_path", "factura_tipo"):
+            if g.get(k) is not None:
+                payload[k] = g[k]
+        if ha > 0 and payload["total_de_usd"]:
+            payload["usd_ha"] = round(float(payload["total_de_usd"]) / ha, 2)
+        await _sb_post("gastos", payload)
+        lineas.append(f"{payload['rubro'].capitalize()} · USD {_num(payload['total_de_usd'])}")
+    await _wa_clear_conv(numero)
+    lineas.append("\n_La factura quedó adjunta._")
     await kapso.enviar_botones(numero, "\n".join(lineas), [("menu", "Cargar otra cosa")])
 
 
@@ -1119,7 +1169,7 @@ async def _kapso_flujo(ident: dict, numero: str, m, conv: dict) -> None:
         if estado == "k_lluvia_campo":
             await _kapso_guardar_lluvia(ident, numero, campo, float(datos.get("mm") or 0))
             return
-        if datos.get("gasto", {}).get("total_de_usd"):
+        if datos.get("gastos") or datos.get("gasto", {}).get("total_de_usd"):
             await _kapso_guardar_gasto(ident, numero, datos)
         else:
             await _wa_set_conv(numero, "k_gasto_rubro", datos)
