@@ -625,6 +625,25 @@ async def _kapso_tarea_completar(ident: dict, numero: str, tarea_id: str, nota: 
         )
 
 
+async def _wa_es_otro_pedido(ident: dict, texto: str, tarea_id: str) -> bool:
+    """¿El mensaje es un pedido nuevo y no un comentario de la tarea `tarea_id`?"""
+    n = _norm(texto)
+    # Lluvia o gasto con monto: claramente es una carga nueva.
+    if ("llov" in n or re.search(r"\bmm\b|milimetros", n)) and _extraer_numero(texto) is not None:
+        return True
+    if _RE_GASTO.search(n) and _parsear_plata(texto):
+        return True
+    # Nombra otra tarea pendiente (por su título).
+    tareas = await _wa_tareas_pendientes(ident)
+    for t in tareas:
+        if t.get("id") == tarea_id:
+            continue
+        palabras = [w for w in _norm(t.get("titulo") or "").split() if len(w) >= 5]
+        if palabras and any(w in n for w in palabras):
+            return True
+    return False
+
+
 async def _kapso_tarea_evidencia(ident: dict, numero: str, m, datos: dict) -> None:
     """Foto o comentario después de completar una tarea."""
     tarea_id = datos.get("tarea_id")
@@ -652,7 +671,10 @@ async def _kapso_tarea_evidencia(ident: dict, numero: str, m, datos: dict) -> No
     if payload:
         await _sb_patch(f"tareas?id=eq.{tarea_id}", payload)
         await _wa_clear_conv(numero)
-        await kapso.enviar_texto(numero, "Guardado 📎 Ya lo pueden ver en la app.")
+        filas = await _sb_get("tareas", {"id": f"eq.{tarea_id}", "select": "titulo"})
+        titulo = (filas[0].get("titulo") if filas else "") or "la tarea"
+        que = "la foto" if m.tiene_media else "el comentario"
+        await kapso.enviar_texto(numero, f"Guardé {que} en *{titulo}* 📎 Ya lo pueden ver en la app.")
     else:
         await _wa_clear_conv(numero)
         await kapso.enviar_texto(numero, "Listo, quedó completada.")
@@ -1151,6 +1173,13 @@ async def _kapso_flujo(ident: dict, numero: str, m, conv: dict) -> None:
         return
 
     if estado == "k_tarea_evidencia":
+        # Esperábamos una foto o un comentario de la tarea recién completada,
+        # pero la persona puede estar pidiendo otra cosa ("ya terminé de
+        # fumigar", "llovieron 20 mm"). Eso no se guarda como comentario.
+        if not m.tiene_media and texto and await _wa_es_otro_pedido(ident, texto, datos.get("tarea_id")):
+            await _wa_clear_conv(numero)
+            await _kapso_texto_libre(ident, numero, texto)
+            return
         await _kapso_tarea_evidencia(ident, numero, m, datos)
         return
 
