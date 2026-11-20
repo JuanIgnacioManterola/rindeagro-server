@@ -1203,6 +1203,27 @@ async def _kapso_texto_libre(ident: dict, numero: str, texto: str,
             if manejado:
                 return
 
+    # Entendimos un monto pero no el resto (audio mal transcripto, etc.):
+    # arrancamos la carga guiada con el monto ya puesto en vez de "no entendí".
+    monto = _parsear_plata(texto)
+    if monto and _wa_puede(ident, "gastos", "editar") and (
+            _RE_PLATA_EXPLICITA.search(n) or _RE_GASTO.search(n)):
+        datos = {"gasto": {"total_de_usd": monto}, "confirmar": True}
+        if _RE_PESOS.search(n):
+            tc = await _dolar_venta()
+            datos["gasto"]["total_de_usd"] = round(monto / tc, 2)
+            datos["gasto"]["descripcion_extra"] = f"(ARS {_miles(monto)} al BNA ${_miles(tc)})"
+            monto_txt = f"ARS {_miles(monto)}"
+        else:
+            monto_txt = f"USD {_num(monto)}"
+        if await _kapso_pedir_campo(ident, numero, "k_gasto_campo", datos,
+                                    f"Entendí un gasto de *{monto_txt}*, pero no qué fue 🤔\n\n"
+                                    "¿En qué campo?"):
+            return
+        await _wa_set_conv(numero, "k_gasto_rubro", datos)
+        await _kapso_pedir_rubro(numero)
+        return
+
     await _kapso_menu(ident, numero, "No te entendí del todo 🤔")
 
 
@@ -1334,7 +1355,10 @@ async def _kapso_flujo(ident: dict, numero: str, m, conv: dict) -> None:
         if estado == "k_lluvia_campo":
             await _kapso_guardar_lluvia(ident, numero, campo, float(datos.get("mm") or 0))
             return
-        if datos.get("confirmar") and datos.get("gasto", {}).get("total_de_usd"):
+        if datos.get("gasto", {}).get("total_de_usd") and not datos["gasto"].get("rubro"):
+            await _wa_set_conv(numero, "k_gasto_rubro", datos)
+            await _kapso_pedir_rubro(numero)
+        elif datos.get("confirmar") and datos.get("gasto", {}).get("total_de_usd"):
             await _kapso_confirmar_gasto(numero, datos)
         elif datos.get("gastos") or datos.get("gasto", {}).get("total_de_usd"):
             await _kapso_guardar_gasto(ident, numero, datos)
@@ -1346,6 +1370,10 @@ async def _kapso_flujo(ident: dict, numero: str, m, conv: dict) -> None:
     if estado == "k_gasto_rubro":
         rubro = accion.split(":", 1)[1].capitalize() if accion.startswith("rubro:") else _buscar_rubro(texto)
         datos.setdefault("gasto", {})["rubro"] = rubro
+        if datos["gasto"].get("total_de_usd"):
+            await _wa_set_conv(numero, "k_gasto_desc", datos)
+            await kapso.enviar_texto(numero, "¿Qué producto era? (ej: glifosato, urea, semilla de soja)")
+            return
         await _wa_set_conv(numero, "k_gasto_monto", datos)
         await kapso.enviar_texto(numero, "¿Cuánto fue en dólares? Escribí solo el número.")
         return
@@ -1361,8 +1389,12 @@ async def _kapso_flujo(ident: dict, numero: str, m, conv: dict) -> None:
         return
 
     if estado == "k_gasto_desc":
-        datos.setdefault("gasto", {})["descripcion"] = texto.strip()[:300]
-        await _kapso_guardar_gasto(ident, numero, datos)
+        g = datos.setdefault("gasto", {})
+        g["descripcion"] = f"{texto.strip()} {g.pop('descripcion_extra', '')}".strip()[:300]
+        if datos.get("confirmar"):
+            await _kapso_confirmar_gasto(numero, datos)
+        else:
+            await _kapso_guardar_gasto(ident, numero, datos)
         return
 
     if estado == "k_gasto_confirmar":
@@ -1434,6 +1466,7 @@ _RE_PLATA = re.compile(
     r"|(" + _NUM + r")\s*(?:mil\b|k\b|usd|u\$s|d[oó]lar(?:es)?\b|verdes|palos)"
     r"|(" + _NUM_SUELTO + r")")
 
+_RE_PLATA_EXPLICITA = re.compile(r"\b(usd|u\$s|d[oó]lar(es)?|verdes|pesos|lucas)\b|\$")
 _RE_PESOS = re.compile(r"\bpesos\b|\bar\$|\$ar\b|\bars\b|\blucas\b")
 
 _RE_VER_TAREAS = re.compile(
