@@ -1004,8 +1004,85 @@ async def _kapso_invitar_crear(ident: dict, numero: str, rol_ui: str, datos: dic
 
 # ── Texto libre ───────────────────────────────
 
+# ── Productos parecidos y alias aprendidos ─────────────────
+# Los audios se transcriben mal a veces ("orea" por urea). Si una palabra se
+# parece a un producto conocido pero no es igual, repreguntamos en vez de
+# adivinar; y si la persona confirma, lo guardamos como alias en mensajes_wa
+# (tipo='alias') para reconocerlo solo la próxima vez.
+
+import difflib
+
+def _productos_simples() -> list:
+    # Función y no constante: _RUBRO_POR_PRODUCTO se define más abajo.
+    return sorted({p for ps in _RUBRO_POR_PRODUCTO.values() for p in ps
+                   if " " not in p and len(p) >= 4})
+_PALABRAS_COMUNES = {
+    "gaste", "gasto", "pague", "pago", "pagamos", "compre", "compramos", "dolar", "dolares",
+    "pesos", "lucas", "verdes", "campo", "lote", "para", "porque", "esta", "este", "todo",
+    "cargar", "quiero", "anota", "anotar", "ayer", "hoy", "semana", "mañana", "manana",
+    "litros", "kilos", "bolsas", "bidon", "bidones", "contratista", "fletero", "prueba",
+    "hola", "buenas", "gracias", "quedo", "bien", "termine", "llovio", "llovieron",
+}
+_ALIAS = {"datos": {}, "ts": 0.0}
+
+
+async def _wa_alias() -> dict:
+    """{alias normalizado → producto}, confirmados por usuarios. Cache 10 min."""
+    if time.monotonic() - _ALIAS["ts"] < 600:
+        return _ALIAS["datos"]
+    try:
+        filas = await _sb_get("mensajes_wa", {"tipo": "eq.alias", "confirmado": "eq.true",
+                                              "select": "contenido,interpretacion", "limit": "1000"})
+        _ALIAS["datos"] = {_norm(f["contenido"]): (f.get("interpretacion") or {}).get("producto")
+                           for f in filas or [] if f.get("contenido")}
+    except Exception as e:
+        print(f"[ALIAS] error: {e}")
+    _ALIAS["ts"] = time.monotonic()
+    return _ALIAS["datos"]
+
+
+def _reemplazar_palabra(texto: str, vieja: str, nueva: str) -> str:
+    return re.sub(r"(?i)(?<![\wáéíóúñ])" + re.escape(vieja) + r"(?![\wáéíóúñ])", nueva, texto)
+
+
+def _producto_parecido(texto: str, campos: list) -> tuple | None:
+    """("orea", "urea") si una palabra se parece a un producto sin serlo."""
+    nombres_campo = {w for c in campos for w in _norm(c.get("nombre") or "").split()}
+    catalogo = _productos_simples()
+    for token in re.findall(r"[a-záéíóúñ0-9\-]+", _norm(texto)):
+        if (len(token) < 4 or token in _PALABRAS_COMUNES or token in nombres_campo
+                or token in catalogo or token.isdigit()):
+            continue
+        cerca = difflib.get_close_matches(token, catalogo, n=1, cutoff=0.75)
+        if cerca:
+            return token, cerca[0]
+    return None
+
+
+async def _wa_guardar_alias(ident: dict, alias: str, producto: str) -> None:
+    try:
+        await _sb_post("mensajes_wa", {
+            "usuario_id": ident.get("owner_id"), "tipo": "alias", "contenido": alias,
+            "interpretacion": {"producto": producto}, "confirmado": True,
+        })
+        _ALIAS["datos"][_norm(alias)] = producto
+    except Exception as e:
+        print(f"[ALIAS] no se pudo guardar: {e}")
+
+
+async def _wa_log_mensaje(ident: dict | None, numero: str, m) -> None:
+    """Deja registro de cada mensaje (y la transcripción de los audios)."""
+    try:
+        await _sb_post("mensajes_wa", {
+            "usuario_id": (ident or {}).get("owner_id"), "telefono": numero,
+            "tipo": m.tipo or "text", "contenido": (m.texto or "")[:2000],
+        })
+    except Exception as e:
+        print(f"[LOG WA] {e}")
+
+
 async def _kapso_texto_libre(ident: dict, numero: str, texto: str,
-                             tarea_activa: dict = None) -> None:
+                             tarea_activa: dict = None, saltar_parecidos: bool = False) -> None:
     """
     Intenta resolver el mensaje sin menú: primero lluvia (que es un patrón
     clarísimo), después la IA si está configurada, y si no, el menú.
@@ -1017,6 +1094,27 @@ async def _kapso_texto_libre(ident: dict, numero: str, texto: str,
         posible = re.sub(r"^(a|al)\s+", "", posible)
         await _kapso_invitar_inicio(ident, numero, posible.title())
         return
+
+    # Alias aprendidos: "orea" → "urea" si alguien ya lo confirmó antes.
+    for alias, producto in (await _wa_alias()).items():
+        if producto and re.search(r"(?<![\wáéíóúñ])" + re.escape(alias) + r"(?![\wáéíóúñ])", n):
+            texto = _reemplazar_palabra(texto, alias, producto)
+            n = _norm(texto)
+
+    # Un gasto con un producto que se parece a uno conocido pero no es igual:
+    # preguntamos antes de cargarlo mal.
+    if (not saltar_parecidos and _wa_puede(ident, "gastos", "editar")
+            and (_RE_GASTO.search(n) or _parsear_plata(texto))
+            and not _rubro_por_texto(texto)[1]):
+        parecido = _producto_parecido(texto, ident.get("campos") or [])
+        if parecido:
+            alias, producto = parecido
+            await _wa_set_conv(numero, "k_confirmar_producto",
+                               {"texto": texto, "alias": alias, "producto": producto})
+            await kapso.enviar_botones(
+                numero, f"Entendí *{alias}*. ¿Quisiste decir *{producto}*?",
+                [("prod_si", f"Sí, {producto}"[:20]), ("prod_no", "No, otra cosa")])
+            return
 
     # "cargá esta factura", "te paso un remito": todavía no mandó el archivo
     if re.search(r"\b(factura|facturas|remito|remitos|ticket|comprobante)\b", n) \
@@ -1170,6 +1268,24 @@ async def _kapso_flujo(ident: dict, numero: str, m, conv: dict) -> None:
             return
         await _kapso_texto_libre(ident, numero, texto,
                                  {"id": tid, "titulo": datos.get("titulo") or ""})
+        return
+
+    if estado == "k_confirmar_producto":
+        original = datos.get("texto") or ""
+        await _wa_clear_conv(numero)
+        if accion == "prod_si" or _norm(texto) in ("si", "sí", "dale", "ok", "correcto"):
+            await _wa_guardar_alias(ident, datos.get("alias") or "", datos.get("producto") or "")
+            corregido = _reemplazar_palabra(original, datos.get("alias") or "", datos.get("producto") or "")
+            await _kapso_texto_libre(ident, numero, corregido, saltar_parecidos=True)
+        elif accion == "prod_no":
+            await _kapso_texto_libre(ident, numero, original, saltar_parecidos=True)
+        else:
+            # Escribió el producto correcto ("no, era atrazina"): lo usamos.
+            nuevo = re.sub(r"^(no,?\s*)?(era\s+)?", "", _norm(texto)).strip()
+            if nuevo and len(nuevo) < 40:
+                await _wa_guardar_alias(ident, datos.get("alias") or "", nuevo)
+                original = _reemplazar_palabra(original, datos.get("alias") or "", nuevo)
+            await _kapso_texto_libre(ident, numero, original, saltar_parecidos=True)
         return
 
     if estado == "k_tarea_evidencia":
@@ -1696,6 +1812,7 @@ async def _kapso_procesar(m) -> None:
         pass
 
     ident = await _wa_identificar(numero)
+    asyncio.create_task(_wa_log_mensaje(ident, numero, m))
     if not ident:
         # El mensaje viejo daba por hecho que ya tenían cuenta. En producción
         # escribe también gente que todavía no se registró, así que cubrimos
