@@ -449,25 +449,54 @@ def _wa_primer_nombre(ident: dict) -> str:
 
 # ── Menú ──────────────────────────────────────
 
+def _wa_saludo_hora() -> str:
+    h = datetime.now(AR_TZ).hour
+    if 5 <= h < 13:
+        return "Buen día"
+    if 13 <= h < 20:
+        return "Buenas tardes"
+    return "Buenas noches"
+
+
 async def _kapso_menu(ident: dict, numero: str, encabezado: str = "") -> None:
     nombre = _wa_primer_nombre(ident)
-    if not encabezado:
-        encabezado = f"Hola {nombre} 👋" if nombre else "Hola 👋"
+    saludo = encabezado or (f"{_wa_saludo_hora()}, {nombre} 🌾" if nombre
+                            else f"{_wa_saludo_hora()} 🌾")
+
+    # Algo útil de entrada: cuántas tareas tiene y cuándo vence la próxima.
+    tareas = await _wa_tareas_pendientes(ident) if _wa_puede(ident, "tareas") else []
+    lineas = [saludo]
+    if tareas:
+        n = len(tareas)
+        # _wa_tareas_pendientes trae hasta 10: con 10 puede haber más.
+        cuantas = "10 o más" if n >= 10 else str(n)
+        linea = f"Tenés *{cuantas} tarea{'s' if n != 1 else ''} pendiente{'s' if n != 1 else ''}*"
+        venc = _wa_vencimiento_txt(tareas[0]) if tareas[0].get("fecha_vencimiento") else ""
+        lineas.append(f"{linea}, la próxima {venc}." if venc else f"{linea}.")
+
     botones = []
     if _wa_puede(ident, "tareas"):
-        botones.append(("tareas", "📋 Mis tareas"))
+        botones.append(("tareas", f"📋 Mis tareas ({len(tareas) if len(tareas) < 10 else '10+'})"
+                        if tareas else "📋 Mis tareas"))
     if _wa_puede(ident, "gastos", "editar"):
         botones.append(("gasto", "💵 Cargar gasto"))
     if _wa_puede(ident, "lluvias", "editar"):
         botones.append(("lluvia", "🌧️ Registrar lluvia"))
 
     if not botones:
-        await kapso.enviar_texto(numero, f"{encabezado}\n\nTu usuario todavía no tiene permisos para cargar datos.")
+        await kapso.enviar_texto(numero, "\n".join(lineas) +
+                                 "\n\nTu usuario todavía no tiene permisos para cargar datos.")
         return
 
-    texto = (f"{encabezado}\n\n¿Qué querés hacer?\n\n"
-             "También podés mandarme una *foto de una factura* o un *audio* y lo cargo solo.")
-    await kapso.enviar_botones(numero, texto, botones)
+    campo = ((ident.get("campos") or [{}])[0].get("nombre") or "La Loma")
+    lineas += [
+        "",
+        "¿Qué cargamos hoy?",
+        "",
+        f"También podés escribirme como le hablarías a alguien, por ejemplo "
+        f"_llovieron 25 mm en {campo}_, o mandarme la *foto de una factura*.",
+    ]
+    await kapso.enviar_botones(numero, "\n".join(lineas), botones)
 
 
 # ── Tareas ────────────────────────────────────
@@ -738,8 +767,9 @@ async def _kapso_gasto_desde_archivo(ident: dict, numero: str, m) -> None:
     if items is None:
         await kapso.enviar_texto(
             numero,
-            "Guardé el archivo pero todavía no puedo leerlo automáticamente.\n\n"
-            "Decime el monto en dólares y lo cargo a mano.",
+            "Todavía no puedo leer facturas automáticamente 😕\n\n"
+            "Decime el monto en dólares y qué compraste, por ejemplo "
+            "_gasté 1200 dólares de urea_, y lo cargo.",
         )
         return
     if not items:
@@ -802,7 +832,10 @@ async def _kapso_guardar_gasto(ident: dict, numero: str, datos: dict) -> None:
     payload = {
         "campo_id": campo_id,
         "usuario_id": ident["owner_id"],
-        "rubro": g.get("rubro") or "Otros",
+        # La web guarda el rubro en minúscula ("flete", "herbicidas") y agrupa
+        # por ese valor exacto: con mayúscula el gasto queda fuera de los
+        # gráficos por rubro.
+        "rubro": (g.get("rubro") or "otros").strip().lower(),
         "fecha": datetime.now(AR_TZ).date().isoformat(),
         "total_de_usd": g.get("total_de_usd") or 0,
         "descripcion": g.get("descripcion") or "",
@@ -823,7 +856,7 @@ async def _kapso_guardar_gasto(ident: dict, numero: str, datos: dict) -> None:
     await _sb_post("gastos", payload)
     await _wa_clear_conv(numero)
 
-    lineas = [f"✅ Cargado en *{campo_nombre}*", f"{payload['rubro']} · USD {_num(payload['total_de_usd'])}"]
+    lineas = [f"✅ Cargado en *{campo_nombre}*", f"{payload['rubro'].capitalize()} · USD {_num(payload['total_de_usd'])}"]
     if payload.get("usd_ha"):
         lineas.append(f"USD {_num(payload['usd_ha'])}/ha")
     if g.get("factura_url"):
@@ -904,6 +937,15 @@ async def _kapso_texto_libre(ident: dict, numero: str, texto: str,
         posible = re.sub(r".*(invitar|sumar a|agregar a|dar de alta)\s*", "", n).strip()
         posible = re.sub(r"^(a|al)\s+", "", posible)
         await _kapso_invitar_inicio(ident, numero, posible.title())
+        return
+
+    # "cargá esta factura", "te paso un remito": todavía no mandó el archivo
+    if re.search(r"\b(factura|facturas|remito|remitos|ticket|comprobante)\b", n) \
+            and not _parsear_plata(texto):
+        await kapso.enviar_texto(
+            numero,
+            "Dale, mandame la *foto* o el *PDF* de la factura y la cargo 📎",
+        )
         return
 
     # Lluvia: "llovieron 25 en la loma", "25mm en el ombú"
@@ -1147,6 +1189,7 @@ _RUBRO_POR_PRODUCTO = {
                  "bolsas de maiz", "plantin", "simiente"],
     "laboreo": ["laboreo", "labranza", "siembra", "sembrada", "pulverizacion", "pulverizada",
                 "cosecha", "cosechada", "arada", "rastra", "disco", "contratista"],
+    "arrendamiento": ["arrendamiento", "arriendo", "alquiler del campo", "alquiler de campo"],
     "flete": ["flete", "fletes", "camion", "camiones", "transporte", "acarreo", "chasis"],
 }
 
@@ -1161,7 +1204,7 @@ _NUM_SUELTO = r"\d{1,3}(?:[.,]\d{3})+(?:[.,]\d{1,2})?|\d{3,}(?:[.,]\d{1,2})?"
 
 _RE_PLATA = re.compile(
     r"(?:us\$|usd|u\$s|\$)\s*(" + _NUM + r")"
-    r"|(" + _NUM + r")\s*(?:mil\b|k\b|usd|u\$s|d[oó]lares|dolares|verdes|palos)"
+    r"|(" + _NUM + r")\s*(?:mil\b|k\b|usd|u\$s|d[oó]lar(?:es)?\b|verdes|palos)"
     r"|(" + _NUM_SUELTO + r")")
 
 _RE_PESOS = re.compile(r"\bpesos\b|\bar\$|\$ar\b")
@@ -1203,10 +1246,16 @@ def _parsear_plata(texto: str) -> float | None:
 def _rubro_por_texto(texto: str) -> tuple:
     """Devuelve (rubro, producto) mirando qué producto se nombró."""
     n = _norm(texto)
+    # Palabra entera, no substring: "uan" (el fertilizante) está adentro de
+    # "Don Juan", y "map" adentro de "mapa".
     for rubro, palabras in _RUBRO_POR_PRODUCTO.items():
         for p in palabras:
-            if p in n:
+            if re.search(r"(?<![a-z0-9])" + re.escape(p) + r"(?![a-z0-9])", n):
                 return rubro.capitalize(), p
+    # Sin rubro propio en la web, pero que la descripción diga qué fue.
+    m = re.search(r"\b(gasoil|gas oil|combustible|nafta)\b", n)
+    if m:
+        return "Otros", m.group(1)
     return "Otros", ""
 
 
