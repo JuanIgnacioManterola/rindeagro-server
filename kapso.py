@@ -173,7 +173,7 @@ async def enviar_lista(numero: str, texto: str, boton_texto: str, filas: list,
 
 
 async def enviar_plantilla(numero: str, nombre: str, idioma: str = "es_AR",
-                           parametros: list = None) -> dict:
+                           parametros: list = None, botones_payload: list = None) -> dict:
     """
     Manda un message template aprobado por Meta.
 
@@ -183,12 +183,21 @@ async def enviar_plantilla(numero: str, nombre: str, idioma: str = "es_AR",
     justo en ese caso).
 
     parametros: los {{1}}, {{2}}... del body, en orden. Se mandan como texto.
+    botones_payload: para cada botón de respuesta rápida, en orden, el id que
+    queremos recibir en el webhook cuando lo tocan.
     """
     componentes = []
     if parametros:
         componentes.append({
             "type": "body",
             "parameters": [{"type": "text", "text": str(v)} for v in parametros],
+        })
+    for i, p in enumerate(botones_payload or []):
+        componentes.append({
+            "type": "button",
+            "sub_type": "quick_reply",
+            "index": str(i),
+            "parameters": [{"type": "payload", "payload": p}],
         })
     payload = {
         "messaging_product": "whatsapp",
@@ -259,6 +268,55 @@ async def listar_numeros() -> list:
     except Exception as e:
         print(f"[KAPSO numeros] excepción: {e}")
     return []
+
+
+async def waba_id() -> str:
+    """
+    El id de la cuenta de WhatsApp Business (WABA) del número en uso.
+
+    Las plantillas cuelgan de la WABA, no del número: para crearlas o listarlas
+    hace falta este id. Si está KAPSO_WABA_ID se usa ese; si no, se averigua con
+    la Platform API a partir de KAPSO_PHONE_NUMBER_ID.
+    """
+    fijo = os.environ.get("KAPSO_WABA_ID", "")
+    if fijo:
+        return fijo
+    for n in await listar_numeros():
+        if isinstance(n, dict) and str(n.get("phone_number_id") or n.get("id") or "") == _phone_number_id():
+            return str(n.get("business_account_id") or "")
+    return ""
+
+
+async def listar_plantillas() -> list:
+    """Plantillas de la WABA con su estado (APPROVED, PENDING, REJECTED...). [] si falla."""
+    waba = await waba_id()
+    if not (_api_key() and waba):
+        return []
+    try:
+        async with httpx.AsyncClient(timeout=15) as c:
+            r = await c.get(f"{BASE_URL}/{waba}/message_templates",
+                            headers={"X-API-Key": _api_key()},
+                            params={"limit": "100"})
+            if r.status_code == 200:
+                return r.json().get("data", [])
+            print(f"[KAPSO plantillas] HTTP {r.status_code}: {r.text[:200]}")
+    except Exception as e:
+        print(f"[KAPSO plantillas] excepción: {e}")
+    return []
+
+
+async def crear_plantilla(definicion: dict) -> tuple:
+    """Da de alta una plantilla para revisión de Meta. Devuelve (ok, respuesta o error)."""
+    waba = await waba_id()
+    if not (_api_key() and waba):
+        return False, "falta KAPSO_API_KEY o no se encontró la WABA del número"
+    async with httpx.AsyncClient(timeout=20) as c:
+        r = await c.post(f"{BASE_URL}/{waba}/message_templates",
+                         headers={"X-API-Key": _api_key(), "Content-Type": "application/json"},
+                         json=definicion)
+    if r.status_code in (200, 201):
+        return True, r.json()
+    return False, f"HTTP {r.status_code}: {r.text[:400]}"
 
 
 # ══════════════════════════════════════════════════════════════
@@ -387,6 +445,13 @@ def parsear_entrantes(body: dict) -> list:
             reply = inter.get("button_reply") or inter.get("list_reply") or {}
             m.accion = reply.get("id", "") or ""
             m.texto = reply.get("title", "") or ""
+
+        elif m.tipo == "button":
+            # Botón de respuesta rápida de una plantilla: el payload es el id
+            # que pusimos al mandarla (ver enviar_plantilla).
+            b = msg.get("button") or {}
+            m.accion = b.get("payload", "") or ""
+            m.texto = b.get("text", "") or ""
 
         elif m.tipo == "audio":
             # Kapso transcribe los audios y manda el texto listo.
