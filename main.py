@@ -246,7 +246,8 @@ def _extraer_numero(texto: str) -> float | None:
 
 # ── Decisiones de producto ────────────────────
 # Las tres están pensadas para cambiarse sin tocar nada más.
-CONFIRMAR_ANTES_DE_GUARDAR = False  # False = carga y avisa, con botón para corregir
+# Los gastos que interpreta la IA siempre se confirman antes de guardar
+# (_kapso_confirmar_gasto); los que el bot entiende solo se cargan directo.
 PEDIR_EVIDENCIA_TAREA      = False  # False = foto/comentario opcional al completar
 BOT_MANDA_INVITACION       = False  # False = el link se lo damos al dueño para que lo reenvíe
 
@@ -943,6 +944,19 @@ async def _kapso_guardar_gastos_factura(ident: dict, numero: str, datos: dict) -
     await kapso.enviar_botones(numero, "\n".join(lineas), [("menu", "Cargar otra cosa")])
 
 
+async def _kapso_confirmar_gasto(numero: str, datos: dict) -> None:
+    """Muestra lo que se entendió y espera el OK antes de guardar."""
+    datos.pop("confirmar", None)
+    await _wa_set_conv(numero, "k_gasto_confirmar", datos)
+    g = datos["gasto"]
+    detalle = f" · {g['descripcion']}" if g.get("descripcion") else ""
+    await kapso.enviar_botones(
+        numero,
+        f"Entendí esto:\n*{g['rubro'].capitalize()}*{detalle}\n"
+        f"*USD {_num(g['total_de_usd'])}* · {datos.get('campo_nombre') or ''}\n\n¿Lo cargo así?",
+        [("g_ok", "✅ Sí, cargalo"), ("g_fix", "✏️ Corregir")])
+
+
 async def _kapso_gasto_guiado(ident: dict, numero: str) -> None:
     """Arranca la carga manual de un gasto, paso a paso."""
     datos = {"gasto": {}}
@@ -1220,20 +1234,13 @@ async def _kapso_desde_ia(ident: dict, numero: str, resultado: dict) -> bool:
         if campo:
             datos["campo_id"] = campo["id"]
             datos["campo_nombre"] = campo["nombre"]
-        elif await _kapso_pedir_campo(ident, numero, "k_gasto_campo", datos, "¿A qué campo lo cargo?"):
-            return True
-
-        if CONFIRMAR_ANTES_DE_GUARDAR:
-            await _wa_set_conv(numero, "k_gasto_confirmar", datos)
-            g = datos["gasto"]
-            await kapso.enviar_botones(
-                numero,
-                f"Entendí esto:\n{g['rubro']} · {g['descripcion']}\n"
-                f"*USD {_num(g['total_de_usd'])}* · {datos['campo_nombre']}\n\n¿Lo cargo así?",
-                [("g_ok", "Sí, cargalo"), ("menu", "Cambiar algo")],
-            )
         else:
-            await _kapso_guardar_gasto(ident, numero, datos)
+            datos["confirmar"] = True
+            if await _kapso_pedir_campo(ident, numero, "k_gasto_campo", datos, "¿A qué campo lo cargo?"):
+                return True
+
+        # Lo interpretó la IA: mostramos lo que entendimos antes de guardar.
+        await _kapso_confirmar_gasto(numero, datos)
         return True
 
     return False
@@ -1327,7 +1334,9 @@ async def _kapso_flujo(ident: dict, numero: str, m, conv: dict) -> None:
         if estado == "k_lluvia_campo":
             await _kapso_guardar_lluvia(ident, numero, campo, float(datos.get("mm") or 0))
             return
-        if datos.get("gastos") or datos.get("gasto", {}).get("total_de_usd"):
+        if datos.get("confirmar") and datos.get("gasto", {}).get("total_de_usd"):
+            await _kapso_confirmar_gasto(numero, datos)
+        elif datos.get("gastos") or datos.get("gasto", {}).get("total_de_usd"):
             await _kapso_guardar_gasto(ident, numero, datos)
         else:
             await _wa_set_conv(numero, "k_gasto_rubro", datos)
@@ -1357,11 +1366,13 @@ async def _kapso_flujo(ident: dict, numero: str, m, conv: dict) -> None:
         return
 
     if estado == "k_gasto_confirmar":
-        if accion == "g_ok":
+        if accion == "g_ok" or _norm(texto) in ("si", "sí", "dale", "ok", "cargalo"):
             await _kapso_guardar_gasto(ident, numero, datos)
         else:
             await _wa_clear_conv(numero)
-            await _kapso_menu(ident, numero, "Dale, empecemos de nuevo.")
+            await kapso.enviar_texto(
+                numero, "Dale, no lo cargué. Decímelo de nuevo, por ejemplo: "
+                        "_gasté 500 dólares de urea en La Esperanza_.")
         return
 
     if estado == "k_inv_rol":
@@ -1721,19 +1732,13 @@ async def _kapso_aplicar_intencion(ident: dict, numero: str, intencion: dict) ->
             campo = next(c for c in ident["campos"] if c["id"] == cid)
             datos["campo_id"] = campo["id"]
             datos["campo_nombre"] = campo["nombre"]
-        elif await _kapso_pedir_campo(ident, numero, "k_gasto_campo", datos, "¿A qué campo lo cargo?"):
-            return True
-
-        if CONFIRMAR_ANTES_DE_GUARDAR:
-            await _wa_set_conv(numero, "k_gasto_confirmar", datos)
-            g = datos["gasto"]
-            await kapso.enviar_botones(
-                numero,
-                f"Entendí esto:\n{g['rubro']} · {g['descripcion']}\n"
-                f"*USD {_num(g['total_de_usd'])}* · {datos['campo_nombre']}\n\n¿Lo cargo así?",
-                [("g_ok", "Sí, cargalo"), ("menu", "Cambiar algo")])
         else:
-            await _kapso_guardar_gasto(ident, numero, datos)
+            datos["confirmar"] = True
+            if await _kapso_pedir_campo(ident, numero, "k_gasto_campo", datos, "¿A qué campo lo cargo?"):
+                return True
+
+        # Lo interpretó la IA: mostramos lo que entendimos antes de guardar.
+        await _kapso_confirmar_gasto(numero, datos)
         return True
 
     if accion == "invitar":
