@@ -2165,6 +2165,57 @@ async def _kapso_flujo(ident: dict, numero: str, m, conv: dict) -> None:
         )
         return
 
+    if estado == "k_gasto_multi_edit_texto":
+        # El user mandó un texto/audio con la corrección de un item del multi.
+        # Lo mandamos a Claude para re-interpretar y pisamos el item en la lista,
+        # después volvemos al resumen.
+        idx = datos.get("_editing_idx")
+        multi = datos.get("multi_gasto") or {}
+        items_tmp = multi.get("items") or []
+        if idx is None or not isinstance(idx, int) or idx < 0 or idx >= len(items_tmp):
+            await _wa_clear_conv(numero)
+            await kapso.enviar_texto(numero, "No supe qué item estás editando. Volvé a arrancar.")
+            return
+        # Pre-contexto: le decimos a Claude que SOLO devuelva el item nuevo.
+        intencion_edit = await _interpretar_con_claude(texto, ident, [], None)
+        if not intencion_edit or intencion_edit.get("accion") != "gasto":
+            await kapso.enviar_texto(numero, "No entendí la corrección. Probá de nuevo con "
+                                              "nombre + cantidad + unidad + precio.")
+            return
+        # Extraer un item "nivel arriba" o el primero del items[] de la corrección.
+        if intencion_edit.get("items"):
+            it_nuevo = intencion_edit["items"][0]
+        else:
+            it_nuevo = {
+                "rubro": intencion_edit.get("rubro"),
+                "descripcion": intencion_edit.get("descripcion"),
+                "cantidad": intencion_edit.get("cantidad"),
+                "unidad": intencion_edit.get("unidad"),
+                "precio_unit_usd": intencion_edit.get("precio_unit_usd"),
+                "precio_unit_ars": intencion_edit.get("precio_unit_ars"),
+                "monto_usd": intencion_edit.get("monto_usd"),
+                "monto_ars": intencion_edit.get("monto_ars"),
+                "por_hectarea": intencion_edit.get("por_hectarea"),
+            }
+        campo_actual = {"id": multi.get("campo_id"), "nombre": multi.get("campo_nombre"),
+                        "hectareas": multi.get("hectareas")}
+        tc = await _dolar_venta()
+        nuevo_g = await _wa_armar_gasto(ident, campo_actual, it_nuevo, tc)
+        if not nuevo_g:
+            await kapso.enviar_texto(numero, "La corrección no tiene datos suficientes "
+                                              "(me falta cantidad o precio). Probá de nuevo.")
+            return
+        items_tmp[idx] = nuevo_g
+        multi["items"] = items_tmp
+        datos["multi_gasto"] = multi
+        datos.pop("_editing_idx", None)
+        await _kapso_confirmar_multi(ident, numero,
+                                     {"id": multi.get("campo_id"),
+                                      "nombre": multi.get("campo_nombre"),
+                                      "hectareas": multi.get("hectareas")},
+                                     items_tmp)
+        return
+
     if estado == "k_gasto_multi_campo":
         # El user volvió con el campo elegido; retomamos el multi-producto.
         campo = None
@@ -3242,7 +3293,36 @@ def _parsear_gasto(texto: str, campos: list) -> dict | None:
 
 # ── Interpretación de lenguaje natural con Claude ──
 
-MODELO_CLAUDE = os.environ.get("CLAUDE_MODEL", "claude-opus-5")
+MODELO_CLAUDE = os.environ.get("CLAUDE_MODEL", "claude-opus-5-5")
+
+# Lista de nombres de insumos comunes en pulverizaciones. Si el audio los
+# menciona explícitamente, cada uno DEBE entrar como un item separado. Si
+# Claude devuelve menos items que insumos nombrados, re-preguntamos.
+INSUMOS_CONOCIDOS = (
+    "glifosato", "atrazina", "2,4-d", "2,4 d", "dicamba", "paraquat",
+    "metsulfuron", "clorimurón", "clorimuron", "imazapic", "imazetapir",
+    "s-metolaclor", "metolaclor", "clorpirifos", "cipermetrina",
+    "bifentrin", "endosulfan", "lambda", "cihalotrina",
+    "azoxistrobin", "mancozeb", "triazoles", "carbendazim",
+    "urea", "fosfato", "dap", "map", "sulfato", "potasio", "nitrógeno",
+    "aceite", "coadyuvante", "tensioactivo", "silicona", "aceite agrícola",
+    "soja", "maíz", "maiz", "trigo", "girasol", "sorgo", "cebada",
+    "fertilizante", "herbicida", "fungicida", "insecticida",
+)
+
+
+def _contar_insumos_mencionados(texto: str) -> int:
+    """Cuenta nombres de insumos distintos en el texto para validar items[]."""
+    if not texto:
+        return 0
+    n = _norm_cultivo(texto)
+    vistos = set()
+    for nombre in INSUMOS_CONOCIDOS:
+        if nombre in n:
+            # Agrupamos sinónimos obvios (ej. "maíz"/"maiz") en una sola cuenta.
+            clave = nombre.replace("maiz", "maíz").replace("2,4 d", "2,4-d")
+            vistos.add(clave)
+    return len(vistos)
 
 # Todo lo que el bot sabe hacer. Claude elige una acción y completa los datos.
 ESQUEMA_INTENCION = {
@@ -3479,9 +3559,36 @@ def _contexto_para_claude(ident: dict, tareas: list, tarea_activa: dict = None) 
     return "\n".join(partes)
 
 
+async def _llamar_claude(cliente, messages: list, effort: str = "high") -> dict | None:
+    """Una llamada a Claude con el schema de intención. Devuelve el JSON parseado."""
+    r = await cliente.messages.create(
+        model=MODELO_CLAUDE,
+        max_tokens=4000,
+        system=INSTRUCCIONES_CLAUDE,
+        messages=messages,
+        output_config={
+            "effort": effort,
+            "format": {"type": "json_schema", "schema": ESQUEMA_INTENCION},
+        },
+    )
+    crudo = next((b.text for b in r.content if b.type == "text"), "")
+    if not crudo:
+        return None
+    try:
+        return json.loads(crudo)
+    except json.JSONDecodeError:
+        print(f"[CLAUDE] JSON inválido: {crudo[:300]!r}")
+        return None
+
+
 async def _interpretar_con_claude(texto: str, ident: dict, tareas: list,
                                   tarea_activa: dict = None) -> dict | None:
-    """Traduce un mensaje libre a una acción concreta. None si no hay clave o falla."""
+    """Traduce un mensaje libre a una acción concreta. None si no hay clave o falla.
+
+    Si el texto menciona N insumos distintos pero Claude devuelve menos items en el
+    array (falla típica en audios largos multi-producto), re-llamamos a Claude
+    con mensaje de corrección automático para que vuelva a leer.
+    """
     if not os.environ.get("ANTHROPIC_API_KEY"):
         return None
     try:
@@ -3492,36 +3599,44 @@ async def _interpretar_con_claude(texto: str, ident: dict, tareas: list,
 
     try:
         cliente = anthropic.AsyncAnthropic()
-        r = await cliente.messages.create(
-            model=MODELO_CLAUDE,
-            max_tokens=1000,
-            system=INSTRUCCIONES_CLAUDE,
-            messages=[{
-                "role": "user",
-                "content": (f"{_contexto_para_claude(ident, tareas, tarea_activa)}\n\n"
-                            f"Mensaje recibido:\n{texto}"),
-            }],
-            output_config={
-                # Subo a medium: con un audio multi-producto Claude en low se
-                # quedaba con el primer insumo y descartaba el resto.
-                "effort": "medium",
-                "format": {"type": "json_schema", "schema": ESQUEMA_INTENCION},
-            },
-        )
-        crudo = next((b.text for b in r.content if b.type == "text"), "")
-        if not crudo:
-            print(f"[CLAUDE] respuesta vacía para texto={texto[:200]!r}")
-            return None
-        try:
-            parsed = json.loads(crudo)
-        except json.JSONDecodeError:
-            print(f"[CLAUDE] JSON inválido: {crudo[:300]!r}")
-            return None
-        # Imprimo el JSON completo (sin truncar) para poder diagnosticar un
-        # audio que sale mal interpretado. El truncado a 500 se comía justo
-        # la parte de items[] en los casos multi-producto.
+        contexto = _contexto_para_claude(ident, tareas, tarea_activa)
+        prompt_user = f"{contexto}\n\nMensaje recibido:\n{texto}"
         print(f"[CLAUDE] IN >> {texto[:400]!r}")
-        print(f"[CLAUDE] OUT >> {json.dumps(parsed, ensure_ascii=False)}")
+
+        parsed = await _llamar_claude(cliente, [{"role": "user", "content": prompt_user}],
+                                      effort="high")
+        if parsed is None:
+            print(f"[CLAUDE] respuesta vacía intento 1")
+            return None
+        print(f"[CLAUDE] OUT 1 >> {json.dumps(parsed, ensure_ascii=False)}")
+
+        # Retry defensivo: si el texto nombra >=2 insumos y Claude devolvió
+        # menos items en el array, le decimos qué faltó y le pedimos de
+        # nuevo el JSON completo. Es el fallo real que vimos con el audio
+        # "glifosato + atrazina + aceite".
+        n_insumos = _contar_insumos_mencionados(texto)
+        n_items = len(parsed.get("items") or [])
+        if parsed.get("accion") == "gasto" and n_insumos >= 2 and n_items < n_insumos:
+            print(f"[CLAUDE] retry: texto nombra {n_insumos} insumos pero items={n_items}")
+            correccion = (
+                f"La respuesta anterior sólo tiene {n_items} items en el array, "
+                f"pero el mensaje original nombra {n_insumos} productos distintos. "
+                f"Volvé a leer el mensaje entero y devolvé el JSON completo con un "
+                f"item por cada producto nombrado. No omitas ninguno. "
+                f"Usá items[] siempre que haya 2 o más insumos.\n\n"
+                f"Mensaje original:\n{texto}"
+            )
+            parsed2 = await _llamar_claude(
+                cliente,
+                [{"role": "user", "content": prompt_user},
+                 {"role": "assistant", "content": json.dumps(parsed, ensure_ascii=False)},
+                 {"role": "user", "content": correccion}],
+                effort="high",
+            )
+            if parsed2 and len(parsed2.get("items") or []) >= n_items:
+                parsed = parsed2
+                print(f"[CLAUDE] OUT 2 >> {json.dumps(parsed, ensure_ascii=False)}")
+
         return parsed
     except Exception as e:
         print(f"[CLAUDE] error interpretando: {e}")
@@ -3629,14 +3744,55 @@ async def _wa_armar_gasto(ident: dict, campo: dict | None, item: dict, tc_dolar:
     return gasto
 
 
-async def _kapso_guardar_gasto_multi(ident: dict, numero: str, campo: dict, items_gasto: list[dict]) -> None:
-    """
-    Guarda N gastos de la IA en un solo golpe (multi-producto) y manda UN
-    mensaje resumen al final. Cada item ya viene con total_de_usd calculado.
-    """
-    campo_id = campo["id"]
-    campo_nombre = campo.get("nombre") or ""
+def _formato_resumen_multi(campo: dict, items_gasto: list[dict]) -> str:
+    """Texto del resumen de un multi-producto para mostrar al user antes de guardar."""
     hectareas = float(campo.get("hectareas") or 0)
+    total_general = sum(float(g.get("total_de_usd") or 0) for g in items_gasto)
+    lineas = []
+    for i, g in enumerate(items_gasto, 1):
+        total_g = float(g.get("total_de_usd") or 0)
+        lineas.append(f"{i}️⃣ {g.get('descripcion') or 'sin detalle'} · "
+                      f"*USD {_num(total_g)}*")
+    encabezado = (f"🎤 Entendí tu pulverización en *{campo.get('nombre') or ''}*"
+                  + (f" ({_num(hectareas)} ha)" if hectareas > 0 else "")
+                  + f":\n\n" + "\n".join(lineas)
+                  + f"\n\n💰 *Total: USD {_num(round(total_general, 2))}*")
+    if hectareas > 0 and total_general:
+        encabezado += f" ({_num(round(total_general / hectareas, 2))} USD/ha)"
+    return encabezado
+
+
+async def _kapso_confirmar_multi(ident: dict, numero: str, campo: dict,
+                                  items_gasto: list[dict]) -> None:
+    """
+    Muestra el resumen de N gastos y espera la confirmación del user ANTES
+    de guardar. Nunca escribe a la base sin que el user toque ✅.
+    """
+    datos = {
+        "multi_gasto": {
+            "campo_id": campo["id"],
+            "campo_nombre": campo.get("nombre") or "",
+            "hectareas": float(campo.get("hectareas") or 0),
+            "items": items_gasto,
+        },
+    }
+    await _wa_set_conv(numero, "k_gasto_multi_confirmar", datos)
+    texto = (_formato_resumen_multi(campo, items_gasto)
+             + "\n\n¿Lo cargo así?")
+    await kapso.enviar_botones(numero, texto, [
+        ("g_multi_ok", "✅ Cargar todo"),
+        ("g_multi_fix", "✏️ Corregir uno"),
+        ("g_multi_cancel", "❌ Cancelar"),
+    ])
+
+
+async def _kapso_guardar_multi_definitivo(ident: dict, numero: str, datos: dict) -> None:
+    """Cuando el user tocó ✅: escribe los N gastos a la base y manda resumen."""
+    multi = datos.get("multi_gasto") or {}
+    campo_id = multi.get("campo_id")
+    campo_nombre = multi.get("campo_nombre") or ""
+    hectareas = float(multi.get("hectareas") or 0)
+    items_gasto = multi.get("items") or []
     hoy = datetime.now(AR_TZ).date().isoformat()
 
     total_general = 0.0
@@ -3824,7 +3980,8 @@ async def _kapso_aplicar_intencion(ident: dict, numero: str, intencion: dict,
                      "campo_id": campo["id"], "campo_nombre": campo.get("nombre")}
             await _kapso_confirmar_gasto(numero, datos)
         else:
-            await _kapso_guardar_gasto_multi(ident, numero, campo, gastos_calculados)
+            # NO guardar sin confirmación. El user ve los N items y decide.
+            await _kapso_confirmar_multi(ident, numero, campo, gastos_calculados)
         return True
 
     if accion == "invitar":
@@ -4080,6 +4237,63 @@ async def _kapso_procesar(m) -> None:
         await kapso.enviar_texto(numero, "Avisos reactivados 🌾")
         return
 
+    # Botones del flujo multi-gasto: SIEMPRE antes de cualquier otro check de
+    # conv/estado, así no se pierden si ya hay una conv activa.
+    if accion in ("g_multi_ok", "g_multi_fix", "g_multi_cancel"):
+        conv_tmp = await _wa_get_conv(numero)
+        datos_tmp = (conv_tmp or {}).get("datos_parciales") or {}
+        if (conv_tmp or {}).get("estado") != "k_gasto_multi_confirmar":
+            await kapso.enviar_texto(numero, "Ya no tengo esa pulverización en memoria. "
+                                              "Mandá el audio de nuevo si querés cargarla.")
+            await _wa_clear_conv(numero)
+            return
+        if accion == "g_multi_ok":
+            await _kapso_guardar_multi_definitivo(ident, numero, datos_tmp)
+            return
+        if accion == "g_multi_cancel":
+            await _wa_clear_conv(numero)
+            await kapso.enviar_texto(numero, "Listo, no cargué nada. 👌")
+            return
+        # g_multi_fix: lista los items para que el user elija cuál corregir.
+        items_tmp = (datos_tmp.get("multi_gasto") or {}).get("items") or []
+        if not items_tmp:
+            await _wa_clear_conv(numero)
+            await _kapso_menu(ident, numero)
+            return
+        filas = []
+        for i, it in enumerate(items_tmp, 1):
+            lbl = (it.get("descripcion") or "sin detalle")[:24]
+            sub = f"USD {_num(it.get('total_de_usd') or 0)}"
+            filas.append((f"g_multi_edit:{i-1}", lbl, sub))
+        filas.append(("g_multi_ok", "✅ Cargar como está", "Cancela la edición"))
+        await kapso.enviar_lista(numero, "¿Cuál corregís?", "Elegir item", filas, "Items")
+        return
+    if accion.startswith("g_multi_edit:"):
+        conv_tmp = await _wa_get_conv(numero)
+        datos_tmp = (conv_tmp or {}).get("datos_parciales") or {}
+        if (conv_tmp or {}).get("estado") != "k_gasto_multi_confirmar":
+            await kapso.enviar_texto(numero, "Ya no tengo esa pulverización en memoria.")
+            await _wa_clear_conv(numero)
+            return
+        try:
+            idx = int(accion.split(":", 1)[1])
+        except (ValueError, IndexError):
+            idx = -1
+        items_tmp = (datos_tmp.get("multi_gasto") or {}).get("items") or []
+        if idx < 0 or idx >= len(items_tmp):
+            await kapso.enviar_texto(numero, "No reconocí ese item.")
+            return
+        datos_tmp["_editing_idx"] = idx
+        await _wa_set_conv(numero, "k_gasto_multi_edit_texto", datos_tmp)
+        nombre_actual = items_tmp[idx].get("descripcion") or "ese item"
+        await kapso.enviar_texto(
+            numero,
+            f"Dale, contame cómo va *{nombre_actual}*. "
+            f"Mandame un audio o texto con los datos corregidos "
+            f"(nombre, cantidad, unidad, precio por litro / bolsa).",
+        )
+        return
+
     # Botón "No recibir más" de las plantillas: igual que escribir STOP.
     if accion == "stop":
         await _sb_patch(f"wa_preferencias_notificaciones?user_id=eq.{ident['user_id']}", {"activo": False})
@@ -4162,7 +4376,14 @@ async def _kapso_procesar(m) -> None:
     # Esto evita que una conv en curso "¿a qué campo lo cargo?" atrape un
     # audio completamente nuevo del user (caso real 2026-11-23: audio con 3
     # productos cayó como respuesta a un "¿qué campo?" viejo y cargó basura).
-    if conv and texto and m.tipo in ("text", "audio") and _texto_es_nueva_intencion(texto):
+    # EXCEPCIÓN: estados de edición interactiva (k_gasto_multi_*) son
+    # intencionales: el user está corrigiendo un item del resumen y el audio
+    # largo es esperado — no descartamos.
+    estados_edicion_activa = {"k_gasto_multi_edit_texto", "k_gasto_multi_confirmar",
+                              "k_gasto_multi_campo"}
+    if (conv and texto and m.tipo in ("text", "audio")
+            and conv.get("estado") not in estados_edicion_activa
+            and _texto_es_nueva_intencion(texto)):
         print(f"[WA] descarto estado '{conv.get('estado')}' — llegó nueva intención en texto largo")
         await _wa_clear_conv(numero)
         conv = None
