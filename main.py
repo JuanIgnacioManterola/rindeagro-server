@@ -464,40 +464,43 @@ async def _kapso_menu(ident: dict, numero: str, encabezado: str = "") -> None:
     saludo = encabezado or (f"{_wa_saludo_hora()}, {nombre} 🌾" if nombre
                             else f"{_wa_saludo_hora()} 🌾")
 
-    # Algo útil de entrada: cuántas tareas tiene y cuándo vence la próxima.
-    tareas = await _wa_tareas_pendientes(ident) if _wa_puede(ident, "tareas") else []
-    lineas = [saludo]
-    if tareas:
-        n = len(tareas)
-        # _wa_tareas_pendientes trae hasta 10: con 10 puede haber más.
-        cuantas = "10 o más" if n >= 10 else str(n)
-        linea = f"Tenés *{cuantas} tarea{'s' if n != 1 else ''} pendiente{'s' if n != 1 else ''}*"
-        venc = _wa_vencimiento_txt(tareas[0]) if tareas[0].get("fecha_vencimiento") else ""
-        lineas.append(f"{linea}, la próxima {venc}." if venc else f"{linea}.")
+    campo_demo = ((ident.get("campos") or [{}])[0].get("nombre") or "La Loma")
+    cuerpo = (
+        f"{saludo}\n\n"
+        "¿Qué querés cargar?\n\n"
+        f"También podés escribirme como le hablarías a alguien, por ejemplo "
+        f"_llovieron 25 mm en {campo_demo}_, o mandarme la *foto de una factura*."
+    )
 
-    botones = []
-    if _wa_puede(ident, "tareas"):
-        botones.append(("tareas", f"📋 Mis tareas ({len(tareas) if len(tareas) < 10 else '10+'})"
-                        if tareas else "📋 Mis tareas"))
+    # Las acciones del menú van en una lista desplegable: 3 botones no alcanzan
+    # para las 6 formas de carga (gasto, lluvia, insumo, tarea, ingreso, pago) +
+    # ver tareas. El orden es por frecuencia de uso en campaña.
+    filas = []
     if _wa_puede(ident, "gastos", "editar"):
-        botones.append(("gasto", "💵 Cargar gasto"))
+        filas.append(("gasto", "💵 Cargar gasto", "Insumos, flete, laboreo"))
     if _wa_puede(ident, "lluvias", "editar"):
-        botones.append(("lluvia", "🌧️ Registrar lluvia"))
+        filas.append(("lluvia", "🌧️ Registrar lluvia", "mm en un campo"))
+    if _wa_puede(ident, "insumos", "editar"):
+        filas.append(("insumo", "📦 Cargar insumo", "Sumar al stock"))
+    if _wa_puede(ident, "tareas", "editar"):
+        filas.append(("tarea_nueva", "📝 Cargar tarea", "Pendiente nueva"))
+    if _wa_puede(ident, "ingresos", "editar"):
+        filas.append(("ingreso", "💰 Cargar ingreso", "Venta de cultivo"))
+    if _wa_puede(ident, "compromisos_pago", "editar"):
+        filas.append(("pago", "🧾 Cargar pago", "Cheque o cuota"))
+    # Ver tareas siempre al final — la acción de carga va arriba, la consulta abajo.
+    if _wa_puede(ident, "tareas"):
+        tareas_pend = await _wa_tareas_pendientes(ident)
+        n = len(tareas_pend)
+        titulo = "📋 Mis tareas" + (f" ({n if n < 10 else '10+'})" if tareas_pend else "")
+        filas.append(("tareas", titulo, "Ver y completar"))
 
-    if not botones:
-        await kapso.enviar_texto(numero, "\n".join(lineas) +
+    if not filas:
+        await kapso.enviar_texto(numero, cuerpo +
                                  "\n\nTu usuario todavía no tiene permisos para cargar datos.")
         return
 
-    campo = ((ident.get("campos") or [{}])[0].get("nombre") or "La Loma")
-    lineas += [
-        "",
-        "¿Qué cargamos hoy?",
-        "",
-        f"También podés escribirme como le hablarías a alguien, por ejemplo "
-        f"_llovieron 25 mm en {campo}_, o mandarme la *foto de una factura*.",
-    ]
-    await kapso.enviar_botones(numero, "\n".join(lineas), botones)
+    await kapso.enviar_lista(numero, cuerpo, "Ver opciones", filas, "Qué cargar hoy")
 
 
 # ── Tareas ────────────────────────────────────
@@ -1016,6 +1019,193 @@ async def _kapso_invitar_crear(ident: dict, numero: str, rol_ui: str, datos: dic
     )
 
 
+# ── Insumos (stock) ───────────────────────────
+
+TIPOS_INSUMO = [("herbicidas", "Herbicidas"), ("fungicidas", "Fungicidas"),
+                ("insecticidas", "Insecticidas"), ("fertilizantes", "Fertilizantes"),
+                ("semillas", "Semillas"), ("otros", "Otros")]
+
+
+async def _kapso_insumo_guiado(ident: dict, numero: str) -> None:
+    if not _wa_puede(ident, "insumos", "editar"):
+        await kapso.enviar_texto(numero, "Solo el dueño o un administrador pueden cargar insumos al stock.")
+        return
+    datos = {"insumo": {}}
+    await _wa_set_conv(numero, "k_ins_tipo", datos)
+    filas = [(f"ins_tipo:{k}", v) for k, v in TIPOS_INSUMO]
+    await kapso.enviar_lista(numero, "¿Qué tipo de insumo?", "Elegir tipo", filas, "Tipos")
+
+
+async def _kapso_guardar_insumo(ident: dict, numero: str, datos: dict) -> None:
+    ins = datos.get("insumo", {})
+    cantidad = float(ins.get("cantidad") or 0)
+    unidad = ins.get("unidad") or "unidades"
+    tipo = ins.get("tipo") or "otros"
+    payload = {
+        "owner_id": ident["owner_id"],
+        "nombre": ins.get("nombre") or "Sin nombre",
+        "tipo": tipo,
+        "unidad": unidad,
+        "stock_actual": cantidad,
+        "ubicacion": ins.get("ubicacion") or None,
+    }
+    await _sb_post("stock_insumos", payload)
+    await _wa_clear_conv(numero)
+    ubic_txt = f"\n📍 {ins.get('ubicacion')}" if ins.get("ubicacion") else ""
+    tipo_label = next((v for k, v in TIPOS_INSUMO if k == tipo), tipo.capitalize())
+    await kapso.enviar_texto(
+        numero,
+        f"✅ Agregaste *{_num(cantidad)} {unidad}* de *{ins.get('nombre')}* al stock.\n"
+        f"📦 Rubro: {tipo_label}{ubic_txt}"
+    )
+
+
+# ── Tareas nuevas (cargar) ────────────────────
+
+async def _kapso_tarea_nueva_guiado(ident: dict, numero: str) -> None:
+    if not _wa_puede(ident, "tareas", "editar"):
+        await kapso.enviar_texto(numero, "Solo el dueño o un administrador pueden crear tareas.")
+        return
+    datos = {"tarea_nueva": {}}
+    await _wa_set_conv(numero, "k_tar_titulo", datos)
+    await kapso.enviar_texto(numero, "¿Qué hay que hacer? (ej: _fumigar La Esperanza con glifosato_)")
+
+
+async def _kapso_guardar_tarea_nueva(ident: dict, numero: str, datos: dict) -> None:
+    t = datos.get("tarea_nueva", {})
+    payload = {
+        "owner_id": ident["owner_id"],
+        "titulo": t.get("titulo") or "Sin título",
+        "estado": "pendiente",
+        "fecha_vencimiento": t.get("fecha") or None,
+        "campo_id": t.get("campo_id") or None,
+    }
+    await _sb_post("tareas", payload)
+    await _wa_clear_conv(numero)
+    partes = [f"✅ Tarea creada: *{t.get('titulo')}*"]
+    if t.get("fecha"):
+        partes.append(f"📅 Vence {_wa_fecha_corta(t['fecha'])}")
+    if t.get("campo_nombre"):
+        partes.append(f"🌱 {t['campo_nombre']}")
+    await kapso.enviar_texto(numero, "\n".join(partes))
+
+
+# ── Ingresos (ventas de cultivo) ──────────────
+
+CULTIVOS_WA = [("soja", "Soja"), ("maiz", "Maíz"), ("trigo", "Trigo"),
+               ("girasol", "Girasol"), ("sorgo", "Sorgo"), ("otro", "Otro")]
+
+
+async def _kapso_pedir_cultivo(numero: str) -> None:
+    filas = [(f"cultivo:{k}", v) for k, v in CULTIVOS_WA]
+    await kapso.enviar_lista(numero, "¿Qué cultivo vendiste?", "Elegir cultivo", filas, "Cultivos")
+
+
+async def _kapso_ingreso_guiado(ident: dict, numero: str) -> None:
+    if not _wa_puede(ident, "ingresos", "editar"):
+        await kapso.enviar_texto(numero, "Tu usuario no tiene permiso para cargar ingresos.")
+        return
+    datos = {"ingreso": {}}
+    if await _kapso_pedir_campo(ident, numero, "k_ing_campo", datos, "¿En qué campo fue la venta?"):
+        return
+    # 1 solo campo: seteado por _kapso_pedir_campo → avanzar directo a cultivo
+    datos["ingreso"]["campo_id"] = datos["campo_id"]
+    datos["ingreso"]["campo_nombre"] = datos["campo_nombre"]
+    await _wa_set_conv(numero, "k_ing_cultivo", datos)
+    await _kapso_pedir_cultivo(numero)
+
+
+async def _kapso_guardar_ingreso(ident: dict, numero: str, datos: dict) -> None:
+    """
+    Los ingresos no tienen tabla propia: viven como JSON en campos.ingresos_cultivos.
+    Hay que leer, agregar la venta nueva al array del cultivo, y guardar back.
+    """
+    import json
+    ing = datos.get("ingreso", {})
+    campo_id = ing.get("campo_id")
+    cultivo = ing.get("cultivo") or "otro"
+    tn = float(ing.get("tn") or 0)
+    precio = float(ing.get("precio") or 0)
+
+    filas = await _sb_get("campos", {
+        "id": f"eq.{campo_id}", "select": "ingresos_cultivos", "limit": "1",
+    })
+    if not filas:
+        await _wa_clear_conv(numero)
+        await kapso.enviar_texto(numero, "No encontré el campo. Probá de nuevo.")
+        return
+
+    actual = filas[0].get("ingresos_cultivos")
+    try:
+        datos_cultivos = json.loads(actual) if actual else {}
+        if not isinstance(datos_cultivos, dict):
+            datos_cultivos = {}
+    except Exception:
+        datos_cultivos = {}
+
+    datos_cultivos.setdefault(cultivo, {}).setdefault("ventas", []).append({
+        "tn": tn,
+        "precio": precio,
+        "tipo": "spot",
+        "fecha": datetime.now(AR_TZ).date().isoformat(),
+        "fuente": "whatsapp",
+    })
+
+    await _sb_patch(f"campos?id=eq.{campo_id}",
+                    {"ingresos_cultivos": json.dumps(datos_cultivos)})
+    await _wa_clear_conv(numero)
+    total = tn * precio
+    cultivo_label = next((v for k, v in CULTIVOS_WA if k == cultivo), cultivo.capitalize())
+    await kapso.enviar_texto(
+        numero,
+        f"✅ Venta guardada: *{_num(tn)} tn* de *{cultivo_label}* a *USD {_num(precio)}/tn* en {ing.get('campo_nombre')}\n"
+        f"💰 Total: *USD {_miles(total)}*"
+    )
+
+
+# ── Pagos (cheques / cuotas) ──────────────────
+
+TIPOS_PAGO = [("cheque", "Cheque"), ("cuota_credito", "Cuota de crédito"),
+              ("otro", "Otro")]
+
+
+async def _kapso_pago_guiado(ident: dict, numero: str) -> None:
+    if not _wa_puede(ident, "compromisos_pago", "editar"):
+        await kapso.enviar_texto(numero, "Solo el dueño o un administrador pueden cargar pagos.")
+        return
+    datos = {"pago": {}}
+    await _wa_set_conv(numero, "k_pag_tipo", datos)
+    filas = [(f"pag_tipo:{k}", v) for k, v in TIPOS_PAGO]
+    await kapso.enviar_lista(numero, "¿Qué tipo de pago?", "Elegir tipo", filas, "Tipos")
+
+
+async def _kapso_guardar_pago(ident: dict, numero: str, datos: dict) -> None:
+    p = datos.get("pago", {})
+    importe = float(p.get("importe") or 0)
+    moneda = p.get("moneda") or "ARS"
+    tipo = p.get("tipo") or "cheque"
+    fecha = p.get("fecha") or datetime.now(AR_TZ).date().isoformat()
+    payload = {
+        "owner_id": ident["owner_id"],
+        "tipo": tipo,
+        "beneficiario": p.get("beneficiario") or "",
+        "importe": importe,
+        "moneda": moneda,
+        "fecha_cobro": fecha,
+        "estado": "pendiente",
+        "fuente": "whatsapp",
+    }
+    await _sb_post("compromisos_pago", payload)
+    await _wa_clear_conv(numero)
+    tipo_label = next((v for k, v in TIPOS_PAGO if k == tipo), tipo.capitalize())
+    bene = f" a *{p.get('beneficiario')}*" if p.get("beneficiario") else ""
+    await kapso.enviar_texto(
+        numero,
+        f"✅ {tipo_label} de *{moneda} {_miles(importe)}*{bene}\n"
+        f"📅 Vence {_wa_fecha_corta(fecha)}"
+    )
+
+
 # ── Texto libre ───────────────────────────────
 
 # ── Productos parecidos y alias aprendidos ─────────────────
@@ -1415,6 +1605,224 @@ async def _kapso_flujo(ident: dict, numero: str, m, conv: dict) -> None:
         await _kapso_invitar_crear(ident, numero, rol_ui, datos)
         return
 
+    # ── Insumo (stock) ─────────────────────────
+    if estado == "k_ins_tipo":
+        tipo = None
+        if accion.startswith("ins_tipo:"):
+            tipo = accion.split(":", 1)[1]
+        elif texto:
+            n = _norm(texto)
+            for k, _v in TIPOS_INSUMO:
+                if k[:-1] in n or k in n:
+                    tipo = k
+                    break
+            if not tipo:
+                tipo = "otros"
+        if not tipo:
+            await kapso.enviar_texto(numero, "Tocá un tipo de la lista.")
+            return
+        datos.setdefault("insumo", {})["tipo"] = tipo
+        await _wa_set_conv(numero, "k_ins_nombre", datos)
+        await kapso.enviar_texto(numero, "¿Qué producto? (ej: _Glifosato 48%_, _Urea granulada_)")
+        return
+
+    if estado == "k_ins_nombre":
+        nombre = (texto or "").strip()[:150]
+        if not nombre:
+            await kapso.enviar_texto(numero, "Escribí el nombre del producto.")
+            return
+        datos.setdefault("insumo", {})["nombre"] = nombre
+        await _wa_set_conv(numero, "k_ins_cantidad", datos)
+        await kapso.enviar_texto(numero, "¿Cuánta cantidad? (ej: _300 litros_, _50 kg_, _10 bolsas_)")
+        return
+
+    if estado == "k_ins_cantidad":
+        cantidad, unidad = _parsear_cantidad_unidad(texto)
+        if cantidad <= 0:
+            await kapso.enviar_texto(numero, "No entendí la cantidad. Escribí _300 litros_ o _50 kg_.")
+            return
+        datos.setdefault("insumo", {})["cantidad"] = cantidad
+        datos["insumo"]["unidad"] = unidad
+        await _wa_set_conv(numero, "k_ins_ubicacion", datos)
+        await kapso.enviar_texto(
+            numero, "¿Dónde lo guardás? (ej: _Galpón 1_, o escribí _sin especificar_)")
+        return
+
+    if estado == "k_ins_ubicacion":
+        n = _norm(texto or "")
+        if n and n not in ("sin especificar", "no", "ninguna", "ninguno", "-"):
+            datos.setdefault("insumo", {})["ubicacion"] = texto.strip()[:100]
+        await _kapso_guardar_insumo(ident, numero, datos)
+        return
+
+    # ── Tarea nueva (carga desde WhatsApp) ─────
+    if estado == "k_tar_titulo":
+        titulo = (texto or "").strip()[:200]
+        if not titulo:
+            await kapso.enviar_texto(numero, "¿Qué hay que hacer? Escribí el título.")
+            return
+        datos.setdefault("tarea_nueva", {})["titulo"] = titulo
+        await _wa_set_conv(numero, "k_tar_fecha", datos)
+        await kapso.enviar_texto(
+            numero, "¿Para cuándo? (ej: _mañana_, _15/12_, _próxima semana_, o _sin fecha_)")
+        return
+
+    if estado == "k_tar_fecha":
+        n = _norm(texto or "")
+        if n not in ("sin fecha", "no", "ninguna", "-", ""):
+            fecha = _parsear_fecha_natural(texto)
+            if not fecha:
+                await kapso.enviar_texto(
+                    numero, "No entendí la fecha. Escribí _mañana_, _15/12_, _próxima semana_, o _sin fecha_.")
+                return
+            datos.setdefault("tarea_nueva", {})["fecha"] = fecha
+        # Pedir campo (opcional)
+        campos = ident.get("campos") or []
+        if not campos:
+            await _kapso_guardar_tarea_nueva(ident, numero, datos)
+            return
+        if len(campos) == 1:
+            datos["tarea_nueva"]["campo_id"] = campos[0]["id"]
+            datos["tarea_nueva"]["campo_nombre"] = campos[0]["nombre"]
+            await _kapso_guardar_tarea_nueva(ident, numero, datos)
+            return
+        await _wa_set_conv(numero, "k_tar_campo", datos)
+        filas = []
+        for c in campos[:9]:
+            sub = f"{_num(c['hectareas'])} ha" if c.get("hectareas") else ""
+            filas.append((f"tar_campo:{c['id']}", c["nombre"], sub))
+        filas.append(("tar_campo:none", "Sin campo específico", ""))
+        await kapso.enviar_lista(numero, "¿En qué campo?", "Elegir campo", filas, "Tus campos")
+        return
+
+    if estado == "k_tar_campo":
+        if accion.startswith("tar_campo:"):
+            cid = accion.split(":", 1)[1]
+            if cid != "none":
+                campo = next((c for c in ident.get("campos", []) if c["id"] == cid), None)
+                if campo:
+                    datos["tarea_nueva"]["campo_id"] = campo["id"]
+                    datos["tarea_nueva"]["campo_nombre"] = campo["nombre"]
+        elif texto:
+            n = _norm(texto)
+            if n not in ("sin campo", "ninguno", "no", "-"):
+                campo = _buscar_campo(texto, ident.get("campos") or [])
+                if campo:
+                    datos["tarea_nueva"]["campo_id"] = campo["id"]
+                    datos["tarea_nueva"]["campo_nombre"] = campo["nombre"]
+        await _kapso_guardar_tarea_nueva(ident, numero, datos)
+        return
+
+    # ── Ingreso (venta de cultivo) ─────────────
+    if estado == "k_ing_campo":
+        campo = None
+        if accion.startswith("campo:"):
+            cid = accion.split(":", 1)[1]
+            campo = next((c for c in ident.get("campos", []) if c["id"] == cid), None)
+        if not campo:
+            campo = _buscar_campo(texto, ident.get("campos") or [])
+        if not campo:
+            await kapso.enviar_texto(numero, "No reconocí ese campo. Tocá uno de la lista.")
+            return
+        datos.setdefault("ingreso", {})["campo_id"] = campo["id"]
+        datos["ingreso"]["campo_nombre"] = campo["nombre"]
+        await _wa_set_conv(numero, "k_ing_cultivo", datos)
+        await _kapso_pedir_cultivo(numero)
+        return
+
+    if estado == "k_ing_cultivo":
+        cultivo = None
+        if accion.startswith("cultivo:"):
+            cultivo = accion.split(":", 1)[1]
+        elif texto:
+            n = _norm(texto)
+            for k, _v in CULTIVOS_WA:
+                if k in n:
+                    cultivo = k
+                    break
+            if not cultivo:
+                cultivo = "otro"
+        if not cultivo:
+            await kapso.enviar_texto(numero, "Tocá un cultivo de la lista.")
+            return
+        datos["ingreso"]["cultivo"] = cultivo
+        await _wa_set_conv(numero, "k_ing_tn", datos)
+        await kapso.enviar_texto(numero, "¿Cuántas toneladas vendiste?")
+        return
+
+    if estado == "k_ing_tn":
+        tn = _extraer_numero(texto)
+        if tn is None or tn <= 0:
+            await kapso.enviar_texto(numero, "Escribí solo el número de toneladas, por ejemplo *50*.")
+            return
+        datos["ingreso"]["tn"] = tn
+        await _wa_set_conv(numero, "k_ing_precio", datos)
+        await kapso.enviar_texto(numero, "¿A qué precio USD por tonelada?")
+        return
+
+    if estado == "k_ing_precio":
+        precio = _extraer_numero(texto)
+        if precio is None or precio <= 0:
+            await kapso.enviar_texto(numero, "Escribí solo el precio en USD por tonelada, por ejemplo *320*.")
+            return
+        datos["ingreso"]["precio"] = precio
+        await _kapso_guardar_ingreso(ident, numero, datos)
+        return
+
+    # ── Pago (cheque/cuota) ────────────────────
+    if estado == "k_pag_tipo":
+        tipo = None
+        if accion.startswith("pag_tipo:"):
+            tipo = accion.split(":", 1)[1]
+        elif texto:
+            n = _norm(texto)
+            if "cheque" in n:
+                tipo = "cheque"
+            elif "cuota" in n or "credito" in n or "crédito" in n:
+                tipo = "cuota_credito"
+            else:
+                tipo = "otro"
+        if not tipo:
+            await kapso.enviar_texto(numero, "Tocá un tipo de la lista.")
+            return
+        datos.setdefault("pago", {})["tipo"] = tipo
+        await _wa_set_conv(numero, "k_pag_beneficiario", datos)
+        await kapso.enviar_texto(numero, "¿A quién le pagás? (ej: _Acopio La Hortensia_)")
+        return
+
+    if estado == "k_pag_beneficiario":
+        bene = (texto or "").strip()[:150]
+        if not bene:
+            await kapso.enviar_texto(numero, "Escribí el nombre del beneficiario.")
+            return
+        datos.setdefault("pago", {})["beneficiario"] = bene
+        await _wa_set_conv(numero, "k_pag_importe", datos)
+        await kapso.enviar_texto(numero, "¿Cuánto? (ej: _500 mil pesos_, _USD 2000_)")
+        return
+
+    if estado == "k_pag_importe":
+        importe = _parsear_plata(texto)
+        if importe is None or importe <= 0:
+            await kapso.enviar_texto(numero, "No entendí el monto. Escribí _500 mil pesos_ o _USD 2000_.")
+            return
+        n = _norm(texto)
+        es_usd = ("usd" in n or "dolar" in n or "dólar" in n or "u$s" in n or "u$d" in n)
+        datos.setdefault("pago", {})["importe"] = importe
+        datos["pago"]["moneda"] = "USD" if es_usd else "ARS"
+        await _wa_set_conv(numero, "k_pag_fecha", datos)
+        await kapso.enviar_texto(numero, "¿Cuándo vence? (ej: _15/12_, _próxima semana_, _en 30 días_)")
+        return
+
+    if estado == "k_pag_fecha":
+        fecha = _parsear_fecha_natural(texto)
+        if not fecha:
+            await kapso.enviar_texto(
+                numero, "No entendí la fecha. Escribí _15/12_, _próxima semana_, o _en 30 días_.")
+            return
+        datos.setdefault("pago", {})["fecha"] = fecha
+        await _kapso_guardar_pago(ident, numero, datos)
+        return
+
     # Estado desconocido → limpiar y volver al menú
     await _wa_clear_conv(numero)
     await _kapso_menu(ident, numero)
@@ -1501,6 +1909,104 @@ def _parsear_plata(texto: str) -> float | None:
     elif re.search(r"\b" + re.escape(crudo) + r"\s*(mil|k)\b", texto.lower()):
         valor *= 1000
     return valor
+
+
+def _parsear_fecha_natural(texto: str) -> str | None:
+    """
+    Convierte 'mañana', '15/12', 'próxima semana', 'en 30 días' a ISO 'YYYY-MM-DD'.
+    None si no se reconoce.
+    """
+    n = _norm(texto.strip())
+    hoy = datetime.now(AR_TZ).date()
+
+    if n in ("hoy", "ahora"):
+        return hoy.isoformat()
+    if n in ("mañana", "manana"):
+        return (hoy + timedelta(days=1)).isoformat()
+    if n in ("pasado", "pasado mañana", "pasado manana"):
+        return (hoy + timedelta(days=2)).isoformat()
+    if ("proxima semana" in n or "próxima semana" in n or
+            "semana que viene" in n or "en 1 semana" in n or "en una semana" in n):
+        return (hoy + timedelta(days=7)).isoformat()
+    if "proximo mes" in n or "próximo mes" in n or "mes que viene" in n:
+        return (hoy + timedelta(days=30)).isoformat()
+
+    # Formato DD/MM, DD/MM/YYYY, DD-MM-YYYY
+    m = re.search(r"(\d{1,2})[\/\-](\d{1,2})(?:[\/\-](\d{2,4}))?", n)
+    if m:
+        d, mo, y = int(m.group(1)), int(m.group(2)), m.group(3)
+        anio = int(y) if y else hoy.year
+        if anio < 100:
+            anio += 2000
+        try:
+            fecha = datetime(anio, mo, d).date()
+            # Si fue DD/MM sin año y ya pasó, asumir año que viene
+            if not y and fecha < hoy:
+                fecha = datetime(anio + 1, mo, d).date()
+            return fecha.isoformat()
+        except Exception:
+            pass
+
+    # "en N días"
+    m = re.search(r"en\s+(\d+)\s+d[ií]a", n)
+    if m:
+        try:
+            return (hoy + timedelta(days=int(m.group(1)))).isoformat()
+        except Exception:
+            pass
+
+    # Meses escritos: "15 de diciembre", "15 diciembre"
+    meses = {"enero": 1, "febrero": 2, "marzo": 3, "abril": 4, "mayo": 5, "junio": 6,
+             "julio": 7, "agosto": 8, "septiembre": 9, "setiembre": 9, "octubre": 10,
+             "noviembre": 11, "diciembre": 12}
+    m = re.search(r"(\d{1,2})\s*(?:de\s+)?(" + "|".join(meses.keys()) + r")", n)
+    if m:
+        d = int(m.group(1))
+        mo = meses[m.group(2)]
+        try:
+            fecha = datetime(hoy.year, mo, d).date()
+            if fecha < hoy:
+                fecha = datetime(hoy.year + 1, mo, d).date()
+            return fecha.isoformat()
+        except Exception:
+            pass
+
+    return None
+
+
+def _wa_fecha_corta(fecha_iso: str) -> str:
+    """ '2026-12-15' → '15/12/2026'. Si no parsea, devuelve la entrada tal cual. """
+    if not fecha_iso:
+        return ""
+    try:
+        return datetime.strptime(fecha_iso[:10], "%Y-%m-%d").strftime("%d/%m/%Y")
+    except Exception:
+        return str(fecha_iso)
+
+
+def _parsear_cantidad_unidad(texto: str) -> tuple:
+    """
+    '300 litros' → (300.0, 'litros'). Sin unidad reconocible → (n, 'unidades').
+    Devuelve (0.0, 'unidades') si no hay número.
+    """
+    n = _norm(texto.strip())
+    m = re.search(
+        r"([\d.,]+)\s*(l|lt|lts|litros?|kg|kilos?|bolsas?|dosis|u|unidades?|unidad)\b",
+        n)
+    if m:
+        try:
+            cantidad = float(m.group(1).replace(".", "").replace(",", "."))
+            raw = m.group(2)
+            unidad = ("litros" if raw.startswith("l") and raw != "unidades" else
+                      "kg" if raw.startswith("k") else
+                      "bolsas" if raw.startswith("bolsa") else
+                      "dosis" if raw == "dosis" else
+                      "unidades")
+            return cantidad, unidad
+        except Exception:
+            pass
+    solo = _extraer_numero(texto)
+    return (float(solo) if solo else 0.0), "unidades"
 
 
 def _rubro_por_texto(texto: str) -> tuple:
@@ -1923,6 +2429,22 @@ async def _kapso_procesar(m) -> None:
         # campo elegido por dos estados para nada.
         await _wa_set_conv(numero, "k_lluvia_mm", {})
         await kapso.enviar_texto(numero, "¿Cuántos mm?")
+        return
+    if accion == "insumo":
+        await _wa_clear_conv(numero)
+        await _kapso_insumo_guiado(ident, numero)
+        return
+    if accion == "tarea_nueva":
+        await _wa_clear_conv(numero)
+        await _kapso_tarea_nueva_guiado(ident, numero)
+        return
+    if accion == "ingreso":
+        await _wa_clear_conv(numero)
+        await _kapso_ingreso_guiado(ident, numero)
+        return
+    if accion == "pago":
+        await _wa_clear_conv(numero)
+        await _kapso_pago_guiado(ident, numero)
         return
     if accion.startswith("t:"):
         await _wa_clear_conv(numero)
