@@ -208,6 +208,26 @@ def _norm(texto: str) -> str:
     return texto.strip().lower()
 
 
+def _texto_es_nueva_intencion(texto: str) -> bool:
+    """
+    Heurística: el mensaje parece una carga completa (ingreso, gasto, lluvia,
+    tarea…), no la respuesta corta al flujo guiado en curso. Si es largo y
+    menciona verbos de acción o varias palabras clave de dominio, damos por
+    hecho que el user está arrancando de cero y descartamos el estado anterior.
+    Un "La Escondida" o "sí" cortito nunca entra acá porque son <60 chars.
+    """
+    n = _norm(texto)
+    if len(n) < 60:
+        return False
+    verbos = ("cargar", "aplicar", "aplicó", "aplicamos", "aplique", "gasté",
+              "gastamos", "compré", "compramos", "llovió", "llovieron",
+              "sembramos", "sembré", "vendimos", "vendí", "pagamos", "pagué",
+              "registrar")
+    palabras = ("hectárea", "hectarea", "por litro", "dólares", "pesos",
+                "por tonelada", "por bolsa", "mm de lluvia", "precio")
+    return any(v in n for v in verbos) or sum(1 for p in palabras if p in n) >= 2
+
+
 # ── Helpers de flujo ────────────────────────
 
 def _buscar_campo(texto: str, campos: list) -> dict | None:
@@ -4115,6 +4135,16 @@ async def _kapso_procesar(m) -> None:
         return
 
     conv = await _wa_get_conv(numero)
+
+    # Si el texto parece ser una nueva intención completa (audio con "cargar
+    # X, aplicar X, precios/cantidades"), descartamos el estado pendiente.
+    # Esto evita que una conv en curso "¿a qué campo lo cargo?" atrape un
+    # audio completamente nuevo del user (caso real 2026-11-23: audio con 3
+    # productos cayó como respuesta a un "¿qué campo?" viejo y cargó basura).
+    if conv and texto and m.tipo in ("text", "audio") and _texto_es_nueva_intencion(texto):
+        print(f"[WA] descarto estado '{conv.get('estado')}' — llegó nueva intención en texto largo")
+        await _wa_clear_conv(numero)
+        conv = None
 
     # Un adjunto sin conversación en curso es, casi siempre, una factura
     if m.tiene_media and not conv:
