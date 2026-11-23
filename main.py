@@ -1898,11 +1898,24 @@ async def _kapso_texto_libre(ident: dict, numero: str, texto: str,
             return
 
     # Claude entiende el resto: "la terminé, anotá que sobró medio bidón"
+    intencion_claude = None
     if os.environ.get("ANTHROPIC_API_KEY"):
         tareas = await _wa_tareas_pendientes(ident)
-        intencion = await _interpretar_con_claude(texto, ident, tareas, tarea_activa)
-        if intencion and await _kapso_aplicar_intencion(ident, numero, intencion):
+        intencion_claude = await _interpretar_con_claude(texto, ident, tareas, tarea_activa)
+        if intencion_claude and await _kapso_aplicar_intencion(ident, numero, intencion_claude):
             return
+
+    # Si Claude entendió el tipo de carga pero no pudo cerrarlo (p. ej. faltó un
+    # campo o un total), NO caemos al motor legacy de OpenAI: esa IA vieja no
+    # sabe de precio_unit y pisa el audio con un total mal (caso 2026-11:
+    # "10 L de glifosato a $5/L" → legacy guardaba USD 3). Mejor menú guiado.
+    if intencion_claude and intencion_claude.get("accion") in (
+            "gasto", "lluvia", "ingreso", "pago", "insumo", "tarea_nueva", "siembra"):
+        print(f"[WA FALLBACK] Claude entendió accion={intencion_claude.get('accion')} "
+              f"confianza={intencion_claude.get('confianza')} pero no se pudo aplicar — voy a menú")
+        await _kapso_menu(ident, numero, "Entendí lo que me mandaste pero me falta info 🤔\n"
+                                           "Elegí abajo qué querés cargar y lo hacemos paso a paso:")
+        return
 
     # IA para gastos dichos en criollo ("gasté 1200 de urea en La Esperanza")
     api_key = os.environ.get("OPENAI_API_KEY", "")
@@ -3294,7 +3307,10 @@ monto_usd en null: la conversión la hace el sistema. "300 lucas" o "300 mil pes
 - Si la persona se corrige ("300, eh, 300 mil"), tomá el último número que dice.
 - Fechas: resolvé a formato YYYY-MM-DD. "ayer", "hoy", "15/12" → fecha concreta. Si no mencionan año, \
 asumí el año actual.
-- confianza baja si estás adivinando. Ante la duda, poné baja: preferimos preguntar antes que cargar mal.
+- confianza: alta si está TODO claro (acción + datos requeridos); media si falta algún opcional \
+(ej. campo o fecha) pero los datos núcleo están; baja SOLO si estás adivinando lo esencial \
+(acción incierta, montos inventados, nombres que no cuadran). Si el mensaje dice "30 litros de \
+glifosato a $5 el litro" la confianza es alta, aunque falte el campo.
 - Dejá en null los campos que el mensaje no menciona. No inventes datos."""
 
 
@@ -3375,7 +3391,16 @@ async def _interpretar_con_claude(texto: str, ident: dict, tareas: list,
             },
         )
         crudo = next((b.text for b in r.content if b.type == "text"), "")
-        return json.loads(crudo) if crudo else None
+        if not crudo:
+            print(f"[CLAUDE] respuesta vacía para texto={texto[:200]!r}")
+            return None
+        try:
+            parsed = json.loads(crudo)
+        except json.JSONDecodeError:
+            print(f"[CLAUDE] JSON inválido: {crudo[:300]!r}")
+            return None
+        print(f"[CLAUDE] texto_in={texto[:200]!r} intencion={json.dumps(parsed, ensure_ascii=False)[:500]}")
+        return parsed
     except Exception as e:
         print(f"[CLAUDE] error interpretando: {e}")
         return None
@@ -3384,8 +3409,27 @@ async def _interpretar_con_claude(texto: str, ident: dict, tareas: list,
 async def _kapso_aplicar_intencion(ident: dict, numero: str, intencion: dict) -> bool:
     """Ejecuta lo que Claude entendió. Devuelve False si no se pudo hacer nada."""
     accion = intencion.get("accion") or "nada"
-    if accion == "nada" or intencion.get("confianza") == "baja":
+    if accion == "nada":
         return False
+    # confianza=baja no se descarta ciegamente: si los datos núcleo están, es
+    # mejor arrancar el flujo con prefill que caer al motor legacy (OpenAI) que
+    # no sabe de precio_unit y pisa con un total equivocado (caso real 2026-11:
+    # audio "10 L de glifosato a $5 el litro" → legacy guardaba USD 3 suelto).
+    # Sólo descartamos si falta la señal mínima para arrancar el flujo correcto.
+    if intencion.get("confianza") == "baja":
+        tiene_dato_util = (
+            intencion.get("monto_usd") is not None
+            or intencion.get("monto_ars") is not None
+            or intencion.get("precio_unit_usd") is not None
+            or intencion.get("precio_unit_ars") is not None
+            or intencion.get("mm") is not None
+            or intencion.get("cantidad") is not None
+            or intencion.get("toneladas") is not None
+            or intencion.get("tarea_id")
+            or intencion.get("titulo_tarea")
+        )
+        if not tiene_dato_util:
+            return False
 
     ids_campos = {c["id"] for c in ident.get("campos", [])}
 
@@ -3472,11 +3516,28 @@ async def _kapso_aplicar_intencion(ident: dict, numero: str, intencion: dict) ->
             # pedimos los datos que faltan por el flujo guiado.
             return False
 
-        datos = {"gasto": {
+        gasto = {
             "rubro": (intencion.get("rubro") or "Otros").capitalize(),
             "descripcion": descripcion,
             "total_de_usd": usd,
-        }}
+        }
+        # Paridad con la app: cantidad, unidad y precio unitario quedan como
+        # columnas propias del gasto, así los gráficos de insumos los ven.
+        if cantidad is not None:
+            gasto["cantidad"] = float(cantidad)
+        if unidad:
+            gasto["unidad"] = unidad
+        if p_unit_usd is not None:
+            gasto["precio_unitario"] = float(p_unit_usd)
+        elif p_unit_ars is not None:
+            # Guardamos el unitario en pesos pasado a USD para mantener el
+            # mismo criterio que el total (todo en USD en la base).
+            try:
+                tc_u = await _dolar_venta()
+                gasto["precio_unitario"] = round(float(p_unit_ars) / tc_u, 4)
+            except Exception:
+                pass
+        datos = {"gasto": gasto}
         cid = intencion.get("campo_id")
         if cid in ids_campos:
             campo = next(c for c in ident["campos"] if c["id"] == cid)
@@ -3487,6 +3548,9 @@ async def _kapso_aplicar_intencion(ident: dict, numero: str, intencion: dict) ->
             if await _kapso_pedir_campo(ident, numero, "k_gasto_campo", datos, "¿A qué campo lo cargo?"):
                 return True
 
+        print(f"[WA GASTO IA] rubro={gasto['rubro']} desc={gasto['descripcion']!r} "
+              f"total_usd={usd} cant={cantidad} unit={unidad} p_unit_usd={p_unit_usd} "
+              f"p_unit_ars={p_unit_ars} campo={datos.get('campo_nombre')!r}")
         # Lo interpretó la IA: mostramos lo que entendimos antes de guardar.
         await _kapso_confirmar_gasto(numero, datos)
         return True
