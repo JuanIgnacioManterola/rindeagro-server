@@ -219,10 +219,13 @@ def _texto_es_nueva_intencion(texto: str) -> bool:
     n = _norm(texto)
     if len(n) < 60:
         return False
-    verbos = ("cargar", "aplicar", "aplicó", "aplicamos", "aplique", "gasté",
-              "gastamos", "compré", "compramos", "llovió", "llovieron",
-              "sembramos", "sembré", "vendimos", "vendí", "pagamos", "pagué",
-              "registrar")
+    verbos = ("cargar", "carrer",  # "carrer" es "cargar" mal transcripto por Kapso
+              "aplicar", "aplicó", "aplicamos", "aplique",
+              "fumigó", "fumigamos", "fumigué", "fumigar",
+              "utilizó", "utilizamos", "utilicé", "utilizar", "usó", "usamos", "usé",
+              "gasté", "gastamos", "compré", "compramos",
+              "llovió", "llovieron", "sembramos", "sembré",
+              "vendimos", "vendí", "pagamos", "pagué", "registrar")
     palabras = ("hectárea", "hectarea", "por litro", "dólares", "pesos",
                 "por tonelada", "por bolsa", "mm de lluvia", "precio")
     return any(v in n for v in verbos) or sum(1 for p in palabras if p in n) >= 2
@@ -3352,11 +3355,19 @@ Y por_hectarea=true. El servidor multiplica por las hectáreas del campo para ob
 total aplicada y el total en plata. "en total" o "en todo el campo" significan lo contrario: la \
 cantidad es absoluta, por_hectarea=false (o null).
 
-Varios productos en un solo mensaje: si el audio enumera dos o más insumos en la misma oración \
-(típico de una pulverización: "glifosato + atrazina + aceite"), devolvé TODOS en el array items. \
-Cada item lleva su propio rubro, descripcion, cantidad, unidad, precio y por_hectarea. En ese \
-caso, al NIVEL DE ARRIBA dejá rubro, descripcion, cantidad, unidad, precio_unit_usd, monto_usd \
-TODOS en null — sólo campo_id y fecha arriba se aplican a todos los items.
+REGLA CRÍTICA — Varios productos en un solo mensaje: si el mensaje enumera DOS O MÁS insumos \
+(típico de una pulverización que lista glifosato, atrazina, aceite, 2,4-D, dicamba, graminicida, \
+coadyuvante, fungicida, etc.) tenés que devolver TODOS en el array items, sin excepción. Es \
+error grave devolver sólo el primero. Cada item lleva su propio rubro, descripcion, cantidad, \
+unidad, precio y por_hectarea. En ese caso, al NIVEL DE ARRIBA dejá rubro, descripcion, \
+cantidad, unidad, precio_unit_usd, monto_usd TODOS en null — sólo campo_id y fecha arriba se \
+aplican a todos los items.
+
+Precios ambiguos: en una pulverización el precio SIEMPRE es por litro (o por kg, o por bolsa — \
+la unidad de ese producto), nunca un monto total. Si el audio dice "glifosato, 2 dólares" sin \
+decir explícitamente "por litro", igual tenés que interpretarlo como precio_unit_usd=2, NO como \
+monto_usd=2. Un "2 dólares" sueltos junto a un insumo es siempre el precio unitario de ese \
+insumo, porque nadie paga un gasto TOTAL de 2 dólares por una pulverización.
 
 Ejemplo clave 1 (un solo producto): "cargar un gasto de 30 litros de glifosato en Arlicher a $5 \
 por litro" → rubro=herbicidas, descripcion="Glifosato", cantidad=30, unidad="litros", \
@@ -3491,7 +3502,9 @@ async def _interpretar_con_claude(texto: str, ident: dict, tareas: list,
                             f"Mensaje recibido:\n{texto}"),
             }],
             output_config={
-                "effort": "low",
+                # Subo a medium: con un audio multi-producto Claude en low se
+                # quedaba con el primer insumo y descartaba el resto.
+                "effort": "medium",
                 "format": {"type": "json_schema", "schema": ESQUEMA_INTENCION},
             },
         )
@@ -3504,7 +3517,11 @@ async def _interpretar_con_claude(texto: str, ident: dict, tareas: list,
         except json.JSONDecodeError:
             print(f"[CLAUDE] JSON inválido: {crudo[:300]!r}")
             return None
-        print(f"[CLAUDE] texto_in={texto[:200]!r} intencion={json.dumps(parsed, ensure_ascii=False)[:500]}")
+        # Imprimo el JSON completo (sin truncar) para poder diagnosticar un
+        # audio que sale mal interpretado. El truncado a 500 se comía justo
+        # la parte de items[] en los casos multi-producto.
+        print(f"[CLAUDE] IN >> {texto[:400]!r}")
+        print(f"[CLAUDE] OUT >> {json.dumps(parsed, ensure_ascii=False)}")
         return parsed
     except Exception as e:
         print(f"[CLAUDE] error interpretando: {e}")
@@ -3735,12 +3752,16 @@ async def _kapso_aplicar_intencion(ident: dict, numero: str, intencion: dict,
                          or intencion.get("monto_ars") is not None
                          or intencion.get("precio_unit_usd") is not None
                          or intencion.get("precio_unit_ars") is not None)
+    print(f"[WA GASTO DBG] accion={accion} items_len={len(items)} "
+          f"tiene_item_arriba={tiene_item_arriba} campo_id_claude={intencion.get('campo_id')!r}")
     if accion == "gasto" and (items or tiene_item_arriba):
         if not _wa_puede(ident, "gastos", "editar"):
             return False
 
         campo = _wa_resolver_campo_fuzzy(ident, intencion.get("_texto_crudo") or "",
                                         intencion.get("campo_id"))
+        print(f"[WA GASTO DBG] fuzzy_campo={(campo or {}).get('nombre')!r} "
+              f"hectareas={(campo or {}).get('hectareas')}")
         tc_dolar = await _dolar_venta()
 
         # Lista final de items a procesar. Si no hay items[], tratamos el nivel
