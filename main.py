@@ -685,14 +685,35 @@ async def _kapso_tarea_evidencia(ident: dict, numero: str, m, datos: dict) -> No
 
 # ── Lluvia ────────────────────────────────────
 
-async def _kapso_guardar_lluvia(ident: dict, numero: str, campo: dict, mm: float) -> None:
-    await _sb_post("lluvias", {
+TIPOS_LLUVIA = [("pareja", "Pareja"), ("tormenta", "Tormenta"),
+                ("garua", "Garúa"), ("granizo", "Granizo")]
+
+ETAPAS_LLUVIA = [("barbecho", "Barbecho"), ("siembra", "Siembra"),
+                 ("vegetativo", "Vegetativo"),
+                 ("floracion", "Floración (crítica)"),
+                 ("llenado", "Llenado de grano"),
+                 ("maduracion", "Maduración")]
+
+
+async def _kapso_guardar_lluvia(ident: dict, numero: str, campo: dict, mm: float,
+                                fecha: str = None, tipo: str = None,
+                                etapa: str = None, observacion: str = None) -> None:
+    """Guarda una lluvia con paridad al modal de la app."""
+    payload = {
         "campo_id": campo["id"],
         "usuario_id": ident["owner_id"],
         "mm": float(mm),
-        "fecha": datetime.now(AR_TZ).date().isoformat(),
+        "fecha": fecha or datetime.now(AR_TZ).date().isoformat(),
         "fuente": "whatsapp",
-    })
+    }
+    if tipo:
+        payload["tipo"] = tipo
+    if etapa:
+        payload["etapa"] = etapa
+    if observacion:
+        payload["observacion"] = observacion[:200]
+
+    await _sb_post("lluvias", payload)
     await _wa_clear_conv(numero)
 
     # Acumulado del mes, para que el dato sirva en el momento
@@ -706,9 +727,20 @@ async def _kapso_guardar_lluvia(ident: dict, numero: str, campo: dict, mm: float
              "may": "mayo", "june": "junio", "july": "julio", "august": "agosto",
              "september": "septiembre", "october": "octubre", "november": "noviembre",
              "december": "diciembre"}
+    cuando = "hoy" if payload["fecha"] == datetime.now(AR_TZ).date().isoformat() else _wa_fecha_corta(payload["fecha"])
+    extras = []
+    if tipo:
+        lbl = next((v for k, v in TIPOS_LLUVIA if k == tipo), tipo)
+        extras.append(f"🌧️ {lbl}")
+    if etapa:
+        lbl = next((v for k, v in ETAPAS_LLUVIA if k == etapa), etapa)
+        extras.append(f"🌱 {lbl}")
+    extra_txt = f"\n{' · '.join(extras)}" if extras else ""
+    obs_txt = f"\n📝 _{observacion}_" if observacion else ""
     await kapso.enviar_texto(
         numero,
-        f"✅ *{_num(mm)} mm* en {campo['nombre']}, hoy.\n\n_Van {_num(total)} mm en {meses.get(mes, mes)}._",
+        f"✅ *{_num(mm)} mm* en {campo['nombre']}, {cuando}.{extra_txt}{obs_txt}\n\n"
+        f"_Van {_num(total)} mm en {meses.get(mes, mes)}._",
     )
 
 
@@ -751,8 +783,24 @@ async def _kapso_pedir_campo(ident: dict, numero: str, estado: str, datos: dict,
 
 # ── Gastos ────────────────────────────────────
 
-RUBROS_WA = ["Herbicidas", "Fungicidas", "Insecticidas", "Fertilizantes",
-             "Semillas", "Laboreo", "Flete", "Otros"]
+# Lista de rubros oficial de la app (paridad con index.html). Los primeros 4
+# admiten descuento desde stock_insumos; los demás son monto plano.
+RUBROS_WA_DEFS = [
+    ("herbicidas", "🧪 Herbicidas"),
+    ("fungicidas", "🍄 Fungicidas"),
+    ("insecticidas", "🐛 Insecticidas"),
+    ("fertilizantes", "⚗️ Fertilizantes"),
+    ("semillas", "🌱 Semillas"),
+    ("laboreo", "🚜 Laboreo"),
+    ("flete", "🚛 Flete"),
+    ("empleados", "👷 Empleados"),
+    ("arrendamiento", "🏠 Arrendamiento"),
+    ("riego", "💧 Riego"),
+    ("otros", "📦 Otros"),
+]
+# Para retrocompatibilidad con código viejo que usaba la lista de strings:
+RUBROS_WA = [v.split(" ", 1)[1] if " " in v else v for _k, v in RUBROS_WA_DEFS]
+RUBROS_WA_INSUMO = {"herbicidas", "fungicidas", "insecticidas", "fertilizantes"}
 
 
 async def _ocr_factura(contenido: bytes, mime: str) -> list | None:
@@ -969,8 +1017,78 @@ async def _kapso_gasto_guiado(ident: dict, numero: str) -> None:
 
 
 async def _kapso_pedir_rubro(numero: str) -> None:
-    filas = [(f"rubro:{r.lower()}", r) for r in RUBROS_WA]
-    await kapso.enviar_lista(numero, "¿Qué rubro?", "Elegir rubro", filas, "Rubros")
+    filas = [(f"rubro:{k}", v) for k, v in RUBROS_WA_DEFS]
+    # WhatsApp list permite hasta 10 filas; tenemos 11 rubros así que recortamos
+    # "otros" y dejamos 10 (el user puede escribir "otros" por texto igual).
+    await kapso.enviar_lista(numero, "¿Qué rubro?", "Elegir rubro", filas[:10], "Rubros")
+
+
+async def _wa_insumos_del_user(ident: dict, tipo: str, limite: int = 9) -> list:
+    """Lee los insumos del user de un tipo específico, con stock > 0."""
+    return await _sb_get("stock_insumos", {
+        "owner_id": f"eq.{ident['owner_id']}",
+        "tipo": f"eq.{tipo}",
+        "stock_actual": "gt.0",
+        "select": "id,nombre,unidad,stock_actual,costo_unitario",
+        "order": "nombre.asc",
+        "limit": str(limite),
+    }) or []
+
+
+async def _kapso_guardar_gasto_con_stock(ident: dict, numero: str, datos: dict) -> None:
+    """
+    Guarda un gasto que sale del stock: inserta en gastos (con insumo_id) y
+    descuenta cantidad × ha del stock_actual del insumo.
+    """
+    g = datos["gasto"]
+    campo_id = datos.get("campo_id")
+    ins_id = g.get("insumo_id")
+    cantidad_total = float(g.get("cantidad_total") or 0)
+    stock_disp = float(g.get("_stock_disp") or 0)
+    costo_unit = float(g.get("precio_unitario") or 0)
+    rubro = (g.get("rubro") or "otros").lower()
+
+    usd_total = round(cantidad_total * costo_unit, 2) if cantidad_total and costo_unit else 0
+    ha_campo = 0.0
+    for c in ident.get("campos", []):
+        if c["id"] == campo_id:
+            ha_campo = float(c.get("hectareas") or 0)
+            break
+
+    payload = {
+        "campo_id": campo_id,
+        "usuario_id": ident["owner_id"],
+        "rubro": rubro,
+        "fecha": g.get("fecha") or datetime.now(AR_TZ).date().isoformat(),
+        "total_de_usd": usd_total,
+        "descripcion": g.get("descripcion", "")[:300],
+        "insumo_id": ins_id,
+        "cantidad": cantidad_total,  # cantidad TOTAL (no por ha) para que el stock se descuente bien
+        "unidad": g.get("unidad"),
+        "precio_unitario": costo_unit,
+    }
+    if ha_campo > 0 and usd_total:
+        payload["usd_ha"] = round(usd_total / ha_campo, 2)
+    if g.get("momento_pulverizacion"):
+        payload["momento_pulverizacion"] = g["momento_pulverizacion"]
+
+    await _sb_post("gastos", payload)
+
+    # Descontar del stock del insumo.
+    nuevo_stock = max(0, round(stock_disp - cantidad_total, 4))
+    await _sb_patch(f"stock_insumos?id=eq.{ins_id}", {"stock_actual": nuevo_stock})
+
+    await _wa_clear_conv(numero)
+
+    lineas = [
+        f"✅ Gasto cargado en *{datos.get('campo_nombre')}*",
+        f"{rubro.capitalize()} · *{_num(cantidad_total)} {payload['unidad']}* de {payload['descripcion']}",
+        f"USD *{_num(usd_total)}* total",
+    ]
+    if payload.get("usd_ha"):
+        lineas.append(f"USD {_num(payload['usd_ha'])}/ha")
+    lineas.append(f"\n📦 Stock descontado — quedan *{_num(nuevo_stock)} {payload['unidad']}*")
+    await kapso.enviar_texto(numero, "\n".join(lineas))
 
 
 # ── Invitar a alguien al equipo ───────────────
@@ -1048,15 +1166,22 @@ async def _kapso_guardar_insumo(ident: dict, numero: str, datos: dict) -> None:
         "stock_actual": cantidad,
         "ubicacion": ins.get("ubicacion") or None,
     }
+    if ins.get("costo_unitario"):
+        payload["costo_unitario"] = float(ins["costo_unitario"])
+    if ins.get("notas"):
+        payload["notas"] = ins["notas"][:500]
     await _sb_post("stock_insumos", payload)
     await _wa_clear_conv(numero)
-    ubic_txt = f"\n📍 {ins.get('ubicacion')}" if ins.get("ubicacion") else ""
     tipo_label = next((v for k, v in TIPOS_INSUMO if k == tipo), tipo.capitalize())
-    await kapso.enviar_texto(
-        numero,
-        f"✅ Agregaste *{_num(cantidad)} {unidad}* de *{ins.get('nombre')}* al stock.\n"
-        f"📦 Rubro: {tipo_label}{ubic_txt}"
-    )
+    partes = [f"✅ Agregaste *{_num(cantidad)} {unidad}* de *{ins.get('nombre')}* al stock.",
+              f"📦 Rubro: {tipo_label}"]
+    if ins.get("ubicacion"):
+        partes.append(f"📍 {ins['ubicacion']}")
+    if ins.get("costo_unitario"):
+        partes.append(f"💰 USD {_num(ins['costo_unitario'])} por {unidad[:-1] if unidad.endswith('s') else unidad}")
+    if ins.get("notas"):
+        partes.append(f"📝 _{ins['notas']}_")
+    await kapso.enviar_texto(numero, "\n".join(partes))
 
 
 # ── Tareas nuevas (cargar) ────────────────────
@@ -1070,6 +1195,9 @@ async def _kapso_tarea_nueva_guiado(ident: dict, numero: str) -> None:
     await kapso.enviar_texto(numero, "¿Qué hay que hacer? (ej: _fumigar La Esperanza con glifosato_)")
 
 
+PRIORIDADES_TAREA = [("alta", "🔴 Alta"), ("media", "🟡 Media"), ("baja", "🟢 Baja")]
+
+
 async def _kapso_guardar_tarea_nueva(ident: dict, numero: str, datos: dict) -> None:
     t = datos.get("tarea_nueva", {})
     payload = {
@@ -1079,9 +1207,18 @@ async def _kapso_guardar_tarea_nueva(ident: dict, numero: str, datos: dict) -> N
         "fecha_vencimiento": t.get("fecha") or None,
         "campo_id": t.get("campo_id") or None,
     }
+    if t.get("descripcion"):
+        payload["descripcion"] = t["descripcion"][:500]
+    if t.get("prioridad"):
+        payload["prioridad"] = t["prioridad"]
     await _sb_post("tareas", payload)
     await _wa_clear_conv(numero)
     partes = [f"✅ Tarea creada: *{t.get('titulo')}*"]
+    if t.get("descripcion"):
+        partes.append(f"📝 _{t['descripcion']}_")
+    if t.get("prioridad"):
+        lbl = next((v for k, v in PRIORIDADES_TAREA if k == t["prioridad"]), t["prioridad"])
+        partes.append(f"⚡ Prioridad: {lbl}")
     if t.get("fecha"):
         partes.append(f"📅 Vence {_wa_fecha_corta(t['fecha'])}")
     if t.get("campo_nombre"):
@@ -1095,7 +1232,66 @@ CULTIVOS_WA = [("soja", "Soja"), ("maiz", "Maíz"), ("trigo", "Trigo"),
                ("girasol", "Girasol"), ("sorgo", "Sorgo"), ("otro", "Otro")]
 
 
+async def _wa_cultivos_del_campo(campo_id: str) -> list:
+    """
+    Devuelve los cultivos sembrados en el campo. Se busca en:
+      1. campos.cultivo (texto, monocultivo)
+      2. campos.hectareas_cultivo (JSON dict cultivo → ha)
+      3. campos.ingresos_cultivos (JSON dict cultivo → {...})
+    Normaliza a lowercase sin acentos. Lista vacía si no hay nada cargado.
+    """
+    import json
+    filas = await _sb_get("campos", {
+        "id": f"eq.{campo_id}",
+        "select": "cultivo,hectareas_cultivo,ingresos_cultivos",
+        "limit": "1",
+    })
+    if not filas:
+        return []
+    f = filas[0]
+    cultivos = set()
+    if f.get("cultivo"):
+        cultivos.add(_norm(str(f["cultivo"])).strip())
+    for col in ("hectareas_cultivo", "ingresos_cultivos"):
+        try:
+            raw = f.get(col)
+            d = json.loads(raw) if raw else {}
+            if isinstance(d, dict):
+                for k in d.keys():
+                    cultivos.add(_norm(str(k)).strip())
+        except Exception:
+            pass
+    return sorted(c for c in cultivos if c)
+
+
+async def _kapso_pedir_cultivo_del_campo(numero: str, campo_id: str) -> int:
+    """
+    Pide elegir cultivo. Muestra solo los sembrados en el campo. Si no hay
+    ninguno sembrado, fallback a la lista genérica. Si hay uno solo devuelve
+    1 sin preguntar (el caller debe leer datos).
+    Devuelve: 2 = preguntó por lista, 1 = autoseleccionado, 0 = error.
+    """
+    sembrados = await _wa_cultivos_del_campo(campo_id)
+    if sembrados and len(sembrados) == 1:
+        return 1  # el caller sabe autoseleccionar el único
+    if sembrados:
+        filas = []
+        for c in sembrados[:9]:
+            lbl = next((v for k, v in CULTIVOS_WA if k == c), c.capitalize())
+            filas.append((f"cultivo:{c}", lbl))
+        filas.append(("cultivo:otro", "Otro"))
+        await kapso.enviar_lista(numero, "¿Qué cultivo vendiste?",
+                                 "Elegir cultivo", filas, "Sembrados en el campo")
+    else:
+        # Campo sin cultivos cargados — mostrar lista genérica
+        filas = [(f"cultivo:{k}", v) for k, v in CULTIVOS_WA]
+        await kapso.enviar_lista(numero, "¿Qué cultivo vendiste? (el campo no tiene cultivos cargados)",
+                                 "Elegir cultivo", filas, "Cultivos")
+    return 2
+
+
 async def _kapso_pedir_cultivo(numero: str) -> None:
+    """Versión antigua — mantiene compatibilidad. Prefiere pedir_cultivo_del_campo."""
     filas = [(f"cultivo:{k}", v) for k, v in CULTIVOS_WA]
     await kapso.enviar_lista(numero, "¿Qué cultivo vendiste?", "Elegir cultivo", filas, "Cultivos")
 
@@ -1110,8 +1306,18 @@ async def _kapso_ingreso_guiado(ident: dict, numero: str) -> None:
     # 1 solo campo: seteado por _kapso_pedir_campo → avanzar directo a cultivo
     datos["ingreso"]["campo_id"] = datos["campo_id"]
     datos["ingreso"]["campo_nombre"] = datos["campo_nombre"]
-    await _wa_set_conv(numero, "k_ing_cultivo", datos)
-    await _kapso_pedir_cultivo(numero)
+    # Mostrar solo los cultivos sembrados en el campo
+    resultado = await _kapso_pedir_cultivo_del_campo(numero, datos["campo_id"])
+    if resultado == 1:
+        # Autoseleccionar el único cultivo sembrado
+        sembrados = await _wa_cultivos_del_campo(datos["campo_id"])
+        datos["ingreso"]["cultivo"] = sembrados[0]
+        await _wa_set_conv(numero, "k_ing_tn", datos)
+        lbl = next((v for k, v in CULTIVOS_WA if k == sembrados[0]), sembrados[0].capitalize())
+        await kapso.enviar_texto(
+            numero, f"Tomé *{lbl}* del campo. ¿Cuántas toneladas vendiste?")
+    else:
+        await _wa_set_conv(numero, "k_ing_cultivo", datos)
 
 
 async def _kapso_guardar_ingreso(ident: dict, numero: str, datos: dict) -> None:
@@ -1125,6 +1331,7 @@ async def _kapso_guardar_ingreso(ident: dict, numero: str, datos: dict) -> None:
     cultivo = ing.get("cultivo") or "otro"
     tn = float(ing.get("tn") or 0)
     precio = float(ing.get("precio") or 0)
+    comprador = (ing.get("comprador") or "").strip()[:150]
 
     filas = await _sb_get("campos", {
         "id": f"eq.{campo_id}", "select": "ingresos_cultivos", "limit": "1",
@@ -1142,30 +1349,38 @@ async def _kapso_guardar_ingreso(ident: dict, numero: str, datos: dict) -> None:
     except Exception:
         datos_cultivos = {}
 
-    datos_cultivos.setdefault(cultivo, {}).setdefault("ventas", []).append({
+    venta = {
         "tn": tn,
         "precio": precio,
         "tipo": "spot",
         "fecha": datetime.now(AR_TZ).date().isoformat(),
         "fuente": "whatsapp",
-    })
+    }
+    if comprador:
+        venta["comprador"] = comprador
+    datos_cultivos.setdefault(cultivo, {}).setdefault("ventas", []).append(venta)
 
     await _sb_patch(f"campos?id=eq.{campo_id}",
                     {"ingresos_cultivos": json.dumps(datos_cultivos)})
     await _wa_clear_conv(numero)
     total = tn * precio
     cultivo_label = next((v for k, v in CULTIVOS_WA if k == cultivo), cultivo.capitalize())
+    comp_txt = f"\n🤝 Comprador: *{comprador}*" if comprador else ""
     await kapso.enviar_texto(
         numero,
         f"✅ Venta guardada: *{_num(tn)} tn* de *{cultivo_label}* a *USD {_num(precio)}/tn* en {ing.get('campo_nombre')}\n"
-        f"💰 Total: *USD {_miles(total)}*"
+        f"💰 Total: *USD {_miles(total)}*{comp_txt}"
     )
 
 
 # ── Pagos (cheques / cuotas) ──────────────────
 
-TIPOS_PAGO = [("cheque", "Cheque"), ("cuota_credito", "Cuota de crédito"),
-              ("otro", "Otro")]
+TIPOS_PAGO = [("cheque", "🧾 Cheque"), ("cuota_credito", "💳 Cuota de crédito"),
+              ("otro", "📄 Otro")]
+
+FRECUENCIAS_CREDITO = [("mensual", "Mensual", 1), ("bimestral", "Bimestral", 2),
+                       ("trimestral", "Trimestral", 3), ("semestral", "Semestral", 6),
+                       ("anual", "Anual", 12)]
 
 
 async def _kapso_pago_guiado(ident: dict, numero: str) -> None:
@@ -1178,31 +1393,137 @@ async def _kapso_pago_guiado(ident: dict, numero: str) -> None:
     await kapso.enviar_lista(numero, "¿Qué tipo de pago?", "Elegir tipo", filas, "Tipos")
 
 
-async def _kapso_guardar_pago(ident: dict, numero: str, datos: dict) -> None:
+def _sumar_meses(fecha: date, meses: int) -> date:
+    """Suma N meses a una fecha, clipping al último día del mes si hace falta."""
+    from calendar import monthrange
+    y = fecha.year + (fecha.month + meses - 1) // 12
+    m = (fecha.month + meses - 1) % 12 + 1
+    d = min(fecha.day, monthrange(y, m)[1])
+    return date(y, m, d)
+
+
+async def _kapso_guardar_pago_cheque(ident: dict, numero: str, datos: dict) -> None:
+    """Guarda un cheque con todos los campos (beneficiario, importe, moneda,
+    fecha emisión, fecha cobro, banco, número)."""
     p = datos.get("pago", {})
     importe = float(p.get("importe") or 0)
     moneda = p.get("moneda") or "ARS"
-    tipo = p.get("tipo") or "cheque"
+    fecha_cobro = p.get("fecha") or datetime.now(AR_TZ).date().isoformat()
+
+    payload = {
+        "owner_id": ident["owner_id"],
+        "tipo": "cheque",
+        "beneficiario": (p.get("beneficiario") or "")[:150],
+        "importe": importe,
+        "moneda": moneda,
+        "fecha_cobro": fecha_cobro,
+        "estado": "pendiente",
+        "fuente": "whatsapp",
+    }
+    if p.get("fecha_emision"):
+        payload["fecha_emision"] = p["fecha_emision"]
+    if p.get("banco"):
+        payload["banco"] = p["banco"][:100]
+    if p.get("numero_cheque"):
+        payload["numero_cheque"] = p["numero_cheque"][:30]
+
+    await _sb_post("compromisos_pago", payload)
+    await _wa_clear_conv(numero)
+
+    lineas = [f"✅ Cheque de *{moneda} {_miles(importe)}* a *{payload['beneficiario']}*",
+              f"📅 Cobro: {_wa_fecha_corta(fecha_cobro)}"]
+    if p.get("banco"):
+        lineas.append(f"🏦 {p['banco']}")
+    if p.get("numero_cheque"):
+        lineas.append(f"#️⃣ Nº {p['numero_cheque']}")
+    await kapso.enviar_texto(numero, "\n".join(lineas))
+
+
+async def _kapso_guardar_pago_credito(ident: dict, numero: str, datos: dict) -> None:
+    """Genera N cuotas de un crédito, todas con el mismo credito_id, fechas
+    calculadas según frecuencia."""
+    import secrets
+    p = datos.get("pago", {})
+    importe_cuota = float(p.get("importe_cuota") or 0)
+    moneda = p.get("moneda") or "ARS"
+    cantidad = int(p.get("cantidad_cuotas") or 1)
+    frecuencia = p.get("frecuencia") or "mensual"
+    beneficiario = (p.get("beneficiario") or "")[:150]
+    descripcion = (p.get("descripcion") or "")[:300]
+    try:
+        fecha_primera = datetime.strptime(p["fecha_primera"], "%Y-%m-%d").date()
+    except Exception:
+        fecha_primera = datetime.now(AR_TZ).date()
+
+    inc_meses = next((m for k, _, m in FRECUENCIAS_CREDITO if k == frecuencia), 1)
+    credito_id = secrets.token_hex(8)
+
+    for i in range(cantidad):
+        fecha_cuota = _sumar_meses(fecha_primera, inc_meses * i)
+        payload = {
+            "owner_id": ident["owner_id"],
+            "tipo": "cuota_credito",
+            "beneficiario": beneficiario,
+            "descripcion": descripcion,
+            "importe": importe_cuota,
+            "moneda": moneda,
+            "fecha_cobro": fecha_cuota.isoformat(),
+            "credito_id": credito_id,
+            "numero_cuota": i + 1,
+            "total_cuotas": cantidad,
+            "estado": "pendiente",
+            "fuente": "whatsapp",
+        }
+        await _sb_post("compromisos_pago", payload)
+
+    await _wa_clear_conv(numero)
+    total = importe_cuota * cantidad
+    freq_label = next((lbl for k, lbl, _ in FRECUENCIAS_CREDITO if k == frecuencia), frecuencia)
+    await kapso.enviar_texto(
+        numero,
+        f"✅ Crédito cargado: *{cantidad} cuotas* de *{moneda} {_miles(importe_cuota)}* ({freq_label})\n"
+        f"🏦 {beneficiario}\n"
+        f"📅 1ra: {_wa_fecha_corta(p['fecha_primera'])}\n"
+        f"💰 Total: *{moneda} {_miles(total)}*"
+    )
+
+
+async def _kapso_guardar_pago_otro(ident: dict, numero: str, datos: dict) -> None:
+    """Pago 'otro' — campo generico (importe + beneficiario + fecha)."""
+    p = datos.get("pago", {})
+    importe = float(p.get("importe") or 0)
+    moneda = p.get("moneda") or "ARS"
     fecha = p.get("fecha") or datetime.now(AR_TZ).date().isoformat()
     payload = {
         "owner_id": ident["owner_id"],
-        "tipo": tipo,
-        "beneficiario": p.get("beneficiario") or "",
+        "tipo": "otro",
+        "beneficiario": (p.get("beneficiario") or "")[:150],
         "importe": importe,
         "moneda": moneda,
         "fecha_cobro": fecha,
         "estado": "pendiente",
         "fuente": "whatsapp",
     }
+    if p.get("descripcion"):
+        payload["descripcion"] = p["descripcion"][:300]
     await _sb_post("compromisos_pago", payload)
     await _wa_clear_conv(numero)
-    tipo_label = next((v for k, v in TIPOS_PAGO if k == tipo), tipo.capitalize())
-    bene = f" a *{p.get('beneficiario')}*" if p.get("beneficiario") else ""
     await kapso.enviar_texto(
         numero,
-        f"✅ {tipo_label} de *{moneda} {_miles(importe)}*{bene}\n"
+        f"✅ Pago de *{moneda} {_miles(importe)}* a *{payload['beneficiario']}*\n"
         f"📅 Vence {_wa_fecha_corta(fecha)}"
     )
+
+
+# Compat: función antigua redirige al guardador correcto
+async def _kapso_guardar_pago(ident: dict, numero: str, datos: dict) -> None:
+    tipo = (datos.get("pago", {}).get("tipo") or "cheque")
+    if tipo == "cheque":
+        await _kapso_guardar_pago_cheque(ident, numero, datos)
+    elif tipo == "cuota_credito":
+        await _kapso_guardar_pago_credito(ident, numero, datos)
+    else:
+        await _kapso_guardar_pago_otro(ident, numero, datos)
 
 
 # ── Texto libre ───────────────────────────────
@@ -1284,6 +1605,37 @@ async def _wa_log_mensaje(ident: dict | None, numero: str, m) -> None:
         print(f"[LOG WA] {e}")
 
 
+def _intento_cargar(texto: str) -> str:
+    """
+    Reconoce frases tipo "quiero cargar un gasto", "cargá una lluvia",
+    "nuevo insumo", etc. Devuelve el tipo detectado o "" si no hay intención.
+    Para los casos con dato concreto (monto, mm), devuelve "" para que el
+    parseador específico siga haciendo su trabajo.
+    """
+    n = _norm(texto)
+    if not re.search(
+            r"\b(quiero|voy a|voy|necesito|puedo|debo|querr[íi]a|quisiera"
+            r"|cargar|cargá|carga|registrar|registra|crear|crea|anotar|anota"
+            r"|sumar|suma|hacer|haz|dar de alta|nuevo|nueva|nuevos|nuevas"
+            r"|agregar|agrega|poner|pone|meter|mete|añadir)\b", n):
+        return ""
+    if re.search(r"\b(invitar|sumar a|agregar a)\b", n):
+        return ""  # dejar que el bloque invitar lo tome
+    if re.search(r"\b(gasto|gastos)\b", n):
+        return "gasto"
+    if re.search(r"\b(lluvia|lluvias|precipitaci[oó]n)\b", n):
+        return "lluvia"
+    if re.search(r"\b(insumo|insumos|stock|dep[oó]sito)\b", n):
+        return "insumo"
+    if re.search(r"\b(tarea|tareas|pendiente|pendientes)\b", n):
+        return "tarea"
+    if re.search(r"\b(ingreso|ingresos|venta|ventas|vend[ií])\b", n):
+        return "ingreso"
+    if re.search(r"\b(pago|pagos|cheque|cheques|cr[eé]dito|cuota|cuotas)\b", n):
+        return "pago"
+    return ""
+
+
 async def _kapso_texto_libre(ident: dict, numero: str, texto: str,
                              tarea_activa: dict = None, saltar_parecidos: bool = False) -> None:
     """
@@ -1291,6 +1643,32 @@ async def _kapso_texto_libre(ident: dict, numero: str, texto: str,
     clarísimo), después la IA si está configurada, y si no, el menú.
     """
     n = _norm(texto)
+
+    # Intento explícito de carga ("quiero cargar un gasto", "cargá una tarea",
+    # "nuevo cheque"): si no viene con dato concreto, arranca el flujo guiado.
+    intento = _intento_cargar(texto)
+    tiene_dato = bool(_parsear_plata(texto) or re.search(r"\b\d+\s*mm\b", n)
+                      or re.search(r"\b\d+\s*(tn|toneladas?|kg|litros?|bolsas?)\b", n))
+    if intento and not tiene_dato:
+        if intento == "gasto" and _wa_puede(ident, "gastos", "editar"):
+            await _kapso_gasto_guiado(ident, numero)
+            return
+        if intento == "lluvia" and _wa_puede(ident, "lluvias", "editar"):
+            await _wa_set_conv(numero, "k_lluvia_mm", {"guiado": True})
+            await kapso.enviar_texto(numero, "¿Cuántos mm?")
+            return
+        if intento == "insumo" and _wa_puede(ident, "insumos", "editar"):
+            await _kapso_insumo_guiado(ident, numero)
+            return
+        if intento == "tarea" and _wa_puede(ident, "tareas", "editar"):
+            await _kapso_tarea_nueva_guiado(ident, numero)
+            return
+        if intento == "ingreso" and _wa_puede(ident, "ingresos", "editar"):
+            await _kapso_ingreso_guiado(ident, numero)
+            return
+        if intento == "pago" and _wa_puede(ident, "compromisos_pago", "editar"):
+            await _kapso_pago_guiado(ident, numero)
+            return
 
     if any(p in n for p in ("invitar", "sumar a", "agregar a", "dar de alta")):
         posible = re.sub(r".*(invitar|sumar a|agregar a|dar de alta)\s*", "", n).strip()
@@ -1524,8 +1902,87 @@ async def _kapso_flujo(ident: dict, numero: str, m, conv: dict) -> None:
         datos["mm"] = mm
         if await _kapso_pedir_campo(ident, numero, "k_lluvia_campo", datos, f"¿Dónde llovieron {_num(mm)} mm?"):
             return
+        # 1 solo campo + guiado → ir a fecha. Si no guiado → guardar directo.
+        if datos.get("guiado"):
+            await _wa_set_conv(numero, "k_lluvia_fecha", datos)
+            await kapso.enviar_texto(
+                numero,
+                "¿Cuándo llovió? (ej: _hoy_, _ayer_, _15/12_)")
+            return
         await _kapso_guardar_lluvia(
             ident, numero, {"id": datos["campo_id"], "nombre": datos["campo_nombre"]}, mm)
+        return
+
+    if estado == "k_lluvia_fecha":
+        n = _norm(texto or "")
+        fecha = None
+        if n and n not in ("hoy", "ahora", "-"):
+            fecha = _parsear_fecha_natural(texto)
+            if not fecha:
+                await kapso.enviar_texto(
+                    numero, "No entendí la fecha. Escribí _hoy_, _ayer_, _15/12_, o _hace 3 días_.")
+                return
+        datos["fecha"] = fecha or datetime.now(AR_TZ).date().isoformat()
+        await _wa_set_conv(numero, "k_lluvia_tipo", datos)
+        filas = [(f"ll_tipo:{k}", v) for k, v in TIPOS_LLUVIA]
+        await kapso.enviar_lista(
+            numero, "¿Qué tipo de lluvia fue?", "Elegir tipo", filas, "Tipo")
+        return
+
+    if estado == "k_lluvia_tipo":
+        tipo = None
+        if accion.startswith("ll_tipo:"):
+            tipo = accion.split(":", 1)[1]
+        elif texto:
+            n = _norm(texto)
+            for k, _v in TIPOS_LLUVIA:
+                if k in n:
+                    tipo = k
+                    break
+            if "sin" in n or n in ("no", "-", "skip"):
+                tipo = None
+        if tipo:
+            datos["tipo"] = tipo
+        await _wa_set_conv(numero, "k_lluvia_etapa", datos)
+        filas = [(f"ll_etapa:{k}", v) for k, v in ETAPAS_LLUVIA]
+        filas.append(("ll_etapa:skip", "Sin especificar"))
+        await kapso.enviar_lista(
+            numero, "¿Etapa del cultivo? (opcional)", "Elegir etapa", filas[:9], "Etapa")
+        return
+
+    if estado == "k_lluvia_etapa":
+        etapa = None
+        if accion.startswith("ll_etapa:"):
+            v = accion.split(":", 1)[1]
+            if v != "skip":
+                etapa = v
+        elif texto:
+            n = _norm(texto)
+            for k, _v in ETAPAS_LLUVIA:
+                if k in n:
+                    etapa = k
+                    break
+        if etapa:
+            datos["etapa"] = etapa
+        await _wa_set_conv(numero, "k_lluvia_obs", datos)
+        await kapso.enviar_texto(
+            numero,
+            "¿Alguna observación? (opcional — escribí _sin obs_ para guardar)")
+        return
+
+    if estado == "k_lluvia_obs":
+        n = _norm(texto or "")
+        obs = None
+        if n and n not in ("sin obs", "sin observacion", "sin observación", "no", "-"):
+            obs = texto.strip()[:200]
+        campo = {"id": datos["campo_id"], "nombre": datos["campo_nombre"]}
+        await _kapso_guardar_lluvia(
+            ident, numero, campo, float(datos.get("mm") or 0),
+            fecha=datos.get("fecha"),
+            tipo=datos.get("tipo"),
+            etapa=datos.get("etapa"),
+            observacion=obs,
+        )
         return
 
     if estado in ("k_gasto_campo", "k_lluvia_campo"):
@@ -1542,6 +1999,12 @@ async def _kapso_flujo(ident: dict, numero: str, m, conv: dict) -> None:
         datos["campo_nombre"] = campo["nombre"]
 
         if estado == "k_lluvia_campo":
+            if datos.get("guiado"):
+                await _wa_set_conv(numero, "k_lluvia_fecha", datos)
+                await kapso.enviar_texto(
+                    numero,
+                    "¿Cuándo llovió? (ej: _hoy_, _ayer_, _15/12_, o solo escribí _hoy_ para seguir)")
+                return
             await _kapso_guardar_lluvia(ident, numero, campo, float(datos.get("mm") or 0))
             return
         if datos.get("gasto", {}).get("total_de_usd") and not datos["gasto"].get("rubro"):
@@ -1559,12 +2022,102 @@ async def _kapso_flujo(ident: dict, numero: str, m, conv: dict) -> None:
     if estado == "k_gasto_rubro":
         rubro = accion.split(":", 1)[1].capitalize() if accion.startswith("rubro:") else _buscar_rubro(texto)
         datos.setdefault("gasto", {})["rubro"] = rubro
+        rubro_lower = (rubro or "").lower()
+
+        # Si es rubro de insumo y venimos del flujo guiado (sin monto todavía),
+        # ofrecer descontar del stock.
+        if rubro_lower in RUBROS_WA_INSUMO and not datos["gasto"].get("total_de_usd"):
+            insumos_stock = await _wa_insumos_del_user(ident, rubro_lower, limite=9)
+            if insumos_stock:
+                filas = []
+                for ins in insumos_stock:
+                    lbl = str(ins.get("nombre", ""))[:24]
+                    sub_bits = [f"{_num(ins['stock_actual'])} {ins['unidad']} disp."]
+                    if ins.get("costo_unitario"):
+                        sub_bits.append(f"USD {_num(ins['costo_unitario'])}/u")
+                    filas.append((f"g_ins:{ins['id']}", lbl, " · ".join(sub_bits)[:72]))
+                filas.append(("g_ins:nuevo", "➕ Cargar nuevo (sin stock)", "Compro y uso ahora"))
+                await _wa_set_conv(numero, "k_gasto_stock", datos)
+                await kapso.enviar_lista(
+                    numero, f"¿Lo sacás de tu stock de {rubro_lower}?",
+                    "Elegir del stock", filas, "Stock disponible")
+                return
+
         if datos["gasto"].get("total_de_usd"):
             await _wa_set_conv(numero, "k_gasto_desc", datos)
             await kapso.enviar_texto(numero, "¿Qué producto era? (ej: glifosato, urea, semilla de soja)")
             return
         await _wa_set_conv(numero, "k_gasto_monto", datos)
         await kapso.enviar_texto(numero, "¿Cuánto fue en dólares? Escribí solo el número.")
+        return
+
+    if estado == "k_gasto_stock":
+        if accion.startswith("g_ins:"):
+            ins_id = accion.split(":", 1)[1]
+            if ins_id == "nuevo":
+                # Sin stock → flujo normal (pedir monto + descripción)
+                await _wa_set_conv(numero, "k_gasto_monto", datos)
+                await kapso.enviar_texto(
+                    numero, "Dale. ¿Cuánto fue en dólares? Escribí solo el número.")
+                return
+            # Buscar insumo
+            filas = await _sb_get("stock_insumos", {
+                "id": f"eq.{ins_id}",
+                "select": "id,nombre,unidad,stock_actual,costo_unitario",
+                "limit": "1",
+            })
+            if not filas:
+                await kapso.enviar_texto(numero, "No encontré ese insumo. Volvé a probar.")
+                return
+            ins = filas[0]
+            g = datos.setdefault("gasto", {})
+            g["insumo_id"] = ins["id"]
+            g["descripcion"] = ins["nombre"]
+            g["unidad"] = ins["unidad"]
+            g["_stock_disp"] = float(ins.get("stock_actual") or 0)
+            if ins.get("costo_unitario"):
+                g["precio_unitario"] = float(ins["costo_unitario"])
+            await _wa_set_conv(numero, "k_gasto_cant_total", datos)
+            await kapso.enviar_texto(
+                numero,
+                f"¿Cuánto *{ins['nombre']}* usaste en total?\n"
+                f"(disponibles: *{_num(ins['stock_actual'])} {ins['unidad']}*)")
+            return
+        # Texto libre — tratar como si eligió "nuevo"
+        await _wa_set_conv(numero, "k_gasto_monto", datos)
+        await kapso.enviar_texto(numero, "¿Cuánto fue en dólares? Escribí solo el número.")
+        return
+
+    if estado == "k_gasto_cant_total":
+        cantidad = _extraer_numero(texto)
+        if cantidad is None or cantidad <= 0:
+            await kapso.enviar_texto(numero, "Escribí solo el número, por ejemplo *30*.")
+            return
+        g = datos.setdefault("gasto", {})
+        stock_disp = float(g.get("_stock_disp") or 0)
+        if cantidad > stock_disp + 0.001:
+            await kapso.enviar_texto(
+                numero,
+                f"⛔ No alcanza. Tenés *{_num(stock_disp)} {g.get('unidad', '')}*, pedís *{_num(cantidad)}*.\n"
+                "Cargá más stock primero o escribí _cancelar_.")
+            return
+        g["cantidad_total"] = cantidad
+        if g.get("precio_unitario"):
+            await _kapso_guardar_gasto_con_stock(ident, numero, datos)
+            return
+        await _wa_set_conv(numero, "k_gasto_precio_unit", datos)
+        await kapso.enviar_texto(
+            numero,
+            f"El insumo no tenía precio cargado. ¿Cuánto costó por {g.get('unidad', 'unidad')} en USD?")
+        return
+
+    if estado == "k_gasto_precio_unit":
+        precio = _extraer_numero(texto)
+        if precio is None or precio <= 0:
+            await kapso.enviar_texto(numero, "Escribí solo el precio en USD, por ejemplo *3.5*.")
+            return
+        datos.setdefault("gasto", {})["precio_unitario"] = precio
+        await _kapso_guardar_gasto_con_stock(ident, numero, datos)
         return
 
     if estado == "k_gasto_monto":
@@ -1651,6 +2204,30 @@ async def _kapso_flujo(ident: dict, numero: str, m, conv: dict) -> None:
         n = _norm(texto or "")
         if n and n not in ("sin especificar", "no", "ninguna", "ninguno", "-"):
             datos.setdefault("insumo", {})["ubicacion"] = texto.strip()[:100]
+        await _wa_set_conv(numero, "k_ins_costo", datos)
+        unidad = datos.get("insumo", {}).get("unidad", "unidad")
+        unidad_singular = unidad[:-1] if unidad.endswith("s") else unidad
+        await kapso.enviar_texto(
+            numero,
+            f"¿Cuánto cuesta por {unidad_singular}? (ej: _USD 3.5_ por litro, o escribí _sin costo_)")
+        return
+
+    if estado == "k_ins_costo":
+        n = _norm(texto or "")
+        if n and n not in ("sin costo", "no", "ninguno", "-", "0"):
+            costo = _extraer_numero(texto)
+            if costo is not None and costo > 0:
+                datos.setdefault("insumo", {})["costo_unitario"] = costo
+        await _wa_set_conv(numero, "k_ins_notas", datos)
+        await kapso.enviar_texto(
+            numero,
+            "¿Alguna nota? (marca, vencimiento, lote... o escribí _sin notas_)")
+        return
+
+    if estado == "k_ins_notas":
+        n = _norm(texto or "")
+        if n and n not in ("sin notas", "sin nota", "no", "ninguna", "-"):
+            datos.setdefault("insumo", {})["notas"] = texto.strip()[:500]
         await _kapso_guardar_insumo(ident, numero, datos)
         return
 
@@ -1661,6 +2238,15 @@ async def _kapso_flujo(ident: dict, numero: str, m, conv: dict) -> None:
             await kapso.enviar_texto(numero, "¿Qué hay que hacer? Escribí el título.")
             return
         datos.setdefault("tarea_nueva", {})["titulo"] = titulo
+        await _wa_set_conv(numero, "k_tar_desc", datos)
+        await kapso.enviar_texto(
+            numero, "¿Agregás algún detalle? (descripción opcional, o escribí _sin detalle_)")
+        return
+
+    if estado == "k_tar_desc":
+        n = _norm(texto or "")
+        if n and n not in ("sin detalle", "sin descripcion", "sin descripción", "no", "ninguno", "-"):
+            datos.setdefault("tarea_nueva", {})["descripcion"] = texto.strip()[:500]
         await _wa_set_conv(numero, "k_tar_fecha", datos)
         await kapso.enviar_texto(
             numero, "¿Para cuándo? (ej: _mañana_, _15/12_, _próxima semana_, o _sin fecha_)")
@@ -1709,6 +2295,26 @@ async def _kapso_flujo(ident: dict, numero: str, m, conv: dict) -> None:
                 if campo:
                     datos["tarea_nueva"]["campo_id"] = campo["id"]
                     datos["tarea_nueva"]["campo_nombre"] = campo["nombre"]
+        await _wa_set_conv(numero, "k_tar_prioridad", datos)
+        filas = [(f"tar_prio:{k}", v) for k, v in PRIORIDADES_TAREA]
+        filas.append(("tar_prio:media", "Dejarla en media por default"))
+        await kapso.enviar_lista(
+            numero, "¿Qué prioridad tiene?", "Elegir prioridad", filas[:6], "Prioridad")
+        return
+
+    if estado == "k_tar_prioridad":
+        prio = None
+        if accion.startswith("tar_prio:"):
+            prio = accion.split(":", 1)[1]
+        elif texto:
+            n = _norm(texto)
+            if "alta" in n or "urgente" in n:
+                prio = "alta"
+            elif "baja" in n:
+                prio = "baja"
+            else:
+                prio = "media"
+        datos.setdefault("tarea_nueva", {})["prioridad"] = prio or "media"
         await _kapso_guardar_tarea_nueva(ident, numero, datos)
         return
 
@@ -1765,10 +2371,20 @@ async def _kapso_flujo(ident: dict, numero: str, m, conv: dict) -> None:
             await kapso.enviar_texto(numero, "Escribí solo el precio en USD por tonelada, por ejemplo *320*.")
             return
         datos["ingreso"]["precio"] = precio
+        await _wa_set_conv(numero, "k_ing_comprador", datos)
+        await kapso.enviar_texto(
+            numero,
+            "¿A quién le vendiste? (ej: _Acopio La Hortensia_, o escribí _sin comprador_ si no querés registrarlo)")
+        return
+
+    if estado == "k_ing_comprador":
+        n = _norm(texto or "")
+        if n and n not in ("sin comprador", "no", "ninguno", "-", ""):
+            datos["ingreso"]["comprador"] = texto.strip()[:150]
         await _kapso_guardar_ingreso(ident, numero, datos)
         return
 
-    # ── Pago (cheque/cuota) ────────────────────
+    # ── Pago: bifurca según tipo (cheque / cuota_credito / otro) ───────
     if estado == "k_pag_tipo":
         tipo = None
         if accion.startswith("pag_tipo:"):
@@ -1785,8 +2401,14 @@ async def _kapso_flujo(ident: dict, numero: str, m, conv: dict) -> None:
             await kapso.enviar_texto(numero, "Tocá un tipo de la lista.")
             return
         datos.setdefault("pago", {})["tipo"] = tipo
-        await _wa_set_conv(numero, "k_pag_beneficiario", datos)
-        await kapso.enviar_texto(numero, "¿A quién le pagás? (ej: _Acopio La Hortensia_)")
+        if tipo == "cuota_credito":
+            await _wa_set_conv(numero, "k_pag_cr_desc", datos)
+            await kapso.enviar_texto(
+                numero, "¿Cómo le ponemos al crédito? (ej: _Préstamo Galicia para sembradora_)")
+        else:
+            await _wa_set_conv(numero, "k_pag_beneficiario", datos)
+            quien = "¿A quién le pagás?" if tipo != "cheque" else "¿A nombre de quién sale el cheque?"
+            await kapso.enviar_texto(numero, f"{quien} (ej: _Acopio La Hortensia_)")
         return
 
     if estado == "k_pag_beneficiario":
@@ -1809,7 +2431,10 @@ async def _kapso_flujo(ident: dict, numero: str, m, conv: dict) -> None:
         datos.setdefault("pago", {})["importe"] = importe
         datos["pago"]["moneda"] = "USD" if es_usd else "ARS"
         await _wa_set_conv(numero, "k_pag_fecha", datos)
-        await kapso.enviar_texto(numero, "¿Cuándo vence? (ej: _15/12_, _próxima semana_, _en 30 días_)")
+        tipo_pago = datos["pago"].get("tipo", "")
+        prompt = "¿Cuándo se cobra?" if tipo_pago == "cheque" else "¿Cuándo vence?"
+        await kapso.enviar_texto(
+            numero, f"{prompt} (ej: _15/12_, _próxima semana_, _en 30 días_)")
         return
 
     if estado == "k_pag_fecha":
@@ -1819,7 +2444,104 @@ async def _kapso_flujo(ident: dict, numero: str, m, conv: dict) -> None:
                 numero, "No entendí la fecha. Escribí _15/12_, _próxima semana_, o _en 30 días_.")
             return
         datos.setdefault("pago", {})["fecha"] = fecha
+        if datos["pago"].get("tipo") == "cheque":
+            # Para cheque pedimos banco + número opcionales antes de guardar
+            await _wa_set_conv(numero, "k_pag_banco", datos)
+            await kapso.enviar_texto(
+                numero, "¿De qué banco? (opcional, escribí _sin banco_ para saltear)")
+            return
         await _kapso_guardar_pago(ident, numero, datos)
+        return
+
+    # ── Cheque: campos extra opcionales ─────────
+    if estado == "k_pag_banco":
+        n = _norm(texto or "")
+        if n and n not in ("sin banco", "no", "ninguno", "-"):
+            datos.setdefault("pago", {})["banco"] = texto.strip()[:100]
+        await _wa_set_conv(numero, "k_pag_numero", datos)
+        await kapso.enviar_texto(
+            numero, "¿Número de cheque? (opcional, escribí _sin número_ para saltear)")
+        return
+
+    if estado == "k_pag_numero":
+        n = _norm(texto or "")
+        if n and n not in ("sin numero", "sin número", "no", "ninguno", "-"):
+            datos.setdefault("pago", {})["numero_cheque"] = texto.strip()[:30]
+        await _kapso_guardar_pago(ident, numero, datos)
+        return
+
+    # ── Crédito: flujo propio con cuotas ─────────
+    if estado == "k_pag_cr_desc":
+        desc = (texto or "").strip()[:300]
+        if not desc:
+            await kapso.enviar_texto(numero, "Escribí una descripción del crédito.")
+            return
+        datos.setdefault("pago", {})["descripcion"] = desc
+        await _wa_set_conv(numero, "k_pag_cr_beneficiario", datos)
+        await kapso.enviar_texto(numero, "¿Qué banco o entidad? (ej: _Banco Galicia_)")
+        return
+
+    if estado == "k_pag_cr_beneficiario":
+        bene = (texto or "").strip()[:150]
+        if not bene:
+            await kapso.enviar_texto(numero, "Escribí el banco o entidad.")
+            return
+        datos.setdefault("pago", {})["beneficiario"] = bene
+        await _wa_set_conv(numero, "k_pag_cr_importe_cuota", datos)
+        await kapso.enviar_texto(numero, "¿Importe de cada cuota? (ej: _500 mil pesos_, _USD 400_)")
+        return
+
+    if estado == "k_pag_cr_importe_cuota":
+        importe = _parsear_plata(texto)
+        if importe is None or importe <= 0:
+            await kapso.enviar_texto(numero, "No entendí el importe. Escribí _500 mil pesos_ o _USD 400_.")
+            return
+        n = _norm(texto)
+        es_usd = ("usd" in n or "dolar" in n or "dólar" in n or "u$s" in n or "u$d" in n)
+        datos.setdefault("pago", {})["importe_cuota"] = importe
+        datos["pago"]["moneda"] = "USD" if es_usd else "ARS"
+        await _wa_set_conv(numero, "k_pag_cr_cantidad", datos)
+        await kapso.enviar_texto(numero, "¿Cuántas cuotas en total? (ej: _12_)")
+        return
+
+    if estado == "k_pag_cr_cantidad":
+        cantidad = _extraer_numero(texto)
+        if cantidad is None or cantidad <= 0 or cantidad > 120:
+            await kapso.enviar_texto(numero, "Escribí la cantidad de cuotas (1 a 120).")
+            return
+        datos.setdefault("pago", {})["cantidad_cuotas"] = int(cantidad)
+        await _wa_set_conv(numero, "k_pag_cr_frecuencia", datos)
+        filas = [(f"pag_cr_freq:{k}", lbl) for k, lbl, _ in FRECUENCIAS_CREDITO]
+        await kapso.enviar_lista(
+            numero, "¿Con qué frecuencia?", "Elegir", filas, "Frecuencia")
+        return
+
+    if estado == "k_pag_cr_frecuencia":
+        freq = None
+        if accion.startswith("pag_cr_freq:"):
+            freq = accion.split(":", 1)[1]
+        elif texto:
+            n = _norm(texto)
+            for k, _lbl, _m in FRECUENCIAS_CREDITO:
+                if k in n:
+                    freq = k
+                    break
+        if not freq:
+            await kapso.enviar_texto(numero, "Tocá una frecuencia de la lista.")
+            return
+        datos.setdefault("pago", {})["frecuencia"] = freq
+        await _wa_set_conv(numero, "k_pag_cr_fecha", datos)
+        await kapso.enviar_texto(
+            numero, "¿Cuándo vence la primera cuota? (ej: _15/12_, _próximo mes_)")
+        return
+
+    if estado == "k_pag_cr_fecha":
+        fecha = _parsear_fecha_natural(texto)
+        if not fecha:
+            await kapso.enviar_texto(numero, "No entendí la fecha. Escribí _15/12_ o _próximo mes_.")
+            return
+        datos.setdefault("pago", {})["fecha_primera"] = fecha
+        await _kapso_guardar_pago_credito(ident, numero, datos)
         return
 
     # Estado desconocido → limpiar y volver al menú
@@ -2069,7 +2791,9 @@ ESQUEMA_INTENCION = {
         "accion": {
             "type": "string",
             "enum": ["completar_tarea", "iniciar_tarea", "nota_tarea", "ver_tareas",
-                     "gasto", "lluvia", "invitar", "menu", "nada"],
+                     "gasto", "lluvia", "invitar", "menu", "nada",
+                     # Nuevas intenciones:
+                     "ingreso", "pago", "insumo", "tarea_nueva", "siembra"],
         },
         "tarea_id":        {"type": ["string", "null"]},
         "nota":            {"type": ["string", "null"]},
@@ -2080,10 +2804,33 @@ ESQUEMA_INTENCION = {
         "descripcion":     {"type": ["string", "null"]},
         "mm":              {"type": ["number", "null"]},
         "nombre_invitado": {"type": ["string", "null"]},
+        # Campos nuevos: ingreso (venta de cereal)
+        "cultivo":         {"type": ["string", "null"]},
+        "toneladas":       {"type": ["number", "null"]},
+        "precio_tn_usd":   {"type": ["number", "null"]},
+        "comprador":       {"type": ["string", "null"]},
+        # Pago
+        "tipo_pago":       {"type": ["string", "null"]},
+        "beneficiario":    {"type": ["string", "null"]},
+        "fecha_venc":      {"type": ["string", "null"]},
+        # Insumo
+        "tipo_insumo":     {"type": ["string", "null"]},
+        "cantidad":        {"type": ["number", "null"]},
+        "unidad":          {"type": ["string", "null"]},
+        # Tarea nueva
+        "titulo_tarea":    {"type": ["string", "null"]},
+        "prioridad":       {"type": ["string", "null"]},
+        # Siembra (evento agrícola)
+        "fecha_siembra":   {"type": ["string", "null"]},
         "confianza":       {"type": "string", "enum": ["alta", "media", "baja"]},
     },
     "required": ["accion", "tarea_id", "nota", "campo_id", "rubro", "monto_usd", "monto_ars",
-                 "descripcion", "mm", "nombre_invitado", "confianza"],
+                 "descripcion", "mm", "nombre_invitado",
+                 "cultivo", "toneladas", "precio_tn_usd", "comprador",
+                 "tipo_pago", "beneficiario", "fecha_venc",
+                 "tipo_insumo", "cantidad", "unidad",
+                 "titulo_tarea", "prioridad", "fecha_siembra",
+                 "confianza"],
     "additionalProperties": False,
 }
 
@@ -2098,9 +2845,21 @@ Acciones:
 - iniciar_tarea: dice que arrancó o está haciendo algo.
 - nota_tarea: quiere dejar un comentario sobre una tarea sin darla por terminada.
 - ver_tareas: pregunta qué tiene pendiente.
-- gasto: compró o pagó algo. monto_usd en dólares, rubro entre herbicidas, fungicidas, insecticidas, \
-fertilizantes, semillas, laboreo, flete u otros. descripcion es el producto.
-- lluvia: llovió. mm es la cantidad.
+- gasto: compró o pagó algo del campo. monto_usd en dólares, rubro entre herbicidas, fungicidas, \
+insecticidas, fertilizantes, semillas, laboreo, flete, empleados, arrendamiento, riego, otros. \
+descripcion es el producto. Si menciona cantidad y unidad ("30 litros de glifosato"), ponelas en \
+cantidad y unidad.
+- lluvia: llovió. mm es la cantidad. Si menciona fecha ("ayer", "15/12"), ponela en fecha_venc.
+- ingreso: vendió cereal. cultivo (soja/maiz/trigo/girasol/sorgo), toneladas, precio_tn_usd, \
+comprador (si menciona), campo_id si lo indica.
+- pago: cheque, crédito u otro compromiso. tipo_pago entre cheque, cuota_credito, otro. \
+beneficiario, monto_usd o monto_ars, fecha_venc (vencimiento o cobro).
+- insumo: cargó al stock un producto. tipo_insumo entre herbicidas, fungicidas, insecticidas, \
+fertilizantes, semillas, otros. descripcion = nombre del producto. cantidad + unidad (litros/kg/bolsas/dosis).
+- tarea_nueva: pide crear una tarea nueva. titulo_tarea con el título. descripcion si hay detalle. \
+prioridad entre alta, media, baja. fecha_venc si menciona cuándo.
+- siembra: dice que se sembró un campo ("sembré La Escondida con soja el 10/12"). cultivo, campo_id, \
+fecha_siembra (YYYY-MM-DD). Se guarda como gasto de semillas con la fecha.
 - invitar: quiere sumar a alguien al equipo. nombre_invitado es de quién habla.
 - menu: saluda o pide ver las opciones.
 - nada: no se entiende o no tiene que ver con la app.
@@ -2113,8 +2872,10 @@ corresponda.
 - Los montos son en dólares salvo que diga pesos. Si dice pesos, poné el número en monto_ars y dejá \
 monto_usd en null: la conversión la hace el sistema. "300 lucas" o "300 mil pesos" son 300000.
 - Si la persona se corrige ("300, eh, 300 mil"), tomá el último número que dice.
+- Fechas: resolvé a formato YYYY-MM-DD. "ayer", "hoy", "15/12" → fecha concreta. Si no mencionan año, \
+asumí el año actual.
 - confianza baja si estás adivinando. Ante la duda, poné baja: preferimos preguntar antes que cargar mal.
-- No inventes datos que el mensaje no dice."""
+- Dejá en null los campos que el mensaje no menciona. No inventes datos."""
 
 
 def _miles(v: float) -> str:
@@ -2283,6 +3044,145 @@ async def _kapso_aplicar_intencion(ident: dict, numero: str, intencion: dict) ->
         await _kapso_invitar_inicio(ident, numero, intencion.get("nombre_invitado") or "")
         return True
 
+    # ── Ingreso (venta de cereal) ────────────────────
+    if accion == "ingreso" and intencion.get("toneladas") and intencion.get("precio_tn_usd"):
+        if not _wa_puede(ident, "ingresos", "editar"):
+            return False
+        cultivo = (intencion.get("cultivo") or "").strip().lower() or "otro"
+        datos = {"ingreso": {
+            "cultivo": cultivo,
+            "tn": float(intencion["toneladas"]),
+            "precio": float(intencion["precio_tn_usd"]),
+        }}
+        if intencion.get("comprador"):
+            datos["ingreso"]["comprador"] = intencion["comprador"]
+        cid = intencion.get("campo_id")
+        if cid in ids_campos:
+            campo = next(c for c in ident["campos"] if c["id"] == cid)
+            datos["ingreso"]["campo_id"] = campo["id"]
+            datos["ingreso"]["campo_nombre"] = campo["nombre"]
+            await _kapso_guardar_ingreso(ident, numero, datos)
+            return True
+        # No tiene campo → preguntar
+        if await _kapso_pedir_campo(ident, numero, "k_ing_campo", datos,
+                                    f"¿De qué campo sale la venta de *{_num(intencion['toneladas'])} tn* de {cultivo}?"):
+            return True
+        datos["ingreso"]["campo_id"] = datos["campo_id"]
+        datos["ingreso"]["campo_nombre"] = datos["campo_nombre"]
+        await _kapso_guardar_ingreso(ident, numero, datos)
+        return True
+
+    # ── Pago (cheque/credito/otro) ───────────────────
+    if accion == "pago" and (intencion.get("monto_usd") is not None
+                             or intencion.get("monto_ars") is not None):
+        if not _wa_puede(ident, "compromisos_pago", "editar"):
+            return False
+        tipo = (intencion.get("tipo_pago") or "otro").lower()
+        if tipo not in ("cheque", "cuota_credito", "otro"):
+            tipo = "otro"
+        if intencion.get("monto_usd") is not None:
+            importe = float(intencion["monto_usd"])
+            moneda = "USD"
+        else:
+            importe = float(intencion["monto_ars"])
+            moneda = "ARS"
+        datos = {"pago": {
+            "tipo": tipo,
+            "beneficiario": intencion.get("beneficiario") or "",
+            "importe": importe,
+            "moneda": moneda,
+            "fecha": intencion.get("fecha_venc") or datetime.now(AR_TZ).date().isoformat(),
+        }}
+        if intencion.get("descripcion"):
+            datos["pago"]["descripcion"] = intencion["descripcion"]
+        await _kapso_guardar_pago(ident, numero, datos)
+        return True
+
+    # ── Insumo al stock ─────────────────────────────
+    if accion == "insumo" and intencion.get("descripcion") and intencion.get("cantidad"):
+        if not _wa_puede(ident, "insumos", "editar"):
+            return False
+        tipo = (intencion.get("tipo_insumo") or "otros").lower()
+        if tipo not in ("herbicidas", "fungicidas", "insecticidas", "fertilizantes", "semillas", "otros"):
+            tipo = "otros"
+        unidad = (intencion.get("unidad") or "unidades").lower()
+        if unidad not in ("litros", "kg", "dosis", "bolsas", "unidades"):
+            unidad = "unidades"
+        datos = {"insumo": {
+            "tipo": tipo,
+            "nombre": intencion["descripcion"][:150],
+            "cantidad": float(intencion["cantidad"]),
+            "unidad": unidad,
+        }}
+        if intencion.get("monto_usd"):
+            datos["insumo"]["costo_unitario"] = float(intencion["monto_usd"])
+        await _kapso_guardar_insumo(ident, numero, datos)
+        return True
+
+    # ── Tarea nueva ─────────────────────────────────
+    if accion == "tarea_nueva" and intencion.get("titulo_tarea"):
+        if not _wa_puede(ident, "tareas", "editar"):
+            return False
+        datos = {"tarea_nueva": {
+            "titulo": intencion["titulo_tarea"][:200],
+        }}
+        if intencion.get("descripcion"):
+            datos["tarea_nueva"]["descripcion"] = intencion["descripcion"][:500]
+        if intencion.get("prioridad") in ("alta", "media", "baja"):
+            datos["tarea_nueva"]["prioridad"] = intencion["prioridad"]
+        if intencion.get("fecha_venc"):
+            datos["tarea_nueva"]["fecha"] = intencion["fecha_venc"]
+        cid = intencion.get("campo_id")
+        if cid in ids_campos:
+            campo = next(c for c in ident["campos"] if c["id"] == cid)
+            datos["tarea_nueva"]["campo_id"] = campo["id"]
+            datos["tarea_nueva"]["campo_nombre"] = campo["nombre"]
+        await _kapso_guardar_tarea_nueva(ident, numero, datos)
+        return True
+
+    # ── Siembra (evento agrícola) → gasto de semillas con fecha ─────
+    if accion == "siembra" and intencion.get("cultivo"):
+        if not _wa_puede(ident, "gastos", "editar"):
+            return False
+        cultivo = intencion["cultivo"].strip().lower()
+        fecha = intencion.get("fecha_siembra") or datetime.now(AR_TZ).date().isoformat()
+        cid = intencion.get("campo_id")
+        if cid not in ids_campos:
+            # Sin campo → pedir
+            datos = {"gasto": {
+                "rubro": "Semillas",
+                "descripcion": f"Siembra de {cultivo}",
+                "cultivo": cultivo,
+                "fecha": fecha,
+                "total_de_usd": float(intencion.get("monto_usd") or 0),
+            }, "confirmar": True}
+            if await _kapso_pedir_campo(ident, numero, "k_gasto_campo", datos,
+                                        f"¿En qué campo sembraste {cultivo}?"):
+                return True
+            cid = datos["campo_id"]
+        campo = next((c for c in ident["campos"] if c["id"] == cid), None)
+        if not campo:
+            return False
+        payload = {
+            "campo_id": campo["id"],
+            "usuario_id": ident["owner_id"],
+            "rubro": "semillas",
+            "fecha": fecha,
+            "total_de_usd": float(intencion.get("monto_usd") or 0),
+            "descripcion": f"Siembra de {cultivo}",
+            "cultivo": cultivo,
+        }
+        await _sb_post("gastos", payload)
+        await _wa_clear_conv(numero)
+        await kapso.enviar_texto(
+            numero,
+            f"🌱 Siembra registrada en *{campo['nombre']}*\n"
+            f"Cultivo: *{cultivo.capitalize()}*\n"
+            f"📅 {_wa_fecha_corta(fecha)}\n\n"
+            f"_El evento queda en la timeline del campo (tab Cultivo)._"
+        )
+        return True
+
     return False
 
 
@@ -2425,8 +3325,10 @@ async def _kapso_procesar(m) -> None:
         return
     if accion == "lluvia":
         # Primero los mm y después el campo: al revés habría que arrastrar el
-        # campo elegido por dos estados para nada.
-        await _wa_set_conv(numero, "k_lluvia_mm", {})
+        # campo elegido por dos estados para nada. Flag guiado=True para pedir
+        # fecha/detalles antes de guardar (los flujos por texto libre guardan
+        # directo con defaults).
+        await _wa_set_conv(numero, "k_lluvia_mm", {"guiado": True})
         await kapso.enviar_texto(numero, "¿Cuántos mm?")
         return
     if accion == "insumo":
