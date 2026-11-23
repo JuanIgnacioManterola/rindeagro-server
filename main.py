@@ -2669,8 +2669,18 @@ async def _kapso_flujo(ident: dict, numero: str, m, conv: dict) -> None:
             return
         datos.setdefault("ingreso", {})["campo_id"] = campo["id"]
         datos["ingreso"]["campo_nombre"] = campo["nombre"]
-        await _wa_set_conv(numero, "k_ing_cultivo", datos)
-        await _kapso_pedir_cultivo(numero)
+        # Mostrar solo los cultivos sembrados del campo (no la lista genérica).
+        # Si hay uno solo, autoseleccionar y saltar al siguiente estado.
+        resultado = await _kapso_pedir_cultivo_del_campo(numero, campo["id"])
+        if resultado == 1:
+            sembrados = await _wa_cultivos_del_campo(campo["id"])
+            datos["ingreso"]["cultivo"] = sembrados[0]
+            await _wa_set_conv(numero, "k_ing_tn", datos)
+            lbl = next((v for k, v in CULTIVOS_WA if k == sembrados[0]), sembrados[0].capitalize())
+            await kapso.enviar_texto(
+                numero, f"Tomé *{lbl}* del campo. ¿Cuántas toneladas vendiste?")
+        else:
+            await _wa_set_conv(numero, "k_ing_cultivo", datos)
         return
 
     if estado == "k_ing_cultivo":
