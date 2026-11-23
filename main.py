@@ -3986,6 +3986,61 @@ async def kapso_webhook(request: Request):
     return {"ok": True, "recibidos": len(mensajes)}
 
 
+@app.post("/dev/intencion")
+async def dev_intencion(request: Request):
+    """
+    Endpoint de pruebas: simula lo que haría _kapso_procesar para un mensaje de
+    texto o audio ya transcripto, SIN guardar nada en la base ni mandar nada por
+    WhatsApp. Devuelve la intención cruda de Claude + un simulacro de lo que el
+    bot guardaría. Protegido con X-Dev-Secret contra DEV_SECRET del env.
+    """
+    secret = os.environ.get("DEV_SECRET", "")
+    if not secret or request.headers.get("x-dev-secret", "") != secret:
+        raise HTTPException(status_code=401, detail="forbidden")
+    body = await request.json()
+    texto = (body.get("texto") or "").strip()
+    numero = body.get("numero") or ""
+    if not texto or not numero:
+        raise HTTPException(status_code=400, detail="faltan texto o numero")
+
+    ident = await _wa_identificar(kapso.normalizar_numero(numero))
+    if not ident:
+        return {"ok": False, "motivo": "número no vinculado", "numero": numero}
+
+    tareas = await _wa_tareas_pendientes(ident)
+    intencion = await _interpretar_con_claude(texto, ident, tareas, None)
+
+    simulacro = None
+    if intencion and intencion.get("accion") == "gasto":
+        monto_usd = intencion.get("monto_usd")
+        monto_ars = intencion.get("monto_ars")
+        p_unit_usd = intencion.get("precio_unit_usd")
+        p_unit_ars = intencion.get("precio_unit_ars")
+        cantidad = intencion.get("cantidad")
+        usd = None
+        if monto_usd is not None:
+            usd = float(monto_usd)
+        elif monto_ars is not None:
+            tc = await _dolar_venta()
+            usd = round(float(monto_ars) / tc, 2)
+        elif p_unit_usd is not None and cantidad is not None:
+            usd = round(float(p_unit_usd) * float(cantidad), 2)
+        elif p_unit_ars is not None and cantidad is not None:
+            tc = await _dolar_venta()
+            usd = round(float(p_unit_ars) * float(cantidad) / tc, 2)
+        simulacro = {
+            "rubro": (intencion.get("rubro") or "Otros").capitalize(),
+            "descripcion": intencion.get("descripcion"),
+            "total_de_usd_calculado": usd,
+            "cantidad": cantidad,
+            "unidad": intencion.get("unidad"),
+            "precio_unit_usd": p_unit_usd,
+            "precio_unit_ars": p_unit_ars,
+            "campo_id": intencion.get("campo_id"),
+        }
+    return {"ok": True, "texto": texto, "intencion": intencion, "simulacro_gasto": simulacro}
+
+
 @app.get("/whatsapp/kapso/estado")
 async def kapso_estado(numeros: bool = False):
     """
