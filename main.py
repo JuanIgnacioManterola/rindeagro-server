@@ -1342,13 +1342,24 @@ CULTIVOS_WA = [("soja", "Soja"), ("maiz", "Maíz"), ("trigo", "Trigo"),
                ("girasol", "Girasol"), ("sorgo", "Sorgo"), ("otro", "Otro")]
 
 
+def _norm_cultivo(texto: str) -> str:
+    """Normaliza un nombre de cultivo para matchear con CULTIVOS_WA:
+    lowercase, sin acentos, strip. Usa unicodedata para quitar diacríticos."""
+    import unicodedata
+    n = unicodedata.normalize("NFKD", str(texto))
+    n = "".join(c for c in n if not unicodedata.combining(c))
+    return n.lower().strip()
+
+
 async def _wa_cultivos_del_campo(campo_id: str) -> list:
     """
-    Devuelve los cultivos sembrados en el campo. Se busca en:
+    Devuelve los cultivos sembrados en el campo con el NOMBRE ORIGINAL
+    (preservando mayúsculas/acentos, como lo guarda la app).
+    Si un mismo cultivo aparece con distinto casing en diferentes columnas,
+    se dedupea por nombre normalizado y queda el primero encontrado. Se busca en:
       1. campos.cultivo (texto, monocultivo)
       2. campos.hectareas_cultivo (JSON dict cultivo → ha)
       3. campos.ingresos_cultivos (JSON dict cultivo → {...})
-    Normaliza a lowercase sin acentos. Lista vacía si no hay nada cargado.
     """
     import json
     filas = await _sb_get("campos", {
@@ -1359,19 +1370,24 @@ async def _wa_cultivos_del_campo(campo_id: str) -> list:
     if not filas:
         return []
     f = filas[0]
-    cultivos = set()
+    # Dict normalizado → original: evita duplicados por casing o acentos.
+    vistos = {}
+    def add(nombre):
+        n = _norm_cultivo(nombre)
+        if n and n not in vistos:
+            vistos[n] = str(nombre).strip()
     if f.get("cultivo"):
-        cultivos.add(_norm(str(f["cultivo"])).strip())
+        add(f["cultivo"])
     for col in ("hectareas_cultivo", "ingresos_cultivos"):
         try:
             raw = f.get(col)
             d = json.loads(raw) if raw else {}
             if isinstance(d, dict):
                 for k in d.keys():
-                    cultivos.add(_norm(str(k)).strip())
+                    add(k)
         except Exception:
             pass
-    return sorted(c for c in cultivos if c)
+    return sorted(vistos.values(), key=lambda x: _norm_cultivo(x))
 
 
 async def _kapso_pedir_cultivo_del_campo(numero: str, campo_id: str) -> int:
@@ -1387,7 +1403,8 @@ async def _kapso_pedir_cultivo_del_campo(numero: str, campo_id: str) -> int:
     if sembrados:
         filas = []
         for c in sembrados[:9]:
-            lbl = next((v for k, v in CULTIVOS_WA if k == c), c.capitalize())
+            # Match normalizado con CULTIVOS_WA para el label; id preserva el nombre original.
+            lbl = next((v for k, v in CULTIVOS_WA if k == _norm_cultivo(c)), str(c))
             filas.append((f"cultivo:{c}", lbl))
         filas.append(("cultivo:otro", "Otro"))
         await kapso.enviar_lista(numero, "¿Qué cultivo vendiste?",
@@ -1423,7 +1440,7 @@ async def _kapso_ingreso_guiado(ident: dict, numero: str) -> None:
         sembrados = await _wa_cultivos_del_campo(datos["campo_id"])
         datos["ingreso"]["cultivo"] = sembrados[0]
         await _wa_set_conv(numero, "k_ing_tn", datos)
-        lbl = next((v for k, v in CULTIVOS_WA if k == sembrados[0]), sembrados[0].capitalize())
+        lbl = next((v for k, v in CULTIVOS_WA if k == _norm_cultivo(sembrados[0])), str(sembrados[0]))
         await kapso.enviar_texto(numero, f"¿Cuántas toneladas de *{lbl}* vendiste?")
     else:
         await _wa_set_conv(numero, "k_ing_cultivo", datos)
@@ -1473,7 +1490,7 @@ async def _kapso_guardar_ingreso(ident: dict, numero: str, datos: dict) -> None:
                     {"ingresos_cultivos": json.dumps(datos_cultivos)})
     await _wa_clear_conv(numero)
     total = tn * precio
-    cultivo_label = next((v for k, v in CULTIVOS_WA if k == cultivo), cultivo.capitalize())
+    cultivo_label = next((v for k, v in CULTIVOS_WA if k == _norm_cultivo(cultivo)), str(cultivo))
     comp_txt = f"\n🤝 Comprador: *{comprador}*" if comprador else ""
     await kapso.enviar_texto(
         numero,
@@ -2675,7 +2692,7 @@ async def _kapso_flujo(ident: dict, numero: str, m, conv: dict) -> None:
             sembrados = await _wa_cultivos_del_campo(campo["id"])
             datos["ingreso"]["cultivo"] = sembrados[0]
             await _wa_set_conv(numero, "k_ing_tn", datos)
-            lbl = next((v for k, v in CULTIVOS_WA if k == sembrados[0]), sembrados[0].capitalize())
+            lbl = next((v for k, v in CULTIVOS_WA if k == _norm_cultivo(sembrados[0])), str(sembrados[0]))
             await kapso.enviar_texto(numero, f"¿Cuántas toneladas de *{lbl}* vendiste?")
         else:
             await _wa_set_conv(numero, "k_ing_cultivo", datos)
@@ -2684,21 +2701,28 @@ async def _kapso_flujo(ident: dict, numero: str, m, conv: dict) -> None:
     if estado == "k_ing_cultivo":
         cultivo = None
         if accion.startswith("cultivo:"):
+            # El id del botón preserva el nombre original (ej "Maíz") para que
+            # la venta quede en la misma key que ya tiene el campo.
             cultivo = accion.split(":", 1)[1]
         elif texto:
-            n = _norm(texto)
-            for k, _v in CULTIVOS_WA:
-                if k in n:
-                    cultivo = k
-                    break
+            # Si el user escribe el cultivo, intentamos matchear primero con los
+            # sembrados del campo para preservar el casing original.
+            campo_id = datos.get("ingreso", {}).get("campo_id")
+            if campo_id:
+                sembrados = await _wa_cultivos_del_campo(campo_id)
+                n = _norm_cultivo(texto)
+                for s in sembrados:
+                    if _norm_cultivo(s) == n or n in _norm_cultivo(s):
+                        cultivo = s
+                        break
             if not cultivo:
-                cultivo = "otro"
+                cultivo = texto.strip()[:50]
         if not cultivo:
             await kapso.enviar_texto(numero, "Tocá un cultivo de la lista.")
             return
         datos["ingreso"]["cultivo"] = cultivo
         await _wa_set_conv(numero, "k_ing_tn", datos)
-        lbl = next((v for k, v in CULTIVOS_WA if k == cultivo), cultivo.capitalize())
+        lbl = next((v for k, v in CULTIVOS_WA if k == _norm_cultivo(cultivo)), str(cultivo))
         await kapso.enviar_texto(numero, f"¿Cuántas toneladas de *{lbl}* vendiste?")
         return
 
@@ -2710,7 +2734,7 @@ async def _kapso_flujo(ident: dict, numero: str, m, conv: dict) -> None:
         datos["ingreso"]["tn"] = tn
         await _wa_set_conv(numero, "k_ing_precio", datos)
         cultivo_actual = datos["ingreso"].get("cultivo") or ""
-        lbl = next((v for k, v in CULTIVOS_WA if k == cultivo_actual), cultivo_actual.capitalize() or "cultivo")
+        lbl = next((v for k, v in CULTIVOS_WA if k == _norm_cultivo(cultivo_actual)), str(cultivo_actual) or "cultivo")
         await kapso.enviar_texto(
             numero, f"¿A qué precio USD por tonelada vendiste la *{lbl}*?")
         return
