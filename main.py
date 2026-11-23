@@ -939,11 +939,12 @@ async def _kapso_guardar_gasto(ident: dict, numero: str, datos: dict) -> None:
         # por ese valor exacto: con mayúscula el gasto queda fuera de los
         # gráficos por rubro.
         "rubro": (g.get("rubro") or "otros").strip().lower(),
-        "fecha": datetime.now(AR_TZ).date().isoformat(),
+        "fecha": g.get("fecha") or datetime.now(AR_TZ).date().isoformat(),
         "total_de_usd": g.get("total_de_usd") or 0,
         "descripcion": g.get("descripcion") or "",
     }
-    for k in ("cantidad", "unidad", "precio_unitario", "factura_url", "factura_path", "factura_tipo"):
+    for k in ("cantidad", "unidad", "precio_unitario", "factura_url", "factura_path",
+              "factura_tipo", "momento_pulverizacion", "cultivo"):
         if g.get(k) is not None:
             payload[k] = g[k]
 
@@ -1035,6 +1036,98 @@ async def _wa_insumos_del_user(ident: dict, tipo: str, limite: int = 9) -> list:
     }) or []
 
 
+async def _kapso_guardar_gasto_especial(ident: dict, numero: str, datos: dict) -> None:
+    """
+    Guarda un gasto de rubros especiales (flete, riego, empleados, arrendamiento).
+    Calcula el usd_total y los campos genericos (cantidad, unidad, precio_unitario)
+    según el rubro, igual que guardarGasto() del frontend.
+    """
+    g = datos["gasto"]
+    campo_id = datos.get("campo_id")
+    rubro = (g.get("rubro") or "otros").lower()
+
+    # ha del campo para usd/ha
+    ha_campo = 0.0
+    for c in ident.get("campos", []):
+        if c["id"] == campo_id:
+            ha_campo = float(c.get("hectareas") or 0)
+            break
+    ha_apl = float(g.get("ha_aplicadas") or ha_campo or 1)
+
+    usd_total = 0.0
+    descripcion = (g.get("descripcion") or "").strip()[:300]
+    payload_extra = {}
+
+    if rubro == "flete":
+        tn = float(g.get("tn") or 0)
+        pr = float(g.get("precio_tn") or 0)
+        mon = (g.get("moneda") or "USD").upper()
+        tc = float(g.get("tc") or 0)
+        if mon == "ARS" and tc > 0:
+            usd_total = (tn * pr) / tc
+        else:
+            usd_total = tn * pr
+        payload_extra["cantidad"] = tn
+        payload_extra["precio_unitario"] = pr
+        payload_extra["unidad"] = "ton_ars" if mon == "ARS" else "toneladas"
+        if not descripcion:
+            descripcion = "Flete"
+    elif rubro == "riego":
+        kva = float(g.get("kva") or 0)
+        costo_kva = float(g.get("costo_kva") or 0)
+        usd_total = kva * costo_kva
+        payload_extra["cantidad"] = kva
+        payload_extra["precio_unitario"] = costo_kva
+        payload_extra["unidad"] = "kva"
+        if not descripcion:
+            descripcion = f"Riego — {_num(kva)} kVA"
+    elif rubro == "empleados":
+        monto = float(g.get("monto") or 0)
+        mon = (g.get("moneda") or "USD").upper()
+        tc = float(g.get("tc") or 0)
+        if mon == "ARS" and tc > 0:
+            usd_total = monto / tc
+        else:
+            usd_total = monto
+        if not descripcion:
+            descripcion = "Gasto de empleados"
+    elif rubro == "arrendamiento":
+        qq_ha = float(g.get("qq_ha") or 0)
+        precio_soja = float(g.get("precio_soja") or 0)  # USD/tn
+        usd_total = qq_ha * (precio_soja / 10.0) * (ha_campo or 1)
+        payload_extra["cantidad"] = qq_ha
+        payload_extra["precio_unitario"] = precio_soja
+        payload_extra["unidad"] = "qq_ha"
+        if not descripcion:
+            descripcion = f"Arrendamiento — {_num(qq_ha)} qq/ha"
+
+    usd_ha = round(usd_total / ha_apl, 2) if ha_apl > 0 else None
+
+    payload = {
+        "campo_id": campo_id,
+        "usuario_id": ident["owner_id"],
+        "rubro": rubro,
+        "fecha": g.get("fecha") or datetime.now(AR_TZ).date().isoformat(),
+        "total_de_usd": round(usd_total, 2),
+        "descripcion": descripcion,
+    }
+    if usd_ha is not None:
+        payload["usd_ha"] = usd_ha
+    payload.update(payload_extra)
+
+    await _sb_post("gastos", payload)
+    await _wa_clear_conv(numero)
+
+    rubro_label = rubro.capitalize()
+    lineas = [f"✅ {rubro_label} cargado en *{datos.get('campo_nombre')}*",
+              f"USD *{_num(usd_total)}* total"]
+    if usd_ha:
+        lineas.append(f"USD {_num(usd_ha)}/ha")
+    if descripcion:
+        lineas.append(f"📝 _{descripcion}_")
+    await kapso.enviar_texto(numero, "\n".join(lineas))
+
+
 async def _kapso_guardar_gasto_con_stock(ident: dict, numero: str, datos: dict) -> None:
     """
     Guarda un gasto que sale del stock: inserta en gastos (con insumo_id) y
@@ -1071,6 +1164,8 @@ async def _kapso_guardar_gasto_con_stock(ident: dict, numero: str, datos: dict) 
         payload["usd_ha"] = round(usd_total / ha_campo, 2)
     if g.get("momento_pulverizacion"):
         payload["momento_pulverizacion"] = g["momento_pulverizacion"]
+    if g.get("cultivo"):
+        payload["cultivo"] = g["cultivo"]
 
     await _sb_post("gastos", payload)
 
@@ -1198,6 +1293,17 @@ async def _kapso_tarea_nueva_guiado(ident: dict, numero: str) -> None:
 PRIORIDADES_TAREA = [("alta", "🔴 Alta"), ("media", "🟡 Media"), ("baja", "🟢 Baja")]
 
 
+async def _wa_equipo_del_user(owner_id: str, limite: int = 9) -> list:
+    """Lee los miembros ACTIVOS del equipo del user. Vacío si no hay."""
+    return await _sb_get("equipo", {
+        "owner_id": f"eq.{owner_id}",
+        "activo": "eq.true",
+        "select": "miembro_id,nombre_display,rol",
+        "order": "nombre_display.asc",
+        "limit": str(limite),
+    }) or []
+
+
 async def _kapso_guardar_tarea_nueva(ident: dict, numero: str, datos: dict) -> None:
     t = datos.get("tarea_nueva", {})
     payload = {
@@ -1211,6 +1317,8 @@ async def _kapso_guardar_tarea_nueva(ident: dict, numero: str, datos: dict) -> N
         payload["descripcion"] = t["descripcion"][:500]
     if t.get("prioridad"):
         payload["prioridad"] = t["prioridad"]
+    if t.get("asignado_a"):
+        payload["asignado_a"] = t["asignado_a"]
     await _sb_post("tareas", payload)
     await _wa_clear_conv(numero)
     partes = [f"✅ Tarea creada: *{t.get('titulo')}*"]
@@ -1223,6 +1331,8 @@ async def _kapso_guardar_tarea_nueva(ident: dict, numero: str, datos: dict) -> N
         partes.append(f"📅 Vence {_wa_fecha_corta(t['fecha'])}")
     if t.get("campo_nombre"):
         partes.append(f"🌱 {t['campo_nombre']}")
+    if t.get("asignado_nombre"):
+        partes.append(f"👤 Asignada a: *{t['asignado_nombre']}*")
     await kapso.enviar_texto(numero, "\n".join(partes))
 
 
@@ -1426,6 +1536,8 @@ async def _kapso_guardar_pago_cheque(ident: dict, numero: str, datos: dict) -> N
         payload["banco"] = p["banco"][:100]
     if p.get("numero_cheque"):
         payload["numero_cheque"] = p["numero_cheque"][:30]
+    if p.get("alerta_dias_antes"):
+        payload["alerta_dias_antes"] = int(p["alerta_dias_antes"])
 
     await _sb_post("compromisos_pago", payload)
     await _wa_clear_conv(numero)
@@ -1436,6 +1548,8 @@ async def _kapso_guardar_pago_cheque(ident: dict, numero: str, datos: dict) -> N
         lineas.append(f"🏦 {p['banco']}")
     if p.get("numero_cheque"):
         lineas.append(f"#️⃣ Nº {p['numero_cheque']}")
+    if p.get("alerta_dias_antes"):
+        lineas.append(f"🔔 Aviso {p['alerta_dias_antes']} días antes")
     await kapso.enviar_texto(numero, "\n".join(lineas))
 
 
@@ -1458,6 +1572,7 @@ async def _kapso_guardar_pago_credito(ident: dict, numero: str, datos: dict) -> 
     inc_meses = next((m for k, _, m in FRECUENCIAS_CREDITO if k == frecuencia), 1)
     credito_id = secrets.token_hex(8)
 
+    alerta_dias = int(p.get("alerta_dias_antes") or 0) or None
     for i in range(cantidad):
         fecha_cuota = _sumar_meses(fecha_primera, inc_meses * i)
         payload = {
@@ -1474,17 +1589,20 @@ async def _kapso_guardar_pago_credito(ident: dict, numero: str, datos: dict) -> 
             "estado": "pendiente",
             "fuente": "whatsapp",
         }
+        if alerta_dias:
+            payload["alerta_dias_antes"] = alerta_dias
         await _sb_post("compromisos_pago", payload)
 
     await _wa_clear_conv(numero)
     total = importe_cuota * cantidad
     freq_label = next((lbl for k, lbl, _ in FRECUENCIAS_CREDITO if k == frecuencia), frecuencia)
+    alerta_txt = f"\n🔔 Aviso {alerta_dias} días antes de cada cuota" if alerta_dias else ""
     await kapso.enviar_texto(
         numero,
         f"✅ Crédito cargado: *{cantidad} cuotas* de *{moneda} {_miles(importe_cuota)}* ({freq_label})\n"
         f"🏦 {beneficiario}\n"
         f"📅 1ra: {_wa_fecha_corta(p['fecha_primera'])}\n"
-        f"💰 Total: *{moneda} {_miles(total)}*"
+        f"💰 Total: *{moneda} {_miles(total)}*{alerta_txt}"
     )
 
 
@@ -2043,6 +2161,26 @@ async def _kapso_flujo(ident: dict, numero: str, m, conv: dict) -> None:
                     "Elegir del stock", filas, "Stock disponible")
                 return
 
+        # ── Rubros especiales con flujo propio ─────
+        if rubro_lower == "flete" and not datos["gasto"].get("total_de_usd"):
+            await _wa_set_conv(numero, "k_gasto_fl_tons", datos)
+            await kapso.enviar_texto(numero, "🚛 ¿Cuántas toneladas transportaste?")
+            return
+        if rubro_lower == "riego" and not datos["gasto"].get("total_de_usd"):
+            await _wa_set_conv(numero, "k_gasto_rg_kva", datos)
+            await kapso.enviar_texto(numero, "💧 ¿Cuánto consumo en kVA?")
+            return
+        if rubro_lower == "empleados" and not datos["gasto"].get("total_de_usd"):
+            await _wa_set_conv(numero, "k_gasto_em_desc", datos)
+            await kapso.enviar_texto(
+                numero, "👷 ¿Qué gasto de personal? (ej: _jornalero_, _maquinista_, _salario mensual_)")
+            return
+        if rubro_lower == "arrendamiento" and not datos["gasto"].get("total_de_usd"):
+            await _wa_set_conv(numero, "k_gasto_arr_qq", datos)
+            await kapso.enviar_texto(
+                numero, "🏠 ¿Cuántos quintales de soja por hectárea? (ej: *9*)")
+            return
+
         if datos["gasto"].get("total_de_usd"):
             await _wa_set_conv(numero, "k_gasto_desc", datos)
             await kapso.enviar_texto(numero, "¿Qué producto era? (ej: glifosato, urea, semilla de soja)")
@@ -2103,6 +2241,16 @@ async def _kapso_flujo(ident: dict, numero: str, m, conv: dict) -> None:
             return
         g["cantidad_total"] = cantidad
         if g.get("precio_unitario"):
+            rubro = (g.get("rubro") or "").lower()
+            if rubro in ("herbicidas", "fungicidas", "insecticidas"):
+                await _wa_set_conv(numero, "k_gasto_momento_stock", datos)
+                filas = [("g_mom:barbecho", "Barbecho"), ("g_mom:presiembra", "Presiembra"),
+                         ("g_mom:postemergente", "Postemergente"), ("g_mom:aplicacion", "Aplicación"),
+                         ("g_mom:skip", "Sin especificar")]
+                await kapso.enviar_lista(
+                    numero, "¿Momento de la pulverización?",
+                    "Elegir", filas, "Momento")
+                return
             await _kapso_guardar_gasto_con_stock(ident, numero, datos)
             return
         await _wa_set_conv(numero, "k_gasto_precio_unit", datos)
@@ -2117,7 +2265,132 @@ async def _kapso_flujo(ident: dict, numero: str, m, conv: dict) -> None:
             await kapso.enviar_texto(numero, "Escribí solo el precio en USD, por ejemplo *3.5*.")
             return
         datos.setdefault("gasto", {})["precio_unitario"] = precio
+        rubro = (datos["gasto"].get("rubro") or "").lower()
+        if rubro in ("herbicidas", "fungicidas", "insecticidas"):
+            await _wa_set_conv(numero, "k_gasto_momento_stock", datos)
+            filas = [("g_mom:barbecho", "Barbecho"), ("g_mom:presiembra", "Presiembra"),
+                     ("g_mom:postemergente", "Postemergente"), ("g_mom:aplicacion", "Aplicación"),
+                     ("g_mom:skip", "Sin especificar")]
+            await kapso.enviar_lista(
+                numero, "¿Momento de la pulverización?",
+                "Elegir", filas, "Momento")
+            return
         await _kapso_guardar_gasto_con_stock(ident, numero, datos)
+        return
+
+    if estado == "k_gasto_momento_stock":
+        momento = None
+        if accion.startswith("g_mom:"):
+            v = accion.split(":", 1)[1]
+            if v != "skip":
+                momento = v
+        elif texto:
+            n = _norm(texto)
+            for m in ("barbecho", "presiembra", "postemergente", "aplicacion"):
+                if m in n:
+                    momento = m
+                    break
+        if momento:
+            datos.setdefault("gasto", {})["momento_pulverizacion"] = momento
+        await _kapso_guardar_gasto_con_stock(ident, numero, datos)
+        return
+
+    # ── Flete ─────────────────────────────────
+    if estado == "k_gasto_fl_tons":
+        tn = _extraer_numero(texto)
+        if tn is None or tn <= 0:
+            await kapso.enviar_texto(numero, "Escribí solo el número de toneladas, por ejemplo *30*.")
+            return
+        datos.setdefault("gasto", {})["tn"] = tn
+        await _wa_set_conv(numero, "k_gasto_fl_precio", datos)
+        await kapso.enviar_texto(numero, "¿Precio por tonelada? (ej: _USD 25_, _3 mil pesos_)")
+        return
+
+    if estado == "k_gasto_fl_precio":
+        precio = _parsear_plata(texto)
+        if precio is None or precio <= 0:
+            precio = _extraer_numero(texto)
+        if precio is None or precio <= 0:
+            await kapso.enviar_texto(numero, "No entendí el precio. Escribí _USD 25_ o _3 mil pesos_.")
+            return
+        n = _norm(texto)
+        es_ars = _RE_PESOS.search(n) or ("pesos" in n or "ars" in n)
+        datos.setdefault("gasto", {})["precio_tn"] = precio
+        datos["gasto"]["moneda"] = "ARS" if es_ars else "USD"
+        if es_ars:
+            # Si es ARS, usar TC del BNA
+            tc = await _dolar_venta()
+            datos["gasto"]["tc"] = tc
+        await _kapso_guardar_gasto_especial(ident, numero, datos)
+        return
+
+    # ── Riego ─────────────────────────────────
+    if estado == "k_gasto_rg_kva":
+        kva = _extraer_numero(texto)
+        if kva is None or kva <= 0:
+            await kapso.enviar_texto(numero, "Escribí solo los kVA, por ejemplo *450*.")
+            return
+        datos.setdefault("gasto", {})["kva"] = kva
+        await _wa_set_conv(numero, "k_gasto_rg_costo", datos)
+        await kapso.enviar_texto(numero, "¿Costo por kVA en USD? (ej: *0.08*)")
+        return
+
+    if estado == "k_gasto_rg_costo":
+        costo = _extraer_numero(texto)
+        if costo is None or costo <= 0:
+            await kapso.enviar_texto(numero, "Escribí solo el costo en USD por kVA, por ejemplo *0.08*.")
+            return
+        datos.setdefault("gasto", {})["costo_kva"] = costo
+        await _kapso_guardar_gasto_especial(ident, numero, datos)
+        return
+
+    # ── Empleados ─────────────────────────────
+    if estado == "k_gasto_em_desc":
+        desc = (texto or "").strip()[:200]
+        if not desc:
+            await kapso.enviar_texto(numero, "Escribí una descripción.")
+            return
+        datos.setdefault("gasto", {})["descripcion"] = desc
+        await _wa_set_conv(numero, "k_gasto_em_monto", datos)
+        await kapso.enviar_texto(numero, "¿Cuánto fue? (ej: _USD 500_, _200 mil pesos_)")
+        return
+
+    if estado == "k_gasto_em_monto":
+        monto = _parsear_plata(texto)
+        if monto is None or monto <= 0:
+            monto = _extraer_numero(texto)
+        if monto is None or monto <= 0:
+            await kapso.enviar_texto(numero, "No entendí el monto. Escribí _USD 500_ o _200 mil pesos_.")
+            return
+        n = _norm(texto)
+        es_ars = _RE_PESOS.search(n) or ("pesos" in n or "ars" in n)
+        datos.setdefault("gasto", {})["monto"] = monto
+        datos["gasto"]["moneda"] = "ARS" if es_ars else "USD"
+        if es_ars:
+            tc = await _dolar_venta()
+            datos["gasto"]["tc"] = tc
+        await _kapso_guardar_gasto_especial(ident, numero, datos)
+        return
+
+    # ── Arrendamiento ─────────────────────────
+    if estado == "k_gasto_arr_qq":
+        qq = _extraer_numero(texto)
+        if qq is None or qq <= 0:
+            await kapso.enviar_texto(numero, "Escribí solo los qq/ha, por ejemplo *9*.")
+            return
+        datos.setdefault("gasto", {})["qq_ha"] = qq
+        await _wa_set_conv(numero, "k_gasto_arr_precio_soja", datos)
+        await kapso.enviar_texto(
+            numero, "¿Precio de la soja en USD por tonelada? (ej: *320*)")
+        return
+
+    if estado == "k_gasto_arr_precio_soja":
+        precio = _extraer_numero(texto)
+        if precio is None or precio <= 0:
+            await kapso.enviar_texto(numero, "Escribí solo el precio en USD/tn, por ejemplo *320*.")
+            return
+        datos.setdefault("gasto", {})["precio_soja"] = precio
+        await _kapso_guardar_gasto_especial(ident, numero, datos)
         return
 
     if estado == "k_gasto_monto":
@@ -2135,8 +2408,35 @@ async def _kapso_flujo(ident: dict, numero: str, m, conv: dict) -> None:
         g["descripcion"] = f"{texto.strip()} {g.pop('descripcion_extra', '')}".strip()[:300]
         if datos.get("confirmar"):
             await _kapso_confirmar_gasto(numero, datos)
-        else:
-            await _kapso_guardar_gasto(ident, numero, datos)
+            return
+        rubro = (g.get("rubro") or "").lower()
+        if rubro in ("herbicidas", "fungicidas", "insecticidas"):
+            await _wa_set_conv(numero, "k_gasto_momento_simple", datos)
+            filas = [("g_mom:barbecho", "Barbecho"), ("g_mom:presiembra", "Presiembra"),
+                     ("g_mom:postemergente", "Postemergente"), ("g_mom:aplicacion", "Aplicación"),
+                     ("g_mom:skip", "Sin especificar")]
+            await kapso.enviar_lista(
+                numero, "¿Momento de la pulverización?",
+                "Elegir", filas, "Momento")
+            return
+        await _kapso_guardar_gasto(ident, numero, datos)
+        return
+
+    if estado == "k_gasto_momento_simple":
+        momento = None
+        if accion.startswith("g_mom:"):
+            v = accion.split(":", 1)[1]
+            if v != "skip":
+                momento = v
+        elif texto:
+            n = _norm(texto)
+            for m in ("barbecho", "presiembra", "postemergente", "aplicacion"):
+                if m in n:
+                    momento = m
+                    break
+        if momento:
+            datos.setdefault("gasto", {})["momento_pulverizacion"] = momento
+        await _kapso_guardar_gasto(ident, numero, datos)
         return
 
     if estado == "k_gasto_confirmar":
@@ -2315,6 +2615,44 @@ async def _kapso_flujo(ident: dict, numero: str, m, conv: dict) -> None:
             else:
                 prio = "media"
         datos.setdefault("tarea_nueva", {})["prioridad"] = prio or "media"
+        # Pedir asignado si el user tiene equipo
+        equipo = await _wa_equipo_del_user(ident["owner_id"])
+        if not equipo:
+            # Sin equipo → guardar directo
+            await _kapso_guardar_tarea_nueva(ident, numero, datos)
+            return
+        await _wa_set_conv(numero, "k_tar_asignado", datos)
+        filas = []
+        for m in equipo[:9]:
+            sub = str(m.get("rol") or "").capitalize()
+            filas.append((f"tar_asig:{m['miembro_id']}",
+                          str(m.get("nombre_display") or "Sin nombre")[:24], sub))
+        filas.append(("tar_asig:none", "Sin asignar", "Para vos o cualquiera"))
+        await kapso.enviar_lista(
+            numero, "¿A quién le asignás la tarea?",
+            "Elegir", filas[:10], "Equipo")
+        return
+
+    if estado == "k_tar_asignado":
+        if accion.startswith("tar_asig:"):
+            mid = accion.split(":", 1)[1]
+            if mid != "none":
+                # Buscar el nombre en el equipo
+                equipo = await _wa_equipo_del_user(ident["owner_id"])
+                m = next((m for m in equipo if m["miembro_id"] == mid), None)
+                if m:
+                    datos["tarea_nueva"]["asignado_a"] = mid
+                    datos["tarea_nueva"]["asignado_nombre"] = m.get("nombre_display")
+        elif texto:
+            n = _norm(texto)
+            if n not in ("sin asignar", "no", "ninguno", "-", "para mi"):
+                equipo = await _wa_equipo_del_user(ident["owner_id"])
+                for m in equipo:
+                    nombre_norm = _norm(str(m.get("nombre_display") or ""))
+                    if nombre_norm and nombre_norm in n:
+                        datos["tarea_nueva"]["asignado_a"] = m["miembro_id"]
+                        datos["tarea_nueva"]["asignado_nombre"] = m.get("nombre_display")
+                        break
         await _kapso_guardar_tarea_nueva(ident, numero, datos)
         return
 
@@ -2467,6 +2805,18 @@ async def _kapso_flujo(ident: dict, numero: str, m, conv: dict) -> None:
         n = _norm(texto or "")
         if n and n not in ("sin numero", "sin número", "no", "ninguno", "-"):
             datos.setdefault("pago", {})["numero_cheque"] = texto.strip()[:30]
+        await _wa_set_conv(numero, "k_pag_ch_alerta", datos)
+        await kapso.enviar_texto(
+            numero,
+            "¿Querés que te avise antes del vencimiento? (ej: _7 días antes_, _15 días_, o _sin alerta_)")
+        return
+
+    if estado == "k_pag_ch_alerta":
+        n = _norm(texto or "")
+        if n and n not in ("sin alerta", "no", "ninguno", "-", "sin aviso"):
+            dias = _extraer_numero(texto)
+            if dias and dias > 0 and dias <= 365:
+                datos.setdefault("pago", {})["alerta_dias_antes"] = int(dias)
         await _kapso_guardar_pago(ident, numero, datos)
         return
 
@@ -2541,6 +2891,18 @@ async def _kapso_flujo(ident: dict, numero: str, m, conv: dict) -> None:
             await kapso.enviar_texto(numero, "No entendí la fecha. Escribí _15/12_ o _próximo mes_.")
             return
         datos.setdefault("pago", {})["fecha_primera"] = fecha
+        await _wa_set_conv(numero, "k_pag_cr_alerta", datos)
+        await kapso.enviar_texto(
+            numero,
+            "¿Querés que te avise antes de cada cuota? (ej: _7 días antes_, _15 días_, o _sin alerta_)")
+        return
+
+    if estado == "k_pag_cr_alerta":
+        n = _norm(texto or "")
+        if n and n not in ("sin alerta", "no", "ninguno", "-", "sin aviso"):
+            dias = _extraer_numero(texto)
+            if dias and dias > 0 and dias <= 365:
+                datos.setdefault("pago", {})["alerta_dias_antes"] = int(dias)
         await _kapso_guardar_pago_credito(ident, numero, datos)
         return
 
