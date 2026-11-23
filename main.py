@@ -1424,8 +1424,7 @@ async def _kapso_ingreso_guiado(ident: dict, numero: str) -> None:
         datos["ingreso"]["cultivo"] = sembrados[0]
         await _wa_set_conv(numero, "k_ing_tn", datos)
         lbl = next((v for k, v in CULTIVOS_WA if k == sembrados[0]), sembrados[0].capitalize())
-        await kapso.enviar_texto(
-            numero, f"Tomé *{lbl}* del campo. ¿Cuántas toneladas vendiste?")
+        await kapso.enviar_texto(numero, f"¿Cuántas toneladas de *{lbl}* vendiste?")
     else:
         await _wa_set_conv(numero, "k_ing_cultivo", datos)
 
@@ -2677,8 +2676,7 @@ async def _kapso_flujo(ident: dict, numero: str, m, conv: dict) -> None:
             datos["ingreso"]["cultivo"] = sembrados[0]
             await _wa_set_conv(numero, "k_ing_tn", datos)
             lbl = next((v for k, v in CULTIVOS_WA if k == sembrados[0]), sembrados[0].capitalize())
-            await kapso.enviar_texto(
-                numero, f"Tomé *{lbl}* del campo. ¿Cuántas toneladas vendiste?")
+            await kapso.enviar_texto(numero, f"¿Cuántas toneladas de *{lbl}* vendiste?")
         else:
             await _wa_set_conv(numero, "k_ing_cultivo", datos)
         return
@@ -2700,7 +2698,8 @@ async def _kapso_flujo(ident: dict, numero: str, m, conv: dict) -> None:
             return
         datos["ingreso"]["cultivo"] = cultivo
         await _wa_set_conv(numero, "k_ing_tn", datos)
-        await kapso.enviar_texto(numero, "¿Cuántas toneladas vendiste?")
+        lbl = next((v for k, v in CULTIVOS_WA if k == cultivo), cultivo.capitalize())
+        await kapso.enviar_texto(numero, f"¿Cuántas toneladas de *{lbl}* vendiste?")
         return
 
     if estado == "k_ing_tn":
@@ -2710,7 +2709,10 @@ async def _kapso_flujo(ident: dict, numero: str, m, conv: dict) -> None:
             return
         datos["ingreso"]["tn"] = tn
         await _wa_set_conv(numero, "k_ing_precio", datos)
-        await kapso.enviar_texto(numero, "¿A qué precio USD por tonelada?")
+        cultivo_actual = datos["ingreso"].get("cultivo") or ""
+        lbl = next((v for k, v in CULTIVOS_WA if k == cultivo_actual), cultivo_actual.capitalize() or "cultivo")
+        await kapso.enviar_texto(
+            numero, f"¿A qué precio USD por tonelada vendiste la *{lbl}*?")
         return
 
     if estado == "k_ing_precio":
