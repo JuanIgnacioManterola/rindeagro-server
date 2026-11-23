@@ -3282,6 +3282,13 @@ para el unitario.
 Ejemplo clave: "cargar un gasto de 30 litros de glifosato en Arlicher a $5 por litro" → \
 rubro=herbicidas, descripcion="Glifosato", cantidad=30, unidad="litros", precio_unit_usd=5, \
 monto_usd=null (lo calcula el sistema: 30 × 5 = 150 USD), campo_id=<id de Arlicher>.
+Ojo con "en total": si dice "se aplicaron 30 litros en total" el 30 son LITROS (cantidad=30, \
+unidad=litros), NO son 30 dólares. "En total" ahí describe la cantidad aplicada, no el precio. \
+El total en plata siempre se identifica por la palabra "dólares", "pesos", "USD" o el símbolo \
+"\$", nunca por "en total" a secas.
+Otro ejemplo con "en total": "se aplicaron 30 litros de glifosato en total a 5 dólares el litro" \
+→ cantidad=30, unidad=litros, descripcion="Glifosato", precio_unit_usd=5, monto_usd=null (el \
+sistema calcula 150 USD).
 - lluvia: llovió. mm es la cantidad. Si menciona fecha ("ayer", "15/12"), ponela en fecha_venc.
 - ingreso: vendió cereal. cultivo (soja/maiz/trigo/girasol/sorgo), toneladas, precio_tn_usd, \
 comprador (si menciona), campo_id si lo indica.
@@ -3980,7 +3987,7 @@ async def kapso_webhook(request: Request):
     mensajes = kapso.parsear_entrantes(body)
     print(f"[KAPSO←] evento={evento} mensajes={len(mensajes)}")
     for m in mensajes:
-        print(f"[KAPSO←] de={m.desde} tipo={m.tipo} texto={m.texto[:80]!r} accion={m.accion!r}")
+        print(f"[KAPSO←] de={m.desde} tipo={m.tipo} texto={m.texto[:500]!r} accion={m.accion!r}")
         asyncio.create_task(_kapso_procesar(m))
 
     return {"ok": True, "recibidos": len(mensajes)}
