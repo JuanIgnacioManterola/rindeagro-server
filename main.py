@@ -3223,6 +3223,11 @@ ESQUEMA_INTENCION = {
         "tipo_insumo":     {"type": ["string", "null"]},
         "cantidad":        {"type": ["number", "null"]},
         "unidad":          {"type": ["string", "null"]},
+        # Precio unitario para gasto/insumo: si lo da suelto ("a $5 el litro")
+        # calculamos el total en el servidor con cantidad × precio_unit, así no
+        # dejamos la multiplicación a Claude (se equivocaba con los decimales).
+        "precio_unit_usd": {"type": ["number", "null"]},
+        "precio_unit_ars": {"type": ["number", "null"]},
         # Tarea nueva
         "titulo_tarea":    {"type": ["string", "null"]},
         "prioridad":       {"type": ["string", "null"]},
@@ -3235,6 +3240,7 @@ ESQUEMA_INTENCION = {
                  "cultivo", "toneladas", "precio_tn_usd", "comprador",
                  "tipo_pago", "beneficiario", "fecha_venc",
                  "tipo_insumo", "cantidad", "unidad",
+                 "precio_unit_usd", "precio_unit_ars",
                  "titulo_tarea", "prioridad", "fecha_siembra",
                  "confianza"],
     "additionalProperties": False,
@@ -3251,10 +3257,18 @@ Acciones:
 - iniciar_tarea: dice que arrancó o está haciendo algo.
 - nota_tarea: quiere dejar un comentario sobre una tarea sin darla por terminada.
 - ver_tareas: pregunta qué tiene pendiente.
-- gasto: compró o pagó algo del campo. monto_usd en dólares, rubro entre herbicidas, fungicidas, \
+- gasto: compró o pagó algo del campo. rubro entre herbicidas, fungicidas, \
 insecticidas, fertilizantes, semillas, laboreo, flete, empleados, arrendamiento, riego, otros. \
-descripcion es el producto. Si menciona cantidad y unidad ("30 litros de glifosato"), ponelas en \
-cantidad y unidad.
+descripcion es el NOMBRE del producto específico, nunca el rubro genérico: si dice "glifosato" la \
+descripcion es "Glifosato", no "Herbicida". Si menciona cantidad y unidad ("30 litros") ponelas \
+en cantidad y unidad (unidad entre litros/kg/bolsas/dosis/unidades). Precios: si da un total \
+("gasté 150 dólares"), ponelo en monto_usd; si da precio por unidad ("a $5 el litro", "$200 \
+la bolsa") ponelo en precio_unit_usd y dejá monto_usd en null — el sistema calcula el total \
+con cantidad × precio_unit. Mismo criterio con pesos: monto_ars para el total, precio_unit_ars \
+para el unitario.
+Ejemplo clave: "cargar un gasto de 30 litros de glifosato en Arlicher a $5 por litro" → \
+rubro=herbicidas, descripcion="Glifosato", cantidad=30, unidad="litros", precio_unit_usd=5, \
+monto_usd=null (lo calcula el sistema: 30 × 5 = 150 USD), campo_id=<id de Arlicher>.
 - lluvia: llovió. mm es la cantidad. Si menciona fecha ("ayer", "15/12"), ponela en fecha_venc.
 - ingreso: vendió cereal. cultivo (soja/maiz/trigo/girasol/sorgo), toneladas, precio_tn_usd, \
 comprador (si menciona), campo_id si lo indica.
@@ -3413,20 +3427,51 @@ async def _kapso_aplicar_intencion(ident: dict, numero: str, intencion: dict) ->
             float(intencion["mm"]))
         return True
 
+    # Si el audio dice "30 litros de glifosato a $5 el litro" Claude manda
+    # cantidad+unidad+precio_unit y monto_usd=null: el total lo calculamos acá
+    # para no dejarle la multiplicación. Por eso aceptamos gasto también cuando
+    # viene precio_unit (no sólo cuando viene monto).
     if accion == "gasto" and (intencion.get("monto_usd") is not None
-                              or intencion.get("monto_ars") is not None):
+                              or intencion.get("monto_ars") is not None
+                              or intencion.get("precio_unit_usd") is not None
+                              or intencion.get("precio_unit_ars") is not None):
         if not _wa_puede(ident, "gastos", "editar"):
             return False
         descripcion = intencion.get("descripcion") or ""
-        if intencion.get("monto_usd") is not None:
-            usd = float(intencion["monto_usd"])
-        else:
-            # En pesos: lo pasamos a dólares con el BNA vendedor del día, el
-            # mismo que usa la web para los egresos, y lo dejamos anotado.
-            ars = float(intencion["monto_ars"])
+        cantidad = intencion.get("cantidad")
+        unidad = (intencion.get("unidad") or "").strip()
+        # Descripción con cantidad+unidad al final: "Glifosato (30 litros)".
+        # Útil en el historial para que no quede "Glifosato" a secas.
+        if cantidad is not None and unidad and descripcion:
+            try:
+                descripcion = f"{descripcion} ({_num(float(cantidad))} {unidad})"
+            except (TypeError, ValueError):
+                pass
+
+        monto_usd = intencion.get("monto_usd")
+        monto_ars = intencion.get("monto_ars")
+        p_unit_usd = intencion.get("precio_unit_usd")
+        p_unit_ars = intencion.get("precio_unit_ars")
+
+        if monto_usd is not None:
+            usd = float(monto_usd)
+        elif monto_ars is not None:
+            ars = float(monto_ars)
             tc = await _dolar_venta()
             usd = round(ars / tc, 2)
             descripcion = (f"{descripcion} (ARS {_miles(ars)} al BNA ${_miles(tc)})").strip()
+        elif p_unit_usd is not None and cantidad is not None:
+            usd = round(float(p_unit_usd) * float(cantidad), 2)
+        elif p_unit_ars is not None and cantidad is not None:
+            ars = round(float(p_unit_ars) * float(cantidad), 2)
+            tc = await _dolar_venta()
+            usd = round(ars / tc, 2)
+            descripcion = (f"{descripcion} (ARS {_miles(ars)} al BNA ${_miles(tc)})").strip()
+        else:
+            # Precio unitario sin cantidad: no alcanza para calcular el total,
+            # pedimos los datos que faltan por el flujo guiado.
+            return False
+
         datos = {"gasto": {
             "rubro": (intencion.get("rubro") or "Otros").capitalize(),
             "descripcion": descripcion,
@@ -3714,6 +3759,16 @@ async def _kapso_procesar(m) -> None:
             await _kapso_ver_resumen(ident, numero)
         else:
             await _kapso_menu(ident, numero)
+        return
+
+    # Botones de plantilla (tipo "button") → menú completo, no atajo.
+    # Meta sólo deja 3 botones por plantilla, así que los que vienen del
+    # recordatorio diario (Cargar gasto / Registrar lluvia / Ver tareas) no
+    # cubren las 6 opciones del bot. El user pidió que al tocarlos vea el
+    # menú entero, no que vaya directo al flujo recortado.
+    if m.tipo == "button" and accion in ("gasto", "lluvia", "tareas"):
+        await _wa_clear_conv(numero)
+        await _kapso_menu(ident, numero)
         return
 
     # Botones y listas que valen en cualquier momento
