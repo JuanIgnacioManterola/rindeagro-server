@@ -1273,7 +1273,9 @@ async def _kapso_guardar_insumo(ident: dict, numero: str, datos: dict) -> None:
     if ins.get("ubicacion"):
         partes.append(f"📍 {ins['ubicacion']}")
     if ins.get("costo_unitario"):
-        partes.append(f"💰 USD {_num(ins['costo_unitario'])} por {unidad[:-1] if unidad.endswith('s') else unidad}")
+        unidad_sing = {"litros": "litro", "kg": "kg", "dosis": "dosis",
+                       "bolsas": "bolsa", "unidades": "unidad"}.get(unidad, unidad)
+        partes.append(f"💰 USD {_num(ins['costo_unitario'])} por {unidad_sing}")
     if ins.get("notas"):
         partes.append(f"📝 _{ins['notas']}_")
     await kapso.enviar_texto(numero, "\n".join(partes))
@@ -1291,6 +1293,14 @@ async def _kapso_tarea_nueva_guiado(ident: dict, numero: str) -> None:
 
 
 PRIORIDADES_TAREA = [("alta", "🔴 Alta"), ("media", "🟡 Media"), ("baja", "🟢 Baja")]
+
+
+async def _kapso_set_prioridad_tarea(ident: dict, numero: str, datos: dict) -> None:
+    """Pide elegir prioridad de la tarea (lista con las 3 opciones)."""
+    await _wa_set_conv(numero, "k_tar_prioridad", datos)
+    filas = [(f"tar_prio:{k}", v) for k, v in PRIORIDADES_TAREA]
+    await kapso.enviar_lista(
+        numero, "¿Qué prioridad tiene?", "Elegir prioridad", filas, "Prioridad")
 
 
 async def _wa_equipo_del_user(owner_id: str, limite: int = 9) -> list:
@@ -2522,7 +2532,8 @@ async def _kapso_flujo(ident: dict, numero: str, m, conv: dict) -> None:
             datos.setdefault("insumo", {})["ubicacion"] = texto.strip()[:100]
         await _wa_set_conv(numero, "k_ins_costo", datos)
         unidad = datos.get("insumo", {}).get("unidad", "unidad")
-        unidad_singular = unidad[:-1] if unidad.endswith("s") else unidad
+        unidad_singular = {"litros": "litro", "kg": "kg", "dosis": "dosis",
+                           "bolsas": "bolsa", "unidades": "unidad"}.get(unidad, unidad)
         await kapso.enviar_texto(
             numero,
             f"¿Cuánto cuesta por {unidad_singular}? (ej: _USD 3.5_ por litro, o escribí _sin costo_)")
@@ -2577,15 +2588,16 @@ async def _kapso_flujo(ident: dict, numero: str, m, conv: dict) -> None:
                     numero, "No entendí la fecha. Escribí _mañana_, _15/12_, _próxima semana_, o _sin fecha_.")
                 return
             datos.setdefault("tarea_nueva", {})["fecha"] = fecha
-        # Pedir campo (opcional)
+        # Pedir campo (opcional) → después prioridad y asignado SIEMPRE.
         campos = ident.get("campos") or []
         if not campos:
-            await _kapso_guardar_tarea_nueva(ident, numero, datos)
+            # Sin campos → salta a prioridad directo
+            await _kapso_set_prioridad_tarea(ident, numero, datos)
             return
         if len(campos) == 1:
             datos["tarea_nueva"]["campo_id"] = campos[0]["id"]
             datos["tarea_nueva"]["campo_nombre"] = campos[0]["nombre"]
-            await _kapso_guardar_tarea_nueva(ident, numero, datos)
+            await _kapso_set_prioridad_tarea(ident, numero, datos)
             return
         await _wa_set_conv(numero, "k_tar_campo", datos)
         filas = []
@@ -2611,11 +2623,7 @@ async def _kapso_flujo(ident: dict, numero: str, m, conv: dict) -> None:
                 if campo:
                     datos["tarea_nueva"]["campo_id"] = campo["id"]
                     datos["tarea_nueva"]["campo_nombre"] = campo["nombre"]
-        await _wa_set_conv(numero, "k_tar_prioridad", datos)
-        filas = [(f"tar_prio:{k}", v) for k, v in PRIORIDADES_TAREA]
-        filas.append(("tar_prio:media", "Dejarla en media por default"))
-        await kapso.enviar_lista(
-            numero, "¿Qué prioridad tiene?", "Elegir prioridad", filas[:6], "Prioridad")
+        await _kapso_set_prioridad_tarea(ident, numero, datos)
         return
 
     if estado == "k_tar_prioridad":
