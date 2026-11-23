@@ -4,9 +4,17 @@ import httpx
 import asyncio
 from datetime import datetime, date, timedelta
 import os
+import sys
 import json
 import re
 import time
+
+# Forzar flush en todos los print() así los logs llegan a Railway de inmediato,
+# en vez de quedarse en el buffer de stdout (que Railway muestra con mucho delay).
+_PRINT_ORIGINAL = print
+def print(*args, **kwargs):  # noqa: A001
+    kwargs.setdefault("flush", True)
+    _PRINT_ORIGINAL(*args, **kwargs)
 from bs4 import BeautifulSoup
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -3560,25 +3568,38 @@ def _contexto_para_claude(ident: dict, tareas: list, tarea_activa: dict = None) 
 
 
 async def _llamar_claude(cliente, messages: list, effort: str = "high") -> dict | None:
-    """Una llamada a Claude con el schema de intención. Devuelve el JSON parseado."""
-    r = await cliente.messages.create(
-        model=MODELO_CLAUDE,
-        max_tokens=4000,
-        system=INSTRUCCIONES_CLAUDE,
-        messages=messages,
-        output_config={
-            "effort": effort,
-            "format": {"type": "json_schema", "schema": ESQUEMA_INTENCION},
-        },
-    )
-    crudo = next((b.text for b in r.content if b.type == "text"), "")
-    if not crudo:
-        return None
-    try:
-        return json.loads(crudo)
-    except json.JSONDecodeError:
-        print(f"[CLAUDE] JSON inválido: {crudo[:300]!r}")
-        return None
+    """Una llamada a Claude con el schema de intención. Devuelve el JSON parseado.
+    Si el modelo preferido falla, cae a claude-opus-5 como respaldo."""
+    modelos_a_probar = [MODELO_CLAUDE]
+    if MODELO_CLAUDE != "claude-opus-5":
+        modelos_a_probar.append("claude-opus-5")
+
+    for modelo in modelos_a_probar:
+        try:
+            print(f"[CLAUDE] llamando modelo={modelo} effort={effort}")
+            r = await cliente.messages.create(
+                model=modelo,
+                max_tokens=4000,
+                system=INSTRUCCIONES_CLAUDE,
+                messages=messages,
+                output_config={
+                    "effort": effort,
+                    "format": {"type": "json_schema", "schema": ESQUEMA_INTENCION},
+                },
+            )
+            crudo = next((b.text for b in r.content if b.type == "text"), "")
+            if not crudo:
+                print(f"[CLAUDE] modelo={modelo} devolvió vacío, próximo")
+                continue
+            try:
+                return json.loads(crudo)
+            except json.JSONDecodeError:
+                print(f"[CLAUDE] modelo={modelo} JSON inválido: {crudo[:300]!r}")
+                continue
+        except Exception as e:
+            print(f"[CLAUDE] modelo={modelo} falló: {type(e).__name__}: {e}")
+            continue
+    return None
 
 
 async def _interpretar_con_claude(texto: str, ident: dict, tareas: list,
@@ -3908,8 +3929,33 @@ async def _kapso_aplicar_intencion(ident: dict, numero: str, intencion: dict,
                          or intencion.get("monto_ars") is not None
                          or intencion.get("precio_unit_usd") is not None
                          or intencion.get("precio_unit_ars") is not None)
+    insumos_nombrados = _contar_insumos_mencionados(intencion.get("_texto_crudo") or "")
     print(f"[WA GASTO DBG] accion={accion} items_len={len(items)} "
-          f"tiene_item_arriba={tiene_item_arriba} campo_id_claude={intencion.get('campo_id')!r}")
+          f"tiene_item_arriba={tiene_item_arriba} insumos_en_texto={insumos_nombrados} "
+          f"campo_id_claude={intencion.get('campo_id')!r}")
+
+    # FAIL-SAFE: si el texto nombra 2+ insumos distintos (típico pulverización
+    # con varios químicos) pero Claude devolvió menos items en el array, NO
+    # guardamos nada. Preferimos un mensaje claro al user "no pude leer todos"
+    # antes que un gasto solo con el primer producto (caso real del 2026-11-23).
+    if (accion == "gasto" and insumos_nombrados >= 2
+            and len(items) < insumos_nombrados):
+        print(f"[WA GASTO FAILSAFE] texto menciona {insumos_nombrados} insumos "
+              f"pero Claude devolvió {len(items)} items. Aviso al user y no guardo.")
+        await _wa_clear_conv(numero)
+        texto_err = (
+            f"🎤 Entendí que es una *pulverización* pero no pude leer bien los "
+            f"{insumos_nombrados} productos del audio.\n\n"
+            "Probá de una de estas formas:\n\n"
+            "🅰️ Mandame un audio *más corto por producto*. Ejemplo:\n"
+            "_Glifosato, 3 litros por hectárea, 2 dólares el litro._\n\n"
+            "🅱️ O cargá cada uno por texto, uno por uno, con este formato:\n"
+            "_cargar gasto de 50 litros de atrazina en La Escondida a 7 dólares el litro_\n\n"
+            "Ya podés arrancar con el primero cuando quieras. 👍"
+        )
+        await kapso.enviar_texto(numero, texto_err)
+        return True
+
     if accion == "gasto" and (items or tiene_item_arriba):
         if not _wa_puede(ident, "gastos", "editar"):
             return False
