@@ -466,22 +466,20 @@ async def _kapso_menu(ident: dict, numero: str, encabezado: str = "") -> None:
 
     campo_demo = ((ident.get("campos") or [{}])[0].get("nombre") or "La Loma")
 
-    # 6 opciones de carga visibles directo en el texto del saludo (sin clicks
-    # para ver la lista). WhatsApp solo deja 3 botones, así que los 3 más usados
-    # van como botones de atajo abajo; el resto se eligen respondiendo el número.
-    numeradas = []
-    if _wa_puede(ident, "gastos", "editar"):
-        numeradas.append(("gasto", "💵 Gasto"))
-    if _wa_puede(ident, "lluvias", "editar"):
-        numeradas.append(("lluvia", "🌧️ Lluvia"))
-    if _wa_puede(ident, "insumos", "editar"):
-        numeradas.append(("insumo", "📦 Insumo (stock)"))
-    if _wa_puede(ident, "tareas", "editar"):
-        numeradas.append(("tarea_nueva", "📝 Tarea"))
-    if _wa_puede(ident, "ingresos", "editar"):
-        numeradas.append(("ingreso", "💰 Ingreso (venta)"))
-    if _wa_puede(ident, "compromisos_pago", "editar"):
-        numeradas.append(("pago", "🧾 Pago (cheque/cuota)"))
+    # 6 opciones numeradas, visibles directo en el texto. Sin botones — el user
+    # pidió texto puro para evitar la mezcla "botones + número" que confundía.
+    # Orden definido por el user (nov/2026): ingreso, gasto, insumo, pago,
+    # tarea, lluvia. Si algún permiso falta, esa opción se saltea y la
+    # numeración se corre.
+    todas = [
+        ("ingreso", "💰 Ingreso (venta)", "ingresos", "editar"),
+        ("gasto", "💵 Gasto", "gastos", "editar"),
+        ("insumo", "📦 Insumo (stock)", "insumos", "editar"),
+        ("pago", "🧾 Pago (cheque/cuota)", "compromisos_pago", "editar"),
+        ("tarea_nueva", "📝 Tarea", "tareas", "editar"),
+        ("lluvia", "🌧️ Lluvia", "lluvias", "editar"),
+    ]
+    numeradas = [(a, t) for a, t, mod, niv in todas if _wa_puede(ident, mod, niv)]
 
     if not numeradas:
         await kapso.enviar_texto(
@@ -501,9 +499,7 @@ async def _kapso_menu(ident: dict, numero: str, encabezado: str = "") -> None:
         f"_llovieron 25 mm en {campo_demo}_, o mandame la *foto de una factura*."
     )
 
-    # 3 botones de atajo (los más usados en campaña).
-    botones = [(a, t) for a, t in numeradas[:3]]
-    await kapso.enviar_botones(numero, cuerpo, botones)
+    await kapso.enviar_texto(numero, cuerpo)
 
 
 # ── Tareas ────────────────────────────────────
@@ -2480,19 +2476,17 @@ async def _kapso_procesar(m) -> None:
         for i, emj in enumerate(["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣"], 1):
             n_num = n_num.replace(emj, str(i))
         if n_num in ("1", "2", "3", "4", "5", "6"):
-            opciones = []
-            if _wa_puede(ident, "gastos", "editar"):
-                opciones.append("gasto")
-            if _wa_puede(ident, "lluvias", "editar"):
-                opciones.append("lluvia")
-            if _wa_puede(ident, "insumos", "editar"):
-                opciones.append("insumo")
-            if _wa_puede(ident, "tareas", "editar"):
-                opciones.append("tarea_nueva")
-            if _wa_puede(ident, "ingresos", "editar"):
-                opciones.append("ingreso")
-            if _wa_puede(ident, "compromisos_pago", "editar"):
-                opciones.append("pago")
+            # MISMO orden que _kapso_menu: ingreso, gasto, insumo, pago, tarea, lluvia.
+            # Si el orden de allá cambia, hay que mover éste a la par.
+            orden = [
+                ("ingreso", "ingresos", "editar"),
+                ("gasto", "gastos", "editar"),
+                ("insumo", "insumos", "editar"),
+                ("pago", "compromisos_pago", "editar"),
+                ("tarea_nueva", "tareas", "editar"),
+                ("lluvia", "lluvias", "editar"),
+            ]
+            opciones = [a for a, mod, niv in orden if _wa_puede(ident, mod, niv)]
             idx = int(n_num) - 1
             if 0 <= idx < len(opciones):
                 elegida = opciones[idx]
