@@ -465,42 +465,45 @@ async def _kapso_menu(ident: dict, numero: str, encabezado: str = "") -> None:
                             else f"{_wa_saludo_hora()} 🌾")
 
     campo_demo = ((ident.get("campos") or [{}])[0].get("nombre") or "La Loma")
+
+    # 6 opciones de carga visibles directo en el texto del saludo (sin clicks
+    # para ver la lista). WhatsApp solo deja 3 botones, así que los 3 más usados
+    # van como botones de atajo abajo; el resto se eligen respondiendo el número.
+    numeradas = []
+    if _wa_puede(ident, "gastos", "editar"):
+        numeradas.append(("gasto", "💵 Gasto"))
+    if _wa_puede(ident, "lluvias", "editar"):
+        numeradas.append(("lluvia", "🌧️ Lluvia"))
+    if _wa_puede(ident, "insumos", "editar"):
+        numeradas.append(("insumo", "📦 Insumo (stock)"))
+    if _wa_puede(ident, "tareas", "editar"):
+        numeradas.append(("tarea_nueva", "📝 Tarea"))
+    if _wa_puede(ident, "ingresos", "editar"):
+        numeradas.append(("ingreso", "💰 Ingreso (venta)"))
+    if _wa_puede(ident, "compromisos_pago", "editar"):
+        numeradas.append(("pago", "🧾 Pago (cheque/cuota)"))
+
+    if not numeradas:
+        await kapso.enviar_texto(
+            numero,
+            f"{saludo}\n\nTu usuario todavía no tiene permisos para cargar datos.",
+        )
+        return
+
+    emoji_num = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣"]
+    lineas_num = [f"{emoji_num[i]} {titulo}" for i, (_a, titulo) in enumerate(numeradas)]
+
     cuerpo = (
         f"{saludo}\n\n"
         "¿Qué querés cargar?\n\n"
-        f"También podés escribirme como le hablarías a alguien, por ejemplo "
-        f"_llovieron 25 mm en {campo_demo}_, o mandarme la *foto de una factura*."
+        + "\n".join(lineas_num) +
+        "\n\nRespondé con el número o escribime directo, por ejemplo "
+        f"_llovieron 25 mm en {campo_demo}_, o mandame la *foto de una factura*."
     )
 
-    # Las acciones del menú van en una lista desplegable: 3 botones no alcanzan
-    # para las 6 formas de carga (gasto, lluvia, insumo, tarea, ingreso, pago) +
-    # ver tareas. El orden es por frecuencia de uso en campaña.
-    filas = []
-    if _wa_puede(ident, "gastos", "editar"):
-        filas.append(("gasto", "💵 Cargar gasto", "Insumos, flete, laboreo"))
-    if _wa_puede(ident, "lluvias", "editar"):
-        filas.append(("lluvia", "🌧️ Registrar lluvia", "mm en un campo"))
-    if _wa_puede(ident, "insumos", "editar"):
-        filas.append(("insumo", "📦 Cargar insumo", "Sumar al stock"))
-    if _wa_puede(ident, "tareas", "editar"):
-        filas.append(("tarea_nueva", "📝 Cargar tarea", "Pendiente nueva"))
-    if _wa_puede(ident, "ingresos", "editar"):
-        filas.append(("ingreso", "💰 Cargar ingreso", "Venta de cultivo"))
-    if _wa_puede(ident, "compromisos_pago", "editar"):
-        filas.append(("pago", "🧾 Cargar pago", "Cheque o cuota"))
-    # Ver tareas siempre al final — la acción de carga va arriba, la consulta abajo.
-    if _wa_puede(ident, "tareas"):
-        tareas_pend = await _wa_tareas_pendientes(ident)
-        n = len(tareas_pend)
-        titulo = "📋 Mis tareas" + (f" ({n if n < 10 else '10+'})" if tareas_pend else "")
-        filas.append(("tareas", titulo, "Ver y completar"))
-
-    if not filas:
-        await kapso.enviar_texto(numero, cuerpo +
-                                 "\n\nTu usuario todavía no tiene permisos para cargar datos.")
-        return
-
-    await kapso.enviar_lista(numero, cuerpo, "Ver opciones", filas, "Qué cargar hoy")
+    # 3 botones de atajo (los más usados en campaña).
+    botones = [(a, t) for a, t in numeradas[:3]]
+    await kapso.enviar_botones(numero, cuerpo, botones)
 
 
 # ── Tareas ────────────────────────────────────
@@ -2467,6 +2470,46 @@ async def _kapso_procesar(m) -> None:
     if conv:
         await _kapso_flujo(ident, numero, m, conv)
         return
+
+    # "1".."6" (con o sin emoji) → ejecutan la acción del menú correspondiente,
+    # pero solo cuando NO hay conv activa: si estás esperando "¿cuántos mm?",
+    # "5" es un valor para el flujo, no una elección del menú. El orden es el
+    # mismo que _kapso_menu respeta por permisos.
+    if texto:
+        n_num = _norm(texto).strip()
+        for i, emj in enumerate(["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣"], 1):
+            n_num = n_num.replace(emj, str(i))
+        if n_num in ("1", "2", "3", "4", "5", "6"):
+            opciones = []
+            if _wa_puede(ident, "gastos", "editar"):
+                opciones.append("gasto")
+            if _wa_puede(ident, "lluvias", "editar"):
+                opciones.append("lluvia")
+            if _wa_puede(ident, "insumos", "editar"):
+                opciones.append("insumo")
+            if _wa_puede(ident, "tareas", "editar"):
+                opciones.append("tarea_nueva")
+            if _wa_puede(ident, "ingresos", "editar"):
+                opciones.append("ingreso")
+            if _wa_puede(ident, "compromisos_pago", "editar"):
+                opciones.append("pago")
+            idx = int(n_num) - 1
+            if 0 <= idx < len(opciones):
+                elegida = opciones[idx]
+                if elegida == "gasto":
+                    await _kapso_gasto_guiado(ident, numero)
+                elif elegida == "lluvia":
+                    await _wa_set_conv(numero, "k_lluvia_mm", {})
+                    await kapso.enviar_texto(numero, "¿Cuántos mm?")
+                elif elegida == "insumo":
+                    await _kapso_insumo_guiado(ident, numero)
+                elif elegida == "tarea_nueva":
+                    await _kapso_tarea_nueva_guiado(ident, numero)
+                elif elegida == "ingreso":
+                    await _kapso_ingreso_guiado(ident, numero)
+                elif elegida == "pago":
+                    await _kapso_pago_guiado(ident, numero)
+                return
 
     if m.compartido_numero:
         await kapso.enviar_texto(numero, "Para sumar a alguien al equipo escribime *invitar* y su nombre.")
