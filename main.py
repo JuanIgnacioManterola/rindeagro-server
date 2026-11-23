@@ -1902,7 +1902,7 @@ async def _kapso_texto_libre(ident: dict, numero: str, texto: str,
     if os.environ.get("ANTHROPIC_API_KEY"):
         tareas = await _wa_tareas_pendientes(ident)
         intencion_claude = await _interpretar_con_claude(texto, ident, tareas, tarea_activa)
-        if intencion_claude and await _kapso_aplicar_intencion(ident, numero, intencion_claude):
+        if intencion_claude and await _kapso_aplicar_intencion(ident, numero, intencion_claude, texto):
             return
 
     # Si Claude entendió el tipo de carga pero no pudo cerrarlo (p. ej. faltó un
@@ -2140,6 +2140,24 @@ async def _kapso_flujo(ident: dict, numero: str, m, conv: dict) -> None:
             etapa=datos.get("etapa"),
             observacion=obs,
         )
+        return
+
+    if estado == "k_gasto_multi_campo":
+        # El user volvió con el campo elegido; retomamos el multi-producto.
+        campo = None
+        if accion.startswith("campo:"):
+            cid = accion.split(":", 1)[1]
+            campo = next((c for c in ident.get("campos", []) if c["id"] == cid), None)
+        if not campo:
+            campo = _buscar_campo(texto, ident.get("campos") or [])
+        if not campo:
+            await kapso.enviar_texto(numero, "No reconocí ese campo. Tocá uno de la lista de arriba.")
+            return
+        intencion = datos.get("intencion_pendiente") or {}
+        intencion["campo_id"] = campo["id"]
+        await _wa_clear_conv(numero)
+        await _kapso_aplicar_intencion(ident, numero, intencion,
+                                       intencion.get("_texto_crudo") or "")
         return
 
     if estado in ("k_gasto_campo", "k_lluvia_campo"):
@@ -3241,6 +3259,35 @@ ESQUEMA_INTENCION = {
         # dejamos la multiplicación a Claude (se equivocaba con los decimales).
         "precio_unit_usd": {"type": ["number", "null"]},
         "precio_unit_ars": {"type": ["number", "null"]},
+        # Dosis "por hectárea": si el audio dice "3 L/ha" la cantidad total se
+        # calcula en el servidor como cantidad × hectareas del campo.
+        "por_hectarea":    {"type": ["boolean", "null"]},
+        # Audio que enumera varios productos en un solo mensaje ("glifosato
+        # 3 L/ha, atrazina 2 L/ha, aceite 5 L total"): cada producto va como
+        # un item en este array. El nivel de arriba (rubro/descripcion/
+        # monto/cantidad/unidad) queda null y usamos items. El campo_id y
+        # fecha del nivel de arriba se aplican a todos los items.
+        "items": {
+            "type": ["array", "null"],
+            "items": {
+                "type": "object",
+                "properties": {
+                    "rubro":           {"type": ["string", "null"]},
+                    "descripcion":     {"type": ["string", "null"]},
+                    "cantidad":        {"type": ["number", "null"]},
+                    "unidad":          {"type": ["string", "null"]},
+                    "precio_unit_usd": {"type": ["number", "null"]},
+                    "precio_unit_ars": {"type": ["number", "null"]},
+                    "monto_usd":       {"type": ["number", "null"]},
+                    "monto_ars":       {"type": ["number", "null"]},
+                    "por_hectarea":    {"type": ["boolean", "null"]},
+                },
+                "required": ["rubro", "descripcion", "cantidad", "unidad",
+                             "precio_unit_usd", "precio_unit_ars",
+                             "monto_usd", "monto_ars", "por_hectarea"],
+                "additionalProperties": False,
+            },
+        },
         # Tarea nueva
         "titulo_tarea":    {"type": ["string", "null"]},
         "prioridad":       {"type": ["string", "null"]},
@@ -3253,7 +3300,7 @@ ESQUEMA_INTENCION = {
                  "cultivo", "toneladas", "precio_tn_usd", "comprador",
                  "tipo_pago", "beneficiario", "fecha_venc",
                  "tipo_insumo", "cantidad", "unidad",
-                 "precio_unit_usd", "precio_unit_ars",
+                 "precio_unit_usd", "precio_unit_ars", "por_hectarea", "items",
                  "titulo_tarea", "prioridad", "fecha_siembra",
                  "confianza"],
     "additionalProperties": False,
@@ -3279,16 +3326,47 @@ en cantidad y unidad (unidad entre litros/kg/bolsas/dosis/unidades). Precios: si
 la bolsa") ponelo en precio_unit_usd y dejá monto_usd en null — el sistema calcula el total \
 con cantidad × precio_unit. Mismo criterio con pesos: monto_ars para el total, precio_unit_ars \
 para el unitario.
-Ejemplo clave: "cargar un gasto de 30 litros de glifosato en Arlicher a $5 por litro" → \
-rubro=herbicidas, descripcion="Glifosato", cantidad=30, unidad="litros", precio_unit_usd=5, \
-monto_usd=null (lo calcula el sistema: 30 × 5 = 150 USD), campo_id=<id de Arlicher>.
+
+Dosis por hectárea: si dice "3 litros por hectárea" o "3 L/ha", poné cantidad=3, unidad="litros" \
+Y por_hectarea=true. El servidor multiplica por las hectáreas del campo para obtener la cantidad \
+total aplicada y el total en plata. "en total" o "en todo el campo" significan lo contrario: la \
+cantidad es absoluta, por_hectarea=false (o null).
+
+Varios productos en un solo mensaje: si el audio enumera dos o más insumos en la misma oración \
+(típico de una pulverización: "glifosato + atrazina + aceite"), devolvé TODOS en el array items. \
+Cada item lleva su propio rubro, descripcion, cantidad, unidad, precio y por_hectarea. En ese \
+caso, al NIVEL DE ARRIBA dejá rubro, descripcion, cantidad, unidad, precio_unit_usd, monto_usd \
+TODOS en null — sólo campo_id y fecha arriba se aplican a todos los items.
+
+Ejemplo clave 1 (un solo producto): "cargar un gasto de 30 litros de glifosato en Arlicher a $5 \
+por litro" → rubro=herbicidas, descripcion="Glifosato", cantidad=30, unidad="litros", \
+precio_unit_usd=5, monto_usd=null, campo_id=<id de Arlicher>, items=null.
+
+Ejemplo clave 2 (por hectárea): "se aplicaron 3 litros de glifosato por hectárea a 3 dólares \
+el litro en La Escondida" → rubro=herbicidas, descripcion="Glifosato", cantidad=3, \
+unidad="litros", precio_unit_usd=3, por_hectarea=true, monto_usd=null, campo_id=<id La \
+Escondida>. (El sistema calcula: 3 L/ha × hectáreas del campo × 3 USD/L.)
+
+Ejemplo clave 3 (varios productos): "cargar gasto en escondida. Se aplicó 3 L de glifosato por \
+hectárea a 3 dólares el litro, 2 L de atrazina por hectárea a 1 dólar el litro, 5 L de aceite \
+en todo el campo a 2 dólares el litro" → accion=gasto, campo_id=<id La Escondida>, rubro/desc/ \
+cantidad/unidad/precio/monto TODOS NULL ARRIBA, items=[ \
+  {rubro:"herbicidas", descripcion:"Glifosato", cantidad:3, unidad:"litros", \
+   precio_unit_usd:3, por_hectarea:true}, \
+  {rubro:"herbicidas", descripcion:"Atrazina", cantidad:2, unidad:"litros", \
+   precio_unit_usd:1, por_hectarea:true}, \
+  {rubro:"otros", descripcion:"Aceite", cantidad:5, unidad:"litros", \
+   precio_unit_usd:2, por_hectarea:false}].
+
 Ojo con "en total": si dice "se aplicaron 30 litros en total" el 30 son LITROS (cantidad=30, \
 unidad=litros), NO son 30 dólares. "En total" ahí describe la cantidad aplicada, no el precio. \
 El total en plata siempre se identifica por la palabra "dólares", "pesos", "USD" o el símbolo \
-"\$", nunca por "en total" a secas.
-Otro ejemplo con "en total": "se aplicaron 30 litros de glifosato en total a 5 dólares el litro" \
-→ cantidad=30, unidad=litros, descripcion="Glifosato", precio_unit_usd=5, monto_usd=null (el \
-sistema calcula 150 USD).
+"\\$", nunca por "en total" a secas.
+
+Nombre del campo: el user dice el nombre del campo de forma suelta ("en escondida", "la loma", \
+"lo del silo"). Matchealo contra la lista de campos de abajo aunque no coincida palabra por \
+palabra: "escondida" = "La Escondida", "loma" = "La Loma Alta". Siempre devolvé campo_id si \
+hay un campo del user que parezca razonable; sólo dejalo null si no mencionó ningún campo.
 - lluvia: llovió. mm es la cantidad. Si menciona fecha ("ayer", "15/12"), ponela en fecha_venc.
 - ingreso: vendió cereal. cultivo (soja/maiz/trigo/girasol/sorgo), toneladas, precio_tn_usd, \
 comprador (si menciona), campo_id si lo indica.
@@ -3413,8 +3491,156 @@ async def _interpretar_con_claude(texto: str, ident: dict, tareas: list,
         return None
 
 
-async def _kapso_aplicar_intencion(ident: dict, numero: str, intencion: dict) -> bool:
+def _wa_resolver_campo_fuzzy(ident: dict, texto: str, campo_id_hint: str | None) -> dict | None:
+    """
+    Si Claude ya devolvió un campo_id válido lo devuelve. Si no, busca una
+    coincidencia aproximada en el texto contra la lista de campos del user: el
+    audio "cargar en escondida" tiene que mapear a "La Escondida".
+    """
+    campos = ident.get("campos") or []
+    if campo_id_hint:
+        for c in campos:
+            if c["id"] == campo_id_hint:
+                return c
+    norm = _norm_cultivo(texto)
+    # Match por token: cada palabra del nombre del campo (ignorando artículos)
+    # tiene que estar en el texto para considerarlo match. Esto deja "escondida"
+    # matchear "La Escondida" pero no un tag suelto que solo diga "la".
+    stop = {"la", "el", "los", "las", "lo", "de", "del"}
+    mejor = None
+    mejor_score = 0
+    for c in campos:
+        nombre = c.get("nombre") or ""
+        palabras = [p for p in _norm_cultivo(nombre).split() if p and p not in stop]
+        if not palabras:
+            continue
+        score = sum(1 for p in palabras if p in norm)
+        if score == len(palabras) and score > mejor_score:
+            mejor, mejor_score = c, score
+    return mejor
+
+
+async def _wa_armar_gasto(ident: dict, campo: dict | None, item: dict, tc_dolar: float) -> dict | None:
+    """
+    Aplica la lógica de cálculo de un gasto a partir de un dict con los campos
+    estándar (rubro, descripcion, cantidad, unidad, precio_unit_usd,
+    precio_unit_ars, monto_usd, monto_ars, por_hectarea). Devuelve el gasto
+    listo para `_kapso_guardar_gasto` (bajo "gasto") o None si no alcanza.
+    """
+    descripcion = (item.get("descripcion") or "").strip()
+    cantidad_raw = item.get("cantidad")
+    unidad = (item.get("unidad") or "").strip()
+    monto_usd = item.get("monto_usd")
+    monto_ars = item.get("monto_ars")
+    p_unit_usd = item.get("precio_unit_usd")
+    p_unit_ars = item.get("precio_unit_ars")
+    por_ha = bool(item.get("por_hectarea"))
+
+    cantidad = None if cantidad_raw is None else float(cantidad_raw)
+    hectareas = float((campo or {}).get("hectareas") or 0)
+
+    # Dosis por hectárea: multiplicamos por las has del campo. Si el campo no
+    # tiene hectáreas cargadas no podemos; devolvemos None para pedir el total.
+    cantidad_total = cantidad
+    if por_ha:
+        if not cantidad or hectareas <= 0:
+            return None
+        cantidad_total = cantidad * hectareas
+
+    usd = None
+    descripcion_extra = ""
+    if monto_usd is not None:
+        usd = float(monto_usd)
+    elif monto_ars is not None:
+        usd = round(float(monto_ars) / tc_dolar, 2)
+        descripcion_extra = f" (ARS {_miles(float(monto_ars))} al BNA ${_miles(tc_dolar)})"
+    elif p_unit_usd is not None and cantidad_total is not None:
+        usd = round(float(p_unit_usd) * cantidad_total, 2)
+    elif p_unit_ars is not None and cantidad_total is not None:
+        ars = round(float(p_unit_ars) * cantidad_total, 2)
+        usd = round(ars / tc_dolar, 2)
+        descripcion_extra = f" (ARS {_miles(ars)} al BNA ${_miles(tc_dolar)})"
+
+    if usd is None:
+        return None
+
+    # Descripción: "Glifosato (90 litros)" cuando sabemos la cantidad total, o
+    # "Glifosato (3 litros/ha × 30 ha)" cuando aplicamos por hectárea, así el
+    # resumen deja claro en qué queda el número.
+    desc_final = descripcion
+    if cantidad_total is not None and unidad:
+        if por_ha and hectareas > 0 and cantidad is not None:
+            desc_final = (f"{desc_final or 'Insumo'} ({_num(cantidad)} {unidad}/ha"
+                          f" × {_num(hectareas)} ha = {_num(cantidad_total)} {unidad})")
+        else:
+            desc_final = f"{desc_final or 'Insumo'} ({_num(cantidad_total)} {unidad})"
+    desc_final = (desc_final + descripcion_extra).strip()
+
+    gasto = {
+        "rubro": (item.get("rubro") or "Otros").strip().capitalize() or "Otros",
+        "descripcion": desc_final or "sin detalle",
+        "total_de_usd": usd,
+    }
+    if cantidad_total is not None:
+        gasto["cantidad"] = cantidad_total
+    if unidad:
+        gasto["unidad"] = unidad
+    if p_unit_usd is not None:
+        gasto["precio_unitario"] = float(p_unit_usd)
+    elif p_unit_ars is not None:
+        gasto["precio_unitario"] = round(float(p_unit_ars) / tc_dolar, 4)
+    return gasto
+
+
+async def _kapso_guardar_gasto_multi(ident: dict, numero: str, campo: dict, items_gasto: list[dict]) -> None:
+    """
+    Guarda N gastos de la IA en un solo golpe (multi-producto) y manda UN
+    mensaje resumen al final. Cada item ya viene con total_de_usd calculado.
+    """
+    campo_id = campo["id"]
+    campo_nombre = campo.get("nombre") or ""
+    hectareas = float(campo.get("hectareas") or 0)
+    hoy = datetime.now(AR_TZ).date().isoformat()
+
+    total_general = 0.0
+    lineas = []
+    for g in items_gasto:
+        payload = {
+            "campo_id": campo_id,
+            "usuario_id": ident["owner_id"],
+            "rubro": (g.get("rubro") or "otros").strip().lower(),
+            "fecha": hoy,
+            "total_de_usd": g.get("total_de_usd") or 0,
+            "descripcion": g.get("descripcion") or "",
+        }
+        for k in ("cantidad", "unidad", "precio_unitario"):
+            if g.get(k) is not None:
+                payload[k] = g[k]
+        if hectareas > 0 and payload["total_de_usd"]:
+            payload["usd_ha"] = round(float(payload["total_de_usd"]) / hectareas, 2)
+        await _sb_post("gastos", payload)
+        total_general += float(payload["total_de_usd"])
+        lineas.append(f"• *{payload['rubro'].capitalize()}* — {payload['descripcion']} · "
+                      f"USD {_num(payload['total_de_usd'])}")
+
+    await _wa_clear_conv(numero)
+    encabezado = (f"✅ Cargué {len(items_gasto)} gastos en *{campo_nombre}*\n"
+                  f"Total: USD {_num(round(total_general, 2))}\n")
+    if hectareas > 0:
+        encabezado += f"USD {_num(round(total_general / hectareas, 2))}/ha\n"
+    await kapso.enviar_botones(
+        numero,
+        encabezado + "\n" + "\n".join(lineas),
+        [("menu", "Cargar otra cosa")],
+    )
+
+
+async def _kapso_aplicar_intencion(ident: dict, numero: str, intencion: dict,
+                                   texto_crudo: str = "") -> bool:
     """Ejecuta lo que Claude entendió. Devuelve False si no se pudo hacer nada."""
+    # Lo guardamos en la intención para que helpers (p. ej. fuzzy match del
+    # campo) puedan consultarlo sin cambiarles la firma.
+    intencion["_texto_crudo"] = texto_crudo
     accion = intencion.get("accion") or "nada"
     if accion == "nada":
         return False
@@ -3478,88 +3704,86 @@ async def _kapso_aplicar_intencion(ident: dict, numero: str, intencion: dict) ->
             float(intencion["mm"]))
         return True
 
-    # Si el audio dice "30 litros de glifosato a $5 el litro" Claude manda
-    # cantidad+unidad+precio_unit y monto_usd=null: el total lo calculamos acá
-    # para no dejarle la multiplicación. Por eso aceptamos gasto también cuando
-    # viene precio_unit (no sólo cuando viene monto).
-    if accion == "gasto" and (intencion.get("monto_usd") is not None
-                              or intencion.get("monto_ars") is not None
-                              or intencion.get("precio_unit_usd") is not None
-                              or intencion.get("precio_unit_ars") is not None):
+    # Gasto desde texto libre. Dos formas:
+    #   1. Un solo producto: los datos vienen al nivel de arriba (rubro,
+    #      descripcion, cantidad, unidad, precio_unit, monto).
+    #   2. Varios productos (típico de un audio con una pulverización):
+    #      Claude los pone en items[]. El nivel de arriba queda null y acá
+    #      iteramos por cada item.
+    items = intencion.get("items") or []
+    tiene_item_arriba = (intencion.get("monto_usd") is not None
+                         or intencion.get("monto_ars") is not None
+                         or intencion.get("precio_unit_usd") is not None
+                         or intencion.get("precio_unit_ars") is not None)
+    if accion == "gasto" and (items or tiene_item_arriba):
         if not _wa_puede(ident, "gastos", "editar"):
             return False
-        descripcion = intencion.get("descripcion") or ""
-        cantidad = intencion.get("cantidad")
-        unidad = (intencion.get("unidad") or "").strip()
-        # Descripción con cantidad+unidad al final: "Glifosato (30 litros)".
-        # Útil en el historial para que no quede "Glifosato" a secas.
-        if cantidad is not None and unidad and descripcion:
-            try:
-                descripcion = f"{descripcion} ({_num(float(cantidad))} {unidad})"
-            except (TypeError, ValueError):
-                pass
 
-        monto_usd = intencion.get("monto_usd")
-        monto_ars = intencion.get("monto_ars")
-        p_unit_usd = intencion.get("precio_unit_usd")
-        p_unit_ars = intencion.get("precio_unit_ars")
+        campo = _wa_resolver_campo_fuzzy(ident, intencion.get("_texto_crudo") or "",
+                                        intencion.get("campo_id"))
+        tc_dolar = await _dolar_venta()
 
-        if monto_usd is not None:
-            usd = float(monto_usd)
-        elif monto_ars is not None:
-            ars = float(monto_ars)
-            tc = await _dolar_venta()
-            usd = round(ars / tc, 2)
-            descripcion = (f"{descripcion} (ARS {_miles(ars)} al BNA ${_miles(tc)})").strip()
-        elif p_unit_usd is not None and cantidad is not None:
-            usd = round(float(p_unit_usd) * float(cantidad), 2)
-        elif p_unit_ars is not None and cantidad is not None:
-            ars = round(float(p_unit_ars) * float(cantidad), 2)
-            tc = await _dolar_venta()
-            usd = round(ars / tc, 2)
-            descripcion = (f"{descripcion} (ARS {_miles(ars)} al BNA ${_miles(tc)})").strip()
-        else:
-            # Precio unitario sin cantidad: no alcanza para calcular el total,
-            # pedimos los datos que faltan por el flujo guiado.
+        # Lista final de items a procesar. Si no hay items[], tratamos el nivel
+        # de arriba como un item único.
+        lista_items = items if items else [{
+            "rubro": intencion.get("rubro"),
+            "descripcion": intencion.get("descripcion"),
+            "cantidad": intencion.get("cantidad"),
+            "unidad": intencion.get("unidad"),
+            "precio_unit_usd": intencion.get("precio_unit_usd"),
+            "precio_unit_ars": intencion.get("precio_unit_ars"),
+            "monto_usd": intencion.get("monto_usd"),
+            "monto_ars": intencion.get("monto_ars"),
+            "por_hectarea": intencion.get("por_hectarea"),
+        }]
+
+        # Si algún item es "por hectárea" necesitamos saber el campo antes de
+        # calcular. Si Claude no dio el campo y el fuzzy no lo encontró,
+        # arrancamos el guiado pidiéndolo.
+        necesita_campo = any(bool(it.get("por_hectarea")) for it in lista_items)
+        if campo is None and necesita_campo:
+            # Guardamos la intencion en el estado para seguir después
+            datos = {"intencion_pendiente": intencion}
+            if await _kapso_pedir_campo(ident, numero, "k_gasto_multi_campo", datos,
+                                        "¿En qué campo fue la aplicación?"):
+                return True
+            # _kapso_pedir_campo devolvió False → no había campos cargados,
+            # abortamos silencioso.
             return False
 
-        gasto = {
-            "rubro": (intencion.get("rubro") or "Otros").capitalize(),
-            "descripcion": descripcion,
-            "total_de_usd": usd,
-        }
-        # Paridad con la app: cantidad, unidad y precio unitario quedan como
-        # columnas propias del gasto, así los gráficos de insumos los ven.
-        if cantidad is not None:
-            gasto["cantidad"] = float(cantidad)
-        if unidad:
-            gasto["unidad"] = unidad
-        if p_unit_usd is not None:
-            gasto["precio_unitario"] = float(p_unit_usd)
-        elif p_unit_ars is not None:
-            # Guardamos el unitario en pesos pasado a USD para mantener el
-            # mismo criterio que el total (todo en USD en la base).
-            try:
-                tc_u = await _dolar_venta()
-                gasto["precio_unitario"] = round(float(p_unit_ars) / tc_u, 4)
-            except Exception:
-                pass
-        datos = {"gasto": gasto}
-        cid = intencion.get("campo_id")
-        if cid in ids_campos:
-            campo = next(c for c in ident["campos"] if c["id"] == cid)
-            datos["campo_id"] = campo["id"]
-            datos["campo_nombre"] = campo["nombre"]
-        else:
+        gastos_calculados = []
+        for it in lista_items:
+            g = await _wa_armar_gasto(ident, campo, it, tc_dolar)
+            if g is not None:
+                gastos_calculados.append(g)
+
+        if not gastos_calculados:
+            # Ni el nivel de arriba ni ningún item pudo calcular total. Caemos
+            # al menú guiado; no tiramos al legacy OpenAI.
+            print(f"[WA GASTO IA] no pude armar ningún gasto de la intencion")
+            return False
+
+        if campo is None:
+            # Sin campo todavía (y ningún item era por hectárea): guardamos
+            # el primer gasto y pedimos el campo con el flujo single-item
+            # existente, así no perdemos retrocompatibilidad.
+            datos = {"gasto": gastos_calculados[0]}
+            if len(gastos_calculados) > 1:
+                datos["gastos_extra"] = gastos_calculados[1:]
             datos["confirmar"] = True
-            if await _kapso_pedir_campo(ident, numero, "k_gasto_campo", datos, "¿A qué campo lo cargo?"):
+            if await _kapso_pedir_campo(ident, numero, "k_gasto_campo", datos,
+                                        "¿A qué campo lo cargo?"):
                 return True
 
-        print(f"[WA GASTO IA] rubro={gasto['rubro']} desc={gasto['descripcion']!r} "
-              f"total_usd={usd} cant={cantidad} unit={unidad} p_unit_usd={p_unit_usd} "
-              f"p_unit_ars={p_unit_ars} campo={datos.get('campo_nombre')!r}")
-        # Lo interpretó la IA: mostramos lo que entendimos antes de guardar.
-        await _kapso_confirmar_gasto(numero, datos)
+        print(f"[WA GASTO IA] campo={campo.get('nombre')!r} items={len(gastos_calculados)} "
+              f"totales={[g['total_de_usd'] for g in gastos_calculados]}")
+
+        if len(gastos_calculados) == 1:
+            datos = {"gasto": gastos_calculados[0],
+                     "campo_id": campo["id"], "campo_nombre": campo.get("nombre")}
+            await _kapso_confirmar_gasto(numero, datos)
+        else:
+            await _kapso_guardar_gasto_multi(ident, numero, campo, gastos_calculados)
         return True
 
     if accion == "invitar":
