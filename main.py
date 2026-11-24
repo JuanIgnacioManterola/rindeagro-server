@@ -1900,33 +1900,58 @@ async def _kapso_texto_libre(ident: dict, numero: str, texto: str,
         await _kapso_tareas(ident, numero)
         return
 
-    # Gasto dicho en criollo, sin IA: "gasté 1200 de urea en La Esperanza"
-    if _wa_puede(ident, "gastos", "editar"):
-        parseado = _parsear_gasto(texto, ident.get("campos") or [])
-        # Si no reconocimos el producto ("orea" en vez de urea, por la
-        # transcripción del audio) y hay IA, que decida Claude el rubro en vez
-        # de mandarlo derecho a "otros".
-        # Lo mismo con los pesos: Claude entiende "300, eh, 300 mil" o "300 lucas".
-        if parseado and os.environ.get("ANTHROPIC_API_KEY") and (
-                parseado.get("ars") or not _rubro_por_texto(texto)[1]):
-            parseado = None
-        if parseado and parseado.get("ars"):
-            ars = parseado["gasto"]["total_de_usd"]
-            tc = await _dolar_venta()
-            parseado["gasto"]["total_de_usd"] = round(ars / tc, 2)
-            parseado["gasto"]["descripcion"] = (
-                f"{parseado['gasto']['descripcion']} (ARS {_miles(ars)} al BNA ${_miles(tc)})")
-        if parseado:
-            datos = {"gasto": parseado["gasto"]}
-            campo = parseado.get("campo")
-            if campo:
-                datos["campo_id"] = campo["id"]
-                datos["campo_nombre"] = campo["nombre"]
-                await _kapso_guardar_gasto(ident, numero, datos)
-            elif not await _kapso_pedir_campo(ident, numero, "k_gasto_campo", datos,
-                                              "¿A qué campo lo cargo?"):
-                await _kapso_guardar_gasto(ident, numero, datos)
-            return
+    # Gasto dicho en criollo, SIN IA, SOLO si Claude no está disponible o el
+    # texto es muy corto y simple (p. ej. "gasté 100 de urea"). Si Claude está
+    # configurado y el texto tiene pinta de ser multi-producto o una venta,
+    # queremos que lo decida Claude.
+    #
+    # Caso real 2026-11-24: "Cargar gasto en la escondida. 3 litros de
+    # glifosato por hectárea, precio del glifosato 2 dólares por litro, cargar
+    # 0,5 litros de atrazina por hectárea precio del litro de atrazina 7,5 usd
+    # y 20 litros de aceite precio del aceite 12 usd" se parseaba como un
+    # gasto único de Herbicidas USD 2 porque _parsear_gasto encontró "gasto"+
+    # "glifosato"+"2 dólares" y guardaba SIN pasar por Claude.
+    saltear_parser = False
+    if os.environ.get("ANTHROPIC_API_KEY"):
+        # Texto largo (>80 chars): es muy probable que Claude entienda mejor.
+        if len(texto) > 80:
+            saltear_parser = True
+        # Más de un insumo nombrado: multi-producto obligatorio para Claude.
+        elif _contar_insumos_mencionados(texto) >= 2:
+            saltear_parser = True
+        # Más de un número "por litro"/"por kg"/etc: pulverización con varios.
+        elif len(re.findall(r"por\s+(litro|kilo|kg|bolsa|tonelada|hect)", _norm(texto))) >= 2:
+            saltear_parser = True
+        # Dice "venta" explícito: no es un gasto, aunque el parser diga que sí.
+        elif re.search(r"\b(venta|vendí|vendimos|vender)\b", _norm(texto)):
+            saltear_parser = True
+
+    parseado = _parsear_gasto(texto, ident.get("campos") or []) if (
+        _wa_puede(ident, "gastos", "editar") and not saltear_parser) else None
+    # Si no reconocimos el producto ("orea" en vez de urea, por la
+    # transcripción del audio) y hay IA, que decida Claude el rubro en vez
+    # de mandarlo derecho a "otros".
+    # Lo mismo con los pesos: Claude entiende "300, eh, 300 mil" o "300 lucas".
+    if parseado and os.environ.get("ANTHROPIC_API_KEY") and (
+            parseado.get("ars") or not _rubro_por_texto(texto)[1]):
+        parseado = None
+    if parseado and parseado.get("ars"):
+        ars = parseado["gasto"]["total_de_usd"]
+        tc = await _dolar_venta()
+        parseado["gasto"]["total_de_usd"] = round(ars / tc, 2)
+        parseado["gasto"]["descripcion"] = (
+            f"{parseado['gasto']['descripcion']} (ARS {_miles(ars)} al BNA ${_miles(tc)})")
+    if parseado:
+        datos = {"gasto": parseado["gasto"]}
+        campo = parseado.get("campo")
+        if campo:
+            datos["campo_id"] = campo["id"]
+            datos["campo_nombre"] = campo["nombre"]
+            await _kapso_guardar_gasto(ident, numero, datos)
+        elif not await _kapso_pedir_campo(ident, numero, "k_gasto_campo", datos,
+                                          "¿A qué campo lo cargo?"):
+            await _kapso_guardar_gasto(ident, numero, datos)
+        return
 
     # Claude entiende el resto: "la terminé, anotá que sobró medio bidón"
     intencion_claude = None
