@@ -1917,19 +1917,34 @@ async def _kapso_texto_libre(ident: dict, numero: str, texto: str,
     # y 20 litros de aceite precio del aceite 12 usd" se parseaba como un
     # gasto único de Herbicidas USD 2 porque _parsear_gasto encontró "gasto"+
     # "glifosato"+"2 dólares" y guardaba SIN pasar por Claude.
+    # Con Claude disponible, el parser legacy sólo se usa para los casos ultra
+    # simples y ambiguos donde Claude es exceso: "gasté 100 de urea". Para
+    # cualquier texto con pinta de ser stock, venta o multi-producto, lo manda
+    # directo a Claude.
+    #
+    # Caso real 2026-11-24: "Agregar 700 litros de glifosato 48% en cerealista
+    # moldes" era interpretado como un gasto de USD 700 porque el parser legacy
+    # vio "agregar" + "700" + "glifosato" y guardó. Pero ese texto es un stock
+    # de insumo. Claude lo clasifica bien si no lo intercepta el parser.
     saltear_parser = False
     if os.environ.get("ANTHROPIC_API_KEY"):
-        # Texto largo (>80 chars): es muy probable que Claude entienda mejor.
-        if len(texto) > 80:
-            saltear_parser = True
-        # Más de un insumo nombrado: multi-producto obligatorio para Claude.
-        elif _contar_insumos_mencionados(texto) >= 2:
-            saltear_parser = True
-        # Más de un número "por litro"/"por kg"/etc: pulverización con varios.
-        elif len(re.findall(r"por\s+(litro|kilo|kg|bolsa|tonelada|hect)", _norm(texto))) >= 2:
-            saltear_parser = True
-        # Dice "venta" explícito: no es un gasto, aunque el parser diga que sí.
-        elif re.search(r"\b(venta|vendí|vendimos|vender)\b", _norm(texto)):
+        n_lower = _norm(texto)
+        es_simple_criollo = bool(re.match(
+            r"^(gast(é|amos|aron|o)|pag(ué|amos|aron|o)|compr(é|amos|aron|o))\b",
+            n_lower,
+        ))
+        # Si el texto empieza con "agregar", "cargar", "sumar", "añadir" sin
+        # ser un verbo de gasto, va a Claude (puede ser stock/insumo/ingreso).
+        verbo_no_gasto = bool(re.match(r"^(agregar|cargar|sumar|añadir|anadir|anotar)\b", n_lower))
+        # Texto largo, multi-insumo, multi-precio o "venta/vendí" → Claude.
+        complejo = (
+            len(texto) > 80
+            or _contar_insumos_mencionados(texto) >= 2
+            or len(re.findall(r"por\s+(litro|kilo|kg|bolsa|tonelada|hect)", n_lower)) >= 2
+            or bool(re.search(r"\b(venta|vendí|vendimos|vender)\b", n_lower))
+            or bool(re.search(r"\b(stock|insumo|insumos|bodega|galp(ó|o)n|dep(ó|o)sito)\b", n_lower))
+        )
+        if verbo_no_gasto or complejo or not es_simple_criollo:
             saltear_parser = True
 
     parseado = _parsear_gasto(texto, ident.get("campos") or []) if (
