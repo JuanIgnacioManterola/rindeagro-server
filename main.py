@@ -3333,6 +3333,14 @@ def _contar_insumos_mencionados(texto: str) -> int:
     return len(vistos)
 
 # Todo lo que el bot sabe hacer. Claude elige una acción y completa los datos.
+#
+# Importante: la API de Claude permite máximo 16 parámetros con union types
+# (arrays o anyOf) en un schema. Si lo pasamos, el request devuelve 400 y Claude
+# NUNCA responde (caso real 2026-11-23: cada audio caía al motor legacy de
+# OpenAI). Por eso NO usamos `["string", "null"]` para los opcionales: en su
+# lugar, strings opcionales van como string con default "", números como number
+# con default 0, booleans con default false. En el servidor tratamos esos
+# valores como "no mencionado" (ver _normalizar_intencion).
 ESQUEMA_INTENCION = {
     "type": "object",
     "properties": {
@@ -3340,58 +3348,51 @@ ESQUEMA_INTENCION = {
             "type": "string",
             "enum": ["completar_tarea", "iniciar_tarea", "nota_tarea", "ver_tareas",
                      "gasto", "lluvia", "invitar", "menu", "nada",
-                     # Nuevas intenciones:
                      "ingreso", "pago", "insumo", "tarea_nueva", "siembra"],
         },
-        "tarea_id":        {"type": ["string", "null"]},
-        "nota":            {"type": ["string", "null"]},
-        "campo_id":        {"type": ["string", "null"]},
-        "rubro":           {"type": ["string", "null"]},
-        "monto_usd":       {"type": ["number", "null"]},
-        "monto_ars":       {"type": ["number", "null"]},
-        "descripcion":     {"type": ["string", "null"]},
-        "mm":              {"type": ["number", "null"]},
-        "nombre_invitado": {"type": ["string", "null"]},
-        # Campos nuevos: ingreso (venta de cereal)
-        "cultivo":         {"type": ["string", "null"]},
-        "toneladas":       {"type": ["number", "null"]},
-        "precio_tn_usd":   {"type": ["number", "null"]},
-        "comprador":       {"type": ["string", "null"]},
+        "tarea_id":        {"type": "string"},
+        "nota":            {"type": "string"},
+        "campo_id":        {"type": "string"},
+        "rubro":           {"type": "string"},
+        "monto_usd":       {"type": "number"},
+        "monto_ars":       {"type": "number"},
+        "descripcion":     {"type": "string"},
+        "mm":              {"type": "number"},
+        "nombre_invitado": {"type": "string"},
+        # Ingreso (venta de cereal)
+        "cultivo":         {"type": "string"},
+        "toneladas":       {"type": "number"},
+        "precio_tn_usd":   {"type": "number"},
+        "comprador":       {"type": "string"},
         # Pago
-        "tipo_pago":       {"type": ["string", "null"]},
-        "beneficiario":    {"type": ["string", "null"]},
-        "fecha_venc":      {"type": ["string", "null"]},
-        # Insumo
-        "tipo_insumo":     {"type": ["string", "null"]},
-        "cantidad":        {"type": ["number", "null"]},
-        "unidad":          {"type": ["string", "null"]},
-        # Precio unitario para gasto/insumo: si lo da suelto ("a $5 el litro")
-        # calculamos el total en el servidor con cantidad × precio_unit, así no
-        # dejamos la multiplicación a Claude (se equivocaba con los decimales).
-        "precio_unit_usd": {"type": ["number", "null"]},
-        "precio_unit_ars": {"type": ["number", "null"]},
-        # Dosis "por hectárea": si el audio dice "3 L/ha" la cantidad total se
-        # calcula en el servidor como cantidad × hectareas del campo.
-        "por_hectarea":    {"type": ["boolean", "null"]},
-        # Audio que enumera varios productos en un solo mensaje ("glifosato
-        # 3 L/ha, atrazina 2 L/ha, aceite 5 L total"): cada producto va como
-        # un item en este array. El nivel de arriba (rubro/descripcion/
-        # monto/cantidad/unidad) queda null y usamos items. El campo_id y
-        # fecha del nivel de arriba se aplican a todos los items.
+        "tipo_pago":       {"type": "string"},
+        "beneficiario":    {"type": "string"},
+        "fecha_venc":      {"type": "string"},
+        # Insumo / gasto detallado
+        "tipo_insumo":     {"type": "string"},
+        "cantidad":        {"type": "number"},
+        "unidad":          {"type": "string"},
+        # Precio unitario: cantidad × precio_unit se calcula en el servidor.
+        "precio_unit_usd": {"type": "number"},
+        "precio_unit_ars": {"type": "number"},
+        # Dosis por hectárea: multiplicamos por has del campo en el servidor.
+        "por_hectarea":    {"type": "boolean"},
+        # Varios productos en un solo mensaje (pulverización): cada item en
+        # items[], y los campos de arriba quedan vacíos.
         "items": {
-            "type": ["array", "null"],
+            "type": "array",
             "items": {
                 "type": "object",
                 "properties": {
-                    "rubro":           {"type": ["string", "null"]},
-                    "descripcion":     {"type": ["string", "null"]},
-                    "cantidad":        {"type": ["number", "null"]},
-                    "unidad":          {"type": ["string", "null"]},
-                    "precio_unit_usd": {"type": ["number", "null"]},
-                    "precio_unit_ars": {"type": ["number", "null"]},
-                    "monto_usd":       {"type": ["number", "null"]},
-                    "monto_ars":       {"type": ["number", "null"]},
-                    "por_hectarea":    {"type": ["boolean", "null"]},
+                    "rubro":           {"type": "string"},
+                    "descripcion":     {"type": "string"},
+                    "cantidad":        {"type": "number"},
+                    "unidad":          {"type": "string"},
+                    "precio_unit_usd": {"type": "number"},
+                    "precio_unit_ars": {"type": "number"},
+                    "monto_usd":       {"type": "number"},
+                    "monto_ars":       {"type": "number"},
+                    "por_hectarea":    {"type": "boolean"},
                 },
                 "required": ["rubro", "descripcion", "cantidad", "unidad",
                              "precio_unit_usd", "precio_unit_ars",
@@ -3400,10 +3401,10 @@ ESQUEMA_INTENCION = {
             },
         },
         # Tarea nueva
-        "titulo_tarea":    {"type": ["string", "null"]},
-        "prioridad":       {"type": ["string", "null"]},
-        # Siembra (evento agrícola)
-        "fecha_siembra":   {"type": ["string", "null"]},
+        "titulo_tarea":    {"type": "string"},
+        "prioridad":       {"type": "string"},
+        # Siembra
+        "fecha_siembra":   {"type": "string"},
         "confianza":       {"type": "string", "enum": ["alta", "media", "baja"]},
     },
     "required": ["accion", "tarea_id", "nota", "campo_id", "rubro", "monto_usd", "monto_ars",
@@ -3416,6 +3417,48 @@ ESQUEMA_INTENCION = {
                  "confianza"],
     "additionalProperties": False,
 }
+
+
+# Keys numéricas: 0 quiere decir "no mencionado" para las que mi handler ya
+# protege con `is None`. Las volvemos a None para no cambiar la lógica de abajo.
+_KEYS_NUM_OPCIONALES = (
+    "monto_usd", "monto_ars", "mm", "toneladas", "precio_tn_usd",
+    "cantidad", "precio_unit_usd", "precio_unit_ars",
+)
+_KEYS_STR_OPCIONALES = (
+    "tarea_id", "nota", "campo_id", "rubro", "descripcion", "nombre_invitado",
+    "cultivo", "comprador", "tipo_pago", "beneficiario", "fecha_venc",
+    "tipo_insumo", "unidad", "titulo_tarea", "prioridad", "fecha_siembra",
+)
+
+
+def _normalizar_intencion(intencion: dict) -> dict:
+    """Convierte 0 y "" a None en los campos opcionales, para que el resto del
+    código que chequea `is None` siga funcionando sin cambios. Los items[] se
+    normalizan también, item por item."""
+    if not isinstance(intencion, dict):
+        return intencion
+    for k in _KEYS_NUM_OPCIONALES:
+        v = intencion.get(k)
+        if v == 0 or v is False:
+            intencion[k] = None
+    for k in _KEYS_STR_OPCIONALES:
+        if intencion.get(k) == "":
+            intencion[k] = None
+    if intencion.get("por_hectarea") in (False, None):
+        intencion["por_hectarea"] = False  # default coherente
+    items = intencion.get("items") or []
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        for k in ("cantidad", "precio_unit_usd", "precio_unit_ars",
+                  "monto_usd", "monto_ars"):
+            if it.get(k) == 0:
+                it[k] = None
+        for k in ("rubro", "descripcion", "unidad"):
+            if it.get(k) == "":
+                it[k] = None
+    return intencion
 
 INSTRUCCIONES_CLAUDE = """Sos el asistente de Rinde Agro, una app de gestión agropecuaria argentina, \
 atendiendo por WhatsApp a productores y a sus empleados de campo.
@@ -3515,7 +3558,10 @@ asumí el año actual.
 (ej. campo o fecha) pero los datos núcleo están; baja SOLO si estás adivinando lo esencial \
 (acción incierta, montos inventados, nombres que no cuadran). Si el mensaje dice "30 litros de \
 glifosato a $5 el litro" la confianza es alta, aunque falte el campo.
-- Dejá en null los campos que el mensaje no menciona. No inventes datos."""
+- Para los campos opcionales que el mensaje NO menciona: strings devolvelos como cadena vacía "" \
+(no inventes un string), números devolvelos como 0, por_hectarea como false. items: si no es \
+una pulverización con varios productos, devolvelo como array vacío []. El servidor los trata \
+como "no mencionado" y no los usa. No inventes datos."""
 
 
 def _miles(v: float) -> str:
@@ -3592,10 +3638,11 @@ async def _llamar_claude(cliente, messages: list, effort: str = "high") -> dict 
                 print(f"[CLAUDE] modelo={modelo} devolvió vacío, próximo")
                 continue
             try:
-                return json.loads(crudo)
+                parsed = json.loads(crudo)
             except json.JSONDecodeError:
                 print(f"[CLAUDE] modelo={modelo} JSON inválido: {crudo[:300]!r}")
                 continue
+            return _normalizar_intencion(parsed)
         except Exception as e:
             print(f"[CLAUDE] modelo={modelo} falló: {type(e).__name__}: {e}")
             continue
