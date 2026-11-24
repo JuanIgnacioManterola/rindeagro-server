@@ -1876,6 +1876,65 @@ def _intento_cargar(texto: str) -> str:
     return ""
 
 
+async def _wa_actualizar_ultimo_cheque(ident: dict, numero: str, texto: str) -> bool:
+    """
+    Si el texto trae info adicional para un cheque recién cargado (número y/o
+    banco, sin otro contexto de carga), buscamos el último cheque del user de
+    los últimos 10 minutos y lo actualizamos. Devuelve True si manejó el
+    mensaje, False si no era un caso de actualización.
+    """
+    n = _norm(texto)
+    # Debe mencionar cheque + número y/o banco, sin plata/fecha nueva.
+    tiene_numero = bool(re.search(r"(?:n(ú|u)mero|nro|n°|#)\s*(?:de\s*)?(?:cheque)?\s*[:\.]?\s*(\d{3,})", n))
+    tiene_banco = bool(re.search(r"\bbanco\b", n))
+    es_sobre_cheque = ("cheque" in n or "echeq" in n or tiene_numero or tiene_banco)
+    tiene_plata_nueva = bool(re.search(r"\$|pesos|d(ó|o)lares|usd|ars", n))
+    if not es_sobre_cheque or tiene_plata_nueva:
+        return False
+    if not (tiene_numero or tiene_banco):
+        return False
+
+    # Buscamos el último cheque pendiente del user, cargado hace menos de 10 min.
+    filas = await _sb_get("compromisos_pago", {
+        "owner_id": f"eq.{ident['owner_id']}",
+        "tipo": "eq.cheque",
+        "select": "id,beneficiario,banco,numero_cheque,created_at,importe,moneda,fecha_cobro",
+        "order": "created_at.desc",
+        "limit": "1",
+    }) or []
+    if not filas:
+        return False
+    cheque = filas[0]
+    try:
+        hace_min = (datetime.now(AR_TZ) - datetime.fromisoformat(
+            cheque["created_at"].replace("Z", "+00:00"))).total_seconds() / 60
+    except Exception:
+        hace_min = 999
+    if hace_min > 10:
+        return False  # muy viejo, no asumimos que es ESE cheque
+
+    patch = {}
+    # Número: extraer dígitos después de "número/n°/#".
+    m_num = re.search(r"(?:n(ú|u)mero|nro|n°|#)\s*(?:de\s*)?(?:cheque)?\s*[:\.]?\s*(\d{3,})", n)
+    if m_num and not cheque.get("numero_cheque"):
+        patch["numero_cheque"] = m_num.group(2)[:30]
+    # Banco: desde "banco X" hasta el final o hasta otro keyword.
+    m_bco = re.search(r"\bbanco\s+([a-záéíóúñ0-9\.\- ]{3,80}?)(?:\s*(?:n(ú|u)mero|nro|cheque)|$)", n)
+    if m_bco and not cheque.get("banco"):
+        patch["banco"] = m_bco.group(1).strip().title()[:100]
+    if not patch:
+        return False
+
+    await _sb_patch(f"compromisos_pago?id=eq.{cheque['id']}", patch)
+    lineas = ["📝 Actualicé el último cheque:"]
+    if patch.get("banco"):
+        lineas.append(f"🏦 Banco: {patch['banco']}")
+    if patch.get("numero_cheque"):
+        lineas.append(f"#️⃣ Nº: {patch['numero_cheque']}")
+    await kapso.enviar_texto(numero, "\n".join(lineas))
+    return True
+
+
 async def _kapso_texto_libre(ident: dict, numero: str, texto: str,
                              tarea_activa: dict = None, saltar_parecidos: bool = False) -> None:
     """
@@ -1883,6 +1942,11 @@ async def _kapso_texto_libre(ident: dict, numero: str, texto: str,
     clarísimo), después la IA si está configurada, y si no, el menú.
     """
     n = _norm(texto)
+
+    # Caso frecuente: después de cargar un cheque, el user manda número y/o
+    # banco por separado. Lo asociamos al último cheque suyo sin re-cargar.
+    if await _wa_actualizar_ultimo_cheque(ident, numero, texto):
+        return
 
     # Intento explícito de carga ("quiero cargar un gasto", "cargá una tarea",
     # "nuevo cheque"): si no viene con dato concreto, arranca el flujo guiado.
@@ -4369,6 +4433,20 @@ async def _kapso_aplicar_intencion(ident: dict, numero: str, intencion: dict,
         }}
         if intencion.get("descripcion"):
             datos["pago"]["descripcion"] = intencion["descripcion"]
+
+        # Si es cheque, pedimos los datos que faltan antes de guardar: banco y
+        # número son parte normal de un cheque (pedido del user 2026-11-24:
+        # cargó un cheque y después quiso decir el número y banco por texto,
+        # pero el bot no supo asociarlo).
+        if tipo == "cheque":
+            if not datos["pago"].get("banco"):
+                await _wa_set_conv(numero, "k_pag_banco", datos)
+                await kapso.enviar_texto(numero, "¿De qué banco es el cheque?")
+                return True
+            if not datos["pago"].get("numero_cheque"):
+                await _wa_set_conv(numero, "k_pag_numero", datos)
+                await kapso.enviar_texto(numero, "¿Cuál es el número del cheque?")
+                return True
         await _kapso_guardar_pago(ident, numero, datos)
         return True
 
