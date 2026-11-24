@@ -1845,11 +1845,17 @@ async def _kapso_texto_libre(ident: dict, numero: str, texto: str,
             await _kapso_pago_guiado(ident, numero)
             return
 
-    if any(p in n for p in ("invitar", "sumar a", "agregar a", "dar de alta")):
-        posible = re.sub(r".*(invitar|sumar a|agregar a|dar de alta)\s*", "", n).strip()
-        posible = re.sub(r"^(a|al)\s+", "", posible)
-        await _kapso_invitar_inicio(ident, numero, posible.title())
-        return
+    # Invitar: usamos word-boundary para NO matchear "agregar al stock" o
+    # "agregar al campo" (caso real 2026-11-24: "agregar al stock de insumos"
+    # caía como invitación). Sólo matcheamos las frases exactas.
+    if re.search(r"\b(invitar|sumar\s+a|agregar\s+a(?!l\b)|dar\s+de\s+alta)\b", n):
+        # Excluimos aún así los casos típicos donde "agregar a" es parte de
+        # "agregar al stock/los insumos/la planilla" etc.
+        if not re.search(r"\bagregar\s+al?\s+(stock|lista|listado|planilla|campo|archivo|insumo|lluvia|gasto|tarea|ingreso|pago)\b", n):
+            posible = re.sub(r".*(invitar|sumar a|agregar a|dar de alta)\s*", "", n).strip()
+            posible = re.sub(r"^(a|al)\s+", "", posible)
+            await _kapso_invitar_inicio(ident, numero, posible.title())
+            return
 
     # Alias aprendidos: "orea" → "urea" si alguien ya lo confirmó antes.
     for alias, producto in (await _wa_alias()).items():
@@ -3418,10 +3424,14 @@ ESQUEMA_INTENCION = {
                     "monto_usd":       {"type": "number"},
                     "monto_ars":       {"type": "number"},
                     "por_hectarea":    {"type": "boolean"},
+                    # Ubicación física del stock: "Fraga", "galpón sur",
+                    # "cerealista moldes". Se usa solo en accion=insumo.
+                    "ubicacion":       {"type": "string"},
                 },
                 "required": ["rubro", "descripcion", "cantidad", "unidad",
                              "precio_unit_usd", "precio_unit_ars",
-                             "monto_usd", "monto_ars", "por_hectarea"],
+                             "monto_usd", "monto_ars", "por_hectarea",
+                             "ubicacion"],
                 "additionalProperties": False,
             },
         },
@@ -3480,7 +3490,7 @@ def _normalizar_intencion(intencion: dict) -> dict:
                   "monto_usd", "monto_ars"):
             if it.get(k) == 0:
                 it[k] = None
-        for k in ("rubro", "descripcion", "unidad"):
+        for k in ("rubro", "descripcion", "unidad", "ubicacion"):
             if it.get(k) == "":
                 it[k] = None
     return intencion
@@ -3560,7 +3570,17 @@ comprador (si menciona), campo_id si lo indica.
 - pago: cheque, crédito u otro compromiso. tipo_pago entre cheque, cuota_credito, otro. \
 beneficiario, monto_usd o monto_ars, fecha_venc (vencimiento o cobro).
 - insumo: cargó al stock un producto. tipo_insumo entre herbicidas, fungicidas, insecticidas, \
-fertilizantes, semillas, otros. descripcion = nombre del producto. cantidad + unidad (litros/kg/bolsas/dosis).
+fertilizantes, semillas, otros. descripcion = nombre del producto (incluí la concentración si \
+la menciona, ej. "Glifosato 48%"). cantidad + unidad (litros/kg/bolsas/dosis). Si menciona \
+dónde está guardado ("ubicado en Fraga", "en el galpón sur", "en cerealista moldes"), ponelo \
+en items[].ubicacion. Múltiples insumos en un solo mensaje = usar items[] con un item por \
+producto. Al nivel de arriba todo en null/"".
+Ejemplo multi-insumo: "agregar al stock 300 L de glifosato al 48% ubicado en Fraga, 500 L del \
+mismo glifosato en cerealista moldes, 280 L de 2,4-D al 60% en Fraga" → accion=insumo, items=[\
+{rubro:"herbicidas", descripcion:"Glifosato 48%", cantidad:300, unidad:"litros", \
+ubicacion:"Fraga"}, {rubro:"herbicidas", descripcion:"Glifosato 48%", cantidad:500, \
+unidad:"litros", ubicacion:"cerealista moldes"}, {rubro:"herbicidas", descripcion:"2,4-D 60%", \
+cantidad:280, unidad:"litros", ubicacion:"Fraga"}].
 - tarea_nueva: pide crear una tarea nueva. titulo_tarea con el título. descripcion si hay detalle. \
 prioridad entre alta, media, baja. fecha_venc si menciona cuándo.
 - siembra: dice que se sembró un campo ("sembré La Escondida con soja el 10/12"). cultivo, campo_id, \
@@ -3927,6 +3947,65 @@ async def _kapso_guardar_multi_definitivo(ident: dict, numero: str, datos: dict)
     )
 
 
+def _formato_resumen_multi_insumo(items_insumo: list[dict]) -> str:
+    """Texto del resumen de un multi-insumo para mostrar al user antes de guardar."""
+    lineas = []
+    for i, it in enumerate(items_insumo, 1):
+        bits = [f"{_num(it.get('cantidad') or 0)} {it.get('unidad') or 'u'}",
+                it.get('nombre') or 'sin nombre']
+        if it.get("ubicacion"):
+            bits.append(f"📍 {it['ubicacion']}")
+        if it.get("costo_unitario"):
+            bits.append(f"USD {_num(it['costo_unitario'])}/u")
+        lineas.append(f"{i}️⃣ " + " · ".join(bits))
+    return "📦 Entendí estos insumos para el stock:\n\n" + "\n".join(lineas)
+
+
+async def _kapso_confirmar_multi_insumo(ident: dict, numero: str,
+                                         items_insumo: list[dict]) -> None:
+    """
+    Muestra el resumen de N insumos y espera confirmación del user ANTES de
+    guardar en stock_insumos. Nunca escribe sin que toque ✅.
+    """
+    datos = {"multi_insumo": {"items": items_insumo}}
+    await _wa_set_conv(numero, "k_ins_multi_confirmar", datos)
+    texto = _formato_resumen_multi_insumo(items_insumo) + "\n\n¿Los agrego al stock?"
+    await kapso.enviar_botones(numero, texto, [
+        ("i_multi_ok", "✅ Agregar todos"),
+        ("i_multi_fix", "✏️ Corregir uno"),
+        ("i_multi_cancel", "❌ Cancelar"),
+    ])
+
+
+async def _kapso_guardar_multi_insumo(ident: dict, numero: str, datos: dict) -> None:
+    """Cuando el user tocó ✅: escribe los N insumos al stock y manda resumen."""
+    items_insumo = (datos.get("multi_insumo") or {}).get("items") or []
+    lineas = []
+    for it in items_insumo:
+        payload = {
+            "owner_id": ident["owner_id"],
+            "nombre": it.get("nombre") or "Sin nombre",
+            "tipo": it.get("tipo") or "otros",
+            "unidad": it.get("unidad") or "unidades",
+            "stock_actual": float(it.get("cantidad") or 0),
+        }
+        if it.get("ubicacion"):
+            payload["ubicacion"] = it["ubicacion"]
+        if it.get("costo_unitario"):
+            payload["costo_unitario"] = float(it["costo_unitario"])
+        await _sb_post("stock_insumos", payload)
+        bits = [f"{_num(payload['stock_actual'])} {payload['unidad']}", payload["nombre"]]
+        if payload.get("ubicacion"):
+            bits.append(f"📍 {payload['ubicacion']}")
+        lineas.append("• " + " · ".join(bits))
+    await _wa_clear_conv(numero)
+    await kapso.enviar_botones(
+        numero,
+        f"✅ Agregué {len(items_insumo)} insumos al stock:\n\n" + "\n".join(lineas),
+        [("menu", "Cargar otra cosa")],
+    )
+
+
 async def _kapso_aplicar_intencion(ident: dict, numero: str, intencion: dict,
                                    texto_crudo: str = "") -> bool:
     """Ejecuta lo que Claude entendió. Devuelve False si no se pudo hacer nada."""
@@ -4196,24 +4275,66 @@ async def _kapso_aplicar_intencion(ident: dict, numero: str, intencion: dict,
         return True
 
     # ── Insumo al stock ─────────────────────────────
-    if accion == "insumo" and intencion.get("descripcion") and intencion.get("cantidad"):
+    # Insumo al stock — single o multi (varios productos en un solo mensaje).
+    if accion == "insumo":
         if not _wa_puede(ident, "insumos", "editar"):
             return False
-        tipo = (intencion.get("tipo_insumo") or "otros").lower()
-        if tipo not in ("herbicidas", "fungicidas", "insecticidas", "fertilizantes", "semillas", "otros"):
-            tipo = "otros"
-        unidad = (intencion.get("unidad") or "unidades").lower()
-        if unidad not in ("litros", "kg", "dosis", "bolsas", "unidades"):
-            unidad = "unidades"
-        datos = {"insumo": {
-            "tipo": tipo,
-            "nombre": intencion["descripcion"][:150],
-            "cantidad": float(intencion["cantidad"]),
-            "unidad": unidad,
-        }}
-        if intencion.get("monto_usd"):
-            datos["insumo"]["costo_unitario"] = float(intencion["monto_usd"])
-        await _kapso_guardar_insumo(ident, numero, datos)
+        items_insumo = intencion.get("items") or []
+
+        def _norm_item_insumo(it: dict) -> dict | None:
+            desc = (it.get("descripcion") or "").strip()
+            cant_raw = it.get("cantidad")
+            try:
+                cant = float(cant_raw) if cant_raw is not None else 0.0
+            except (TypeError, ValueError):
+                cant = 0.0
+            if not desc or cant <= 0:
+                return None
+            tipo = (it.get("rubro") or it.get("tipo_insumo") or "").strip().lower() or "otros"
+            if tipo not in ("herbicidas", "fungicidas", "insecticidas",
+                            "fertilizantes", "semillas", "otros"):
+                tipo = "otros"
+            unidad = (it.get("unidad") or "").strip().lower() or "unidades"
+            if unidad not in ("litros", "kg", "dosis", "bolsas", "unidades"):
+                unidad = "unidades"
+            r = {"tipo": tipo, "nombre": desc[:150], "cantidad": cant, "unidad": unidad}
+            if it.get("ubicacion"):
+                r["ubicacion"] = str(it["ubicacion"])[:150]
+            if it.get("precio_unit_usd"):
+                r["costo_unitario"] = float(it["precio_unit_usd"])
+            elif it.get("monto_usd"):
+                r["costo_unitario"] = float(it["monto_usd"])
+            return r
+
+        normalizados: list[dict] = []
+        for it in items_insumo:
+            n = _norm_item_insumo(it)
+            if n is not None:
+                normalizados.append(n)
+
+        if not normalizados:
+            # Sin items[] válidos: pruebo con el nivel de arriba (modo single).
+            if intencion.get("descripcion") and intencion.get("cantidad"):
+                up = _norm_item_insumo({
+                    "rubro": intencion.get("tipo_insumo"),
+                    "descripcion": intencion.get("descripcion"),
+                    "cantidad": intencion.get("cantidad"),
+                    "unidad": intencion.get("unidad"),
+                    "monto_usd": intencion.get("monto_usd"),
+                })
+                if up:
+                    normalizados.append(up)
+
+        if not normalizados:
+            return False
+
+        if len(normalizados) == 1:
+            await _kapso_guardar_insumo(ident, numero, {"insumo": normalizados[0]})
+            return True
+
+        # Varios insumos: pedir confirmación antes de insertar N stock rows.
+        print(f"[WA INS IA] items={len(normalizados)} tipos={[n['tipo'] for n in normalizados]}")
+        await _kapso_confirmar_multi_insumo(ident, numero, normalizados)
         return True
 
     # ── Tarea nueva ─────────────────────────────────
@@ -4392,6 +4513,22 @@ async def _kapso_procesar(m) -> None:
         await kapso.enviar_texto(numero, "Avisos reactivados 🌾")
         return
 
+    # Botones del flujo multi-insumo (análogo a multi-gasto)
+    if accion in ("i_multi_ok", "i_multi_cancel"):
+        conv_tmp = await _wa_get_conv(numero)
+        datos_tmp = (conv_tmp or {}).get("datos_parciales") or {}
+        if (conv_tmp or {}).get("estado") != "k_ins_multi_confirmar":
+            await kapso.enviar_texto(numero, "Ya no tengo esos insumos en memoria. "
+                                              "Mandalos de nuevo si querés cargarlos.")
+            await _wa_clear_conv(numero)
+            return
+        if accion == "i_multi_ok":
+            await _kapso_guardar_multi_insumo(ident, numero, datos_tmp)
+            return
+        await _wa_clear_conv(numero)
+        await kapso.enviar_texto(numero, "Listo, no cargué nada. 👌")
+        return
+
     # Botones del flujo multi-gasto: SIEMPRE antes de cualquier otro check de
     # conv/estado, así no se pierden si ya hay una conv activa.
     if accion in ("g_multi_ok", "g_multi_fix", "g_multi_cancel"):
@@ -4535,7 +4672,7 @@ async def _kapso_procesar(m) -> None:
     # intencionales: el user está corrigiendo un item del resumen y el audio
     # largo es esperado — no descartamos.
     estados_edicion_activa = {"k_gasto_multi_edit_texto", "k_gasto_multi_confirmar",
-                              "k_gasto_multi_campo"}
+                              "k_gasto_multi_campo", "k_ins_multi_confirmar"}
     if (conv and texto and m.tipo in ("text", "audio")
             and conv.get("estado") not in estados_edicion_activa
             and _texto_es_nueva_intencion(texto)):
