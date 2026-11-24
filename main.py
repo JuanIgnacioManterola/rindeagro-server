@@ -3713,9 +3713,10 @@ async def _interpretar_con_claude(texto: str, ident: dict, tareas: list,
 
 def _wa_resolver_campo_fuzzy(ident: dict, texto: str, campo_id_hint: str | None) -> dict | None:
     """
-    Si Claude ya devolvió un campo_id válido lo devuelve. Si no, busca una
-    coincidencia aproximada en el texto contra la lista de campos del user: el
-    audio "cargar en escondida" tiene que mapear a "La Escondida".
+    Resolver el campo de un mensaje: 1) Claude ya devolvió campo_id válido,
+    2) fuzzy match del texto contra los nombres de los campos del user
+    ("escondida" → "La Escondida"), 3) si el user tiene UN SOLO campo, ese.
+    None sólo cuando el user tiene varios campos y ninguno aparece en el texto.
     """
     campos = ident.get("campos") or []
     if campo_id_hint:
@@ -3737,7 +3738,12 @@ def _wa_resolver_campo_fuzzy(ident: dict, texto: str, campo_id_hint: str | None)
         score = sum(1 for p in palabras if p in norm)
         if score == len(palabras) and score > mejor_score:
             mejor, mejor_score = c, score
-    return mejor
+    if mejor:
+        return mejor
+    # Fallback: si el user tiene un solo campo, lo usamos sin preguntar.
+    if len(campos) == 1:
+        return campos[0]
+    return None
 
 
 async def _wa_armar_gasto(ident: dict, campo: dict | None, item: dict, tc_dolar: float) -> dict | None:
@@ -3951,11 +3957,13 @@ async def _kapso_aplicar_intencion(ident: dict, numero: str, intencion: dict,
     if accion == "lluvia" and intencion.get("mm") is not None:
         if not _wa_puede(ident, "lluvias", "editar"):
             return False
-        cid = intencion.get("campo_id")
-        if cid in ids_campos:
-            campo = next(c for c in ident["campos"] if c["id"] == cid)
+        # Resolver campo: Claude → fuzzy del texto → único del user.
+        campo = _wa_resolver_campo_fuzzy(ident, intencion.get("_texto_crudo") or "",
+                                        intencion.get("campo_id"))
+        if campo is not None:
             await _kapso_guardar_lluvia(ident, numero, campo, float(intencion["mm"]))
             return True
+        # No se pudo inferir: preguntar.
         datos = {"mm": float(intencion["mm"])}
         if await _kapso_pedir_campo(ident, numero, "k_lluvia_campo", datos,
                                     f"¿Dónde llovieron {_num(intencion['mm'])} mm?"):
@@ -4085,27 +4093,54 @@ async def _kapso_aplicar_intencion(ident: dict, numero: str, intencion: dict,
     if accion == "ingreso" and intencion.get("toneladas") and intencion.get("precio_tn_usd"):
         if not _wa_puede(ident, "ingresos", "editar"):
             return False
-        cultivo = (intencion.get("cultivo") or "").strip().lower() or "otro"
+        cultivo = (intencion.get("cultivo") or "").strip()
         datos = {"ingreso": {
-            "cultivo": cultivo,
             "tn": float(intencion["toneladas"]),
             "precio": float(intencion["precio_tn_usd"]),
         }}
         if intencion.get("comprador"):
             datos["ingreso"]["comprador"] = intencion["comprador"]
-        cid = intencion.get("campo_id")
-        if cid in ids_campos:
-            campo = next(c for c in ident["campos"] if c["id"] == cid)
-            datos["ingreso"]["campo_id"] = campo["id"]
-            datos["ingreso"]["campo_nombre"] = campo["nombre"]
-            await _kapso_guardar_ingreso(ident, numero, datos)
-            return True
-        # No tiene campo → preguntar
-        if await _kapso_pedir_campo(ident, numero, "k_ing_campo", datos,
-                                    f"¿De qué campo sale la venta de *{_num(intencion['toneladas'])} tn* de {cultivo}?"):
-            return True
-        datos["ingreso"]["campo_id"] = datos["campo_id"]
-        datos["ingreso"]["campo_nombre"] = datos["campo_nombre"]
+
+        # Resolver campo: Claude → fuzzy del texto → único del user → pedir.
+        campo = _wa_resolver_campo_fuzzy(ident, intencion.get("_texto_crudo") or "",
+                                        intencion.get("campo_id"))
+        if campo is None:
+            campos_user = ident.get("campos") or []
+            if len(campos_user) == 1:
+                campo = campos_user[0]
+
+        if campo is None:
+            # Preguntar campo al user (igual que antes)
+            if await _kapso_pedir_campo(ident, numero, "k_ing_campo", datos,
+                                        f"¿De qué campo sale la venta de *{_num(intencion['toneladas'])} tn*?"):
+                return True
+            campo = {"id": datos["campo_id"], "nombre": datos["campo_nombre"]}
+
+        datos["ingreso"]["campo_id"] = campo["id"]
+        datos["ingreso"]["campo_nombre"] = campo["nombre"]
+
+        # Resolver cultivo: Claude → único del campo → pedir.
+        # NUNCA guardamos bajo "otro": la app filtra por los cultivos reales del
+        # campo y una venta bajo "otro" queda invisible (caso real 2026-11-24).
+        if not cultivo:
+            sembrados = await _wa_cultivos_del_campo(campo["id"])
+            if len(sembrados) == 1:
+                cultivo = sembrados[0]
+                print(f"[WA ING IA] auto-cultivo={cultivo!r} (único sembrado en {campo['nombre']!r})")
+            elif len(sembrados) > 1:
+                # Varios cultivos sembrados: el user tiene que elegir.
+                await _wa_set_conv(numero, "k_ing_cultivo", datos)
+                await _kapso_pedir_cultivo_del_campo(numero, campo["id"])
+                return True
+            else:
+                # El campo no tiene cultivos cargados: pedir con lista genérica.
+                await _wa_set_conv(numero, "k_ing_cultivo", datos)
+                await _kapso_pedir_cultivo(numero)
+                return True
+
+        datos["ingreso"]["cultivo"] = cultivo
+        print(f"[WA ING IA] campo={campo['nombre']!r} cultivo={cultivo!r} "
+              f"tn={intencion['toneladas']} precio={intencion['precio_tn_usd']}")
         await _kapso_guardar_ingreso(ident, numero, datos)
         return True
 
@@ -4169,9 +4204,10 @@ async def _kapso_aplicar_intencion(ident: dict, numero: str, intencion: dict,
             datos["tarea_nueva"]["prioridad"] = intencion["prioridad"]
         if intencion.get("fecha_venc"):
             datos["tarea_nueva"]["fecha"] = intencion["fecha_venc"]
-        cid = intencion.get("campo_id")
-        if cid in ids_campos:
-            campo = next(c for c in ident["campos"] if c["id"] == cid)
+        # Campo: Claude → fuzzy → único del user.
+        campo = _wa_resolver_campo_fuzzy(ident, intencion.get("_texto_crudo") or "",
+                                        intencion.get("campo_id"))
+        if campo is not None:
             datos["tarea_nueva"]["campo_id"] = campo["id"]
             datos["tarea_nueva"]["campo_nombre"] = campo["nombre"]
         await _kapso_guardar_tarea_nueva(ident, numero, datos)
@@ -4183,9 +4219,10 @@ async def _kapso_aplicar_intencion(ident: dict, numero: str, intencion: dict,
             return False
         cultivo = intencion["cultivo"].strip().lower()
         fecha = intencion.get("fecha_siembra") or datetime.now(AR_TZ).date().isoformat()
-        cid = intencion.get("campo_id")
-        if cid not in ids_campos:
-            # Sin campo → pedir
+        # Campo: Claude → fuzzy → único del user.
+        campo = _wa_resolver_campo_fuzzy(ident, intencion.get("_texto_crudo") or "",
+                                        intencion.get("campo_id"))
+        if campo is None:
             datos = {"gasto": {
                 "rubro": "Semillas",
                 "descripcion": f"Siembra de {cultivo}",
@@ -4196,10 +4233,10 @@ async def _kapso_aplicar_intencion(ident: dict, numero: str, intencion: dict,
             if await _kapso_pedir_campo(ident, numero, "k_gasto_campo", datos,
                                         f"¿En qué campo sembraste {cultivo}?"):
                 return True
-            cid = datos["campo_id"]
-        campo = next((c for c in ident["campos"] if c["id"] == cid), None)
+            campo = {"id": datos["campo_id"], "nombre": datos["campo_nombre"]}
         if not campo:
             return False
+        cid = campo["id"]
         payload = {
             "campo_id": campo["id"],
             "usuario_id": ident["owner_id"],
