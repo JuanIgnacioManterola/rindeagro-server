@@ -4429,24 +4429,46 @@ async def _kapso_aplicar_intencion(ident: dict, numero: str, intencion: dict,
             "beneficiario": intencion.get("beneficiario") or "",
             "importe": importe,
             "moneda": moneda,
-            "fecha": intencion.get("fecha_venc") or datetime.now(AR_TZ).date().isoformat(),
         }}
+        # Fecha: SI viene de Claude, la usamos; si NO, se la pedimos al user.
+        # Nunca poner la fecha de hoy silenciosamente (caso real 2026-11-24:
+        # cargó un cheque sin fecha y el bot le puso 24/11, el usuario no se
+        # dio cuenta y quedó un cheque con cobro HOY cuando era otro día).
+        if intencion.get("fecha_venc"):
+            datos["pago"]["fecha"] = intencion["fecha_venc"]
         if intencion.get("descripcion"):
             datos["pago"]["descripcion"] = intencion["descripcion"]
 
-        # Si es cheque, pedimos los datos que faltan antes de guardar: banco y
-        # número son parte normal de un cheque (pedido del user 2026-11-24:
-        # cargó un cheque y después quiso decir el número y banco por texto,
-        # pero el bot no supo asociarlo).
+        # Si es cheque pedimos lo que falta en el mismo orden del flujo guiado:
+        # fecha → banco → número → alerta. El flujo k_pag_* ya encadena entre
+        # estados hasta guardar (pedido del user 2026-11-24: "revisá todas las
+        # secuencias que tienen mal la conversación").
         if tipo == "cheque":
+            if not datos["pago"].get("fecha"):
+                await _wa_set_conv(numero, "k_pag_fecha", datos)
+                await kapso.enviar_texto(
+                    numero,
+                    "¿Cuándo se cobra el cheque? (ej: _15/12_, _próxima semana_, o _en 30 días_)")
+                return True
             if not datos["pago"].get("banco"):
                 await _wa_set_conv(numero, "k_pag_banco", datos)
-                await kapso.enviar_texto(numero, "¿De qué banco es el cheque?")
+                await kapso.enviar_texto(numero, "¿De qué banco es el cheque? "
+                                                 "(opcional, escribí _sin banco_ para saltear)")
                 return True
             if not datos["pago"].get("numero_cheque"):
                 await _wa_set_conv(numero, "k_pag_numero", datos)
-                await kapso.enviar_texto(numero, "¿Cuál es el número del cheque?")
+                await kapso.enviar_texto(numero, "¿Cuál es el número del cheque? "
+                                                 "(opcional, escribí _sin número_ para saltear)")
                 return True
+
+        # Para pagos tipo "otro" o cuota_credito single: también pedir la
+        # fecha si no viene, en vez de poner hoy silenciosamente.
+        if tipo in ("otro", "cuota_credito") and not datos["pago"].get("fecha"):
+            await _wa_set_conv(numero, "k_pag_fecha", datos)
+            prompt = ("¿Cuándo vence?" if tipo == "cuota_credito" else "¿Cuándo es el pago?")
+            await kapso.enviar_texto(numero, f"{prompt} (ej: _15/12_, _próxima semana_, _en 30 días_)")
+            return True
+
         await _kapso_guardar_pago(ident, numero, datos)
         return True
 
