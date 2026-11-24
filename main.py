@@ -1279,34 +1279,99 @@ async def _kapso_insumo_guiado(ident: dict, numero: str) -> None:
     await kapso.enviar_lista(numero, "¿Qué tipo de insumo?", "Elegir tipo", filas, "Tipos")
 
 
+async def _wa_buscar_stock_existente(ident: dict, nombre: str, ubicacion: str | None) -> dict | None:
+    """
+    Busca una fila existente en stock_insumos del user, por mismo nombre y
+    ubicación (case-insensitive). Si existe, el caller suma al stock en vez
+    de crear una nueva fila (pedido del user 2026-11-24: "no me figure
+    separado en dos partes, se cargue los 1.200 litros todos juntos").
+    """
+    if not nombre:
+        return None
+    params = {
+        "owner_id": f"eq.{ident['owner_id']}",
+        "nombre": f"ilike.{nombre.strip()}",
+        "select": "id,nombre,unidad,stock_actual,costo_unitario,ubicacion",
+        "limit": "5",
+    }
+    if ubicacion:
+        params["ubicacion"] = f"ilike.{ubicacion.strip()}"
+    else:
+        params["ubicacion"] = "is.null"
+    filas = await _sb_get("stock_insumos", params) or []
+    # Preferimos match exacto por nombre+ubicación normalizados.
+    norm_nombre = _norm_cultivo(nombre)
+    norm_ubic = _norm_cultivo(ubicacion or "")
+    for f in filas:
+        if (_norm_cultivo(f.get("nombre") or "") == norm_nombre
+                and _norm_cultivo(f.get("ubicacion") or "") == norm_ubic):
+            return f
+    return filas[0] if filas else None
+
+
 async def _kapso_guardar_insumo(ident: dict, numero: str, datos: dict) -> None:
     ins = datos.get("insumo", {})
     cantidad = float(ins.get("cantidad") or 0)
     unidad = ins.get("unidad") or "unidades"
     tipo = ins.get("tipo") or "otros"
+    nombre = ins.get("nombre") or "Sin nombre"
+    ubicacion = ins.get("ubicacion") or None
+    costo_u = float(ins["costo_unitario"]) if ins.get("costo_unitario") else None
+
+    existente = await _wa_buscar_stock_existente(ident, nombre, ubicacion)
+    if existente:
+        # Mergeamos: sumamos al stock actual y promediamos el costo unitario
+        # ponderado por stock (para no distorsionar con una compra chica a
+        # otro precio).
+        stock_prev = float(existente.get("stock_actual") or 0)
+        stock_nuevo = stock_prev + cantidad
+        patch = {"stock_actual": stock_nuevo}
+        costo_prev = existente.get("costo_unitario")
+        if costo_u is not None and costo_prev is not None and stock_prev > 0:
+            costo_merge = ((float(costo_prev) * stock_prev) + (costo_u * cantidad)) / stock_nuevo
+            patch["costo_unitario"] = round(costo_merge, 4)
+        elif costo_u is not None and costo_prev is None:
+            patch["costo_unitario"] = costo_u
+        await _sb_patch(f"stock_insumos?id=eq.{existente['id']}", patch)
+        await _wa_clear_conv(numero)
+        tipo_label = next((v for k, v in TIPOS_INSUMO if k == tipo), tipo.capitalize())
+        partes = [f"✅ Sumé *{_num(cantidad)} {unidad}* al stock existente de *{nombre}*."]
+        partes.append(f"📦 Rubro: {tipo_label}")
+        partes.append(f"📊 Stock total: *{_num(stock_nuevo)} {unidad}* "
+                      f"(antes {_num(stock_prev)})")
+        if ubicacion:
+            partes.append(f"📍 {ubicacion}")
+        if patch.get("costo_unitario"):
+            unidad_sing = {"litros": "litro", "kg": "kg", "dosis": "dosis",
+                           "bolsas": "bolsa", "unidades": "unidad"}.get(unidad, unidad)
+            partes.append(f"💰 USD {_num(patch['costo_unitario'])} por {unidad_sing} (promedio ponderado)")
+        await kapso.enviar_texto(numero, "\n".join(partes))
+        return
+
+    # No existe → crea nueva fila
     payload = {
         "owner_id": ident["owner_id"],
-        "nombre": ins.get("nombre") or "Sin nombre",
+        "nombre": nombre,
         "tipo": tipo,
         "unidad": unidad,
         "stock_actual": cantidad,
-        "ubicacion": ins.get("ubicacion") or None,
+        "ubicacion": ubicacion,
     }
-    if ins.get("costo_unitario"):
-        payload["costo_unitario"] = float(ins["costo_unitario"])
+    if costo_u is not None:
+        payload["costo_unitario"] = costo_u
     if ins.get("notas"):
         payload["notas"] = ins["notas"][:500]
     await _sb_post("stock_insumos", payload)
     await _wa_clear_conv(numero)
     tipo_label = next((v for k, v in TIPOS_INSUMO if k == tipo), tipo.capitalize())
-    partes = [f"✅ Agregaste *{_num(cantidad)} {unidad}* de *{ins.get('nombre')}* al stock.",
+    partes = [f"✅ Agregaste *{_num(cantidad)} {unidad}* de *{nombre}* al stock.",
               f"📦 Rubro: {tipo_label}"]
-    if ins.get("ubicacion"):
-        partes.append(f"📍 {ins['ubicacion']}")
-    if ins.get("costo_unitario"):
+    if ubicacion:
+        partes.append(f"📍 {ubicacion}")
+    if costo_u is not None:
         unidad_sing = {"litros": "litro", "kg": "kg", "dosis": "dosis",
                        "bolsas": "bolsa", "unidades": "unidad"}.get(unidad, unidad)
-        partes.append(f"💰 USD {_num(ins['costo_unitario'])} por {unidad_sing}")
+        partes.append(f"💰 USD {_num(costo_u)} por {unidad_sing}")
     if ins.get("notas"):
         partes.append(f"📝 _{ins['notas']}_")
     await kapso.enviar_texto(numero, "\n".join(partes))
@@ -2696,6 +2761,24 @@ async def _kapso_flujo(ident: dict, numero: str, m, conv: dict) -> None:
         await kapso.enviar_texto(
             numero,
             f"¿Cuánto cuesta por {unidad_singular}? (ej: _USD 3.5_ por litro, o escribí _sin costo_)")
+        return
+
+    if estado == "k_ins_precio":
+        # Respuesta al pedido de precio cuando se cargó un insumo por texto
+        # libre sin precio. El user puede responder con un número o "saltar".
+        n = _norm(texto or "")
+        ins = datos.get("insumo") or {}
+        if n not in ("saltar", "skip", "no", "-", "0", ""):
+            costo = _extraer_numero(texto)
+            if costo is not None and costo > 0:
+                ins["costo_unitario"] = float(costo)
+            else:
+                await kapso.enviar_texto(
+                    numero,
+                    "No entendí el precio. Respondé con un número (ej: _4_ o _4.50_), "
+                    "o _saltar_ para no guardarlo.")
+                return
+        await _kapso_guardar_insumo(ident, numero, {"insumo": ins})
         return
 
     if estado == "k_ins_costo":
@@ -4344,7 +4427,21 @@ async def _kapso_aplicar_intencion(ident: dict, numero: str, intencion: dict,
             return False
 
         if len(normalizados) == 1:
-            await _kapso_guardar_insumo(ident, numero, {"insumo": normalizados[0]})
+            ins_uno = normalizados[0]
+            # Si el user no dijo precio, pedírselo antes de guardar.
+            # (pedido user 2026-11-24: "me lo tienen que preguntar el precio")
+            if not ins_uno.get("costo_unitario"):
+                await _wa_set_conv(numero, "k_ins_precio", {"insumo": ins_uno})
+                unidad_sing = {"litros": "litro", "kg": "kilo", "dosis": "dosis",
+                               "bolsas": "bolsa", "unidades": "unidad"}.get(
+                                   ins_uno.get("unidad") or "unidades", "unidad")
+                await kapso.enviar_texto(
+                    numero,
+                    f"¿A qué precio comprás el {unidad_sing} de *{ins_uno['nombre']}*?\n\n"
+                    "Respondé con el número en USD (ej: _4_ o _4.50_).\n"
+                    "Si no querés guardar el precio, escribí _saltar_ o _0_.")
+                return True
+            await _kapso_guardar_insumo(ident, numero, {"insumo": ins_uno})
             return True
 
         # Varios insumos: pedir confirmación antes de insertar N stock rows.
