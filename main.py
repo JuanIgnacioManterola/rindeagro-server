@@ -922,66 +922,37 @@ async def _kapso_pedir_distribucion_estructura(
 async def _kapso_pedir_multi_seleccion_campos(
     ident: dict, numero: str, datos: dict
 ) -> None:
-    """Muestra la lista interactiva de campos. Los ya elegidos aparecen con
-    ✅ al lado. El user va tocando uno a la vez; el toggle en la lista agrega
-    o saca ese campo. Siempre hay fila ✅ Listo (si N>=2) y ❌ Cancelar al
-    tope. Si el user tiene más campos de los que entran, páginamos.
+    """Pide al user que mande los campos elegidos en UN solo mensaje. WhatsApp
+    no permite seleccionar varios de una vez en una lista (es single-select
+    nativo), así que la UI que funciona es texto libre con lista numerada.
+    Admite números (1-based), nombres (fuzzy), "todos" y "cancelar".
     Estado: k_gasto_multi_pick."""
     campos = ident.get("campos") or []
-    elegidos_ids = datos.get("elegidos_multi") or []
-    pagina = int(datos.get("multi_pagina") or 0)
-
-    # Cupo de filas por página: 10 total - 1 Cancelar - 1 Listo (si corresponde)
-    # - 1 Más (si hay paginación). Hacemos cálculo asumiendo peor caso (3
-    # filas fijas) para no tener que recalcular.
-    acciones = 1  # Cancelar siempre
-    if len(elegidos_ids) >= 2:
-        acciones += 1  # Listo
-    # Primero vemos si todos los campos entran en una sola página.
-    cupo_total = 10 - acciones
-    hay_paginacion = len(campos) > cupo_total
-    if hay_paginacion:
-        acciones += 1  # Más
-        cupo_total = 10 - acciones
-
-    start = pagina * cupo_total
-    if start >= len(campos):
-        start = 0
-        pagina = 0
-    fin = min(start + cupo_total, len(campos))
-    campos_pag = campos[start:fin]
-
-    body = (
-        "📂 Tocá los campos para sumarlos al reparto.\n"
-        "El que tenga ✅ ya está elegido. Tocalo de nuevo si lo querés sacar.\n"
-        "Cuando termines, tocá *✅ Listo*."
-    )
-    if elegidos_ids:
-        nombres = [c["nombre"] for c in campos if c["id"] in elegidos_ids]
-        body += f"\n\n🧮 *Ya elegiste ({len(nombres)}):* {', '.join(nombres)}"
-
-    filas = []
-    if len(elegidos_ids) >= 2:
-        filas.append(
-            ("multi:listo",
-             f"✅ Listo con {len(elegidos_ids)} campos",
-             "Reparto proporcional por ha"))
-    filas.append(("multi:cancelar", "❌ Cancelar", "Vuelvo al principio"))
-    if hay_paginacion:
-        filas.append(("multi:mas", "➕ Ver más campos", f"Página {pagina + 1}"))
-    for c in campos_pag:
-        marca = "✅ " if c["id"] in elegidos_ids else ""
+    lineas = []
+    for i, c in enumerate(campos, start=1):
         sub = []
         if c.get("hectareas"):
             sub.append(f"{_num(c['hectareas'])} ha")
         if c.get("cultivo"):
             sub.append(str(c["cultivo"]))
-        filas.append((f"campo:{c['id']}", f"{marca}{c['nombre']}",
-                      " · ".join(sub) or "tocar para agregar"))
-
-    datos["multi_pagina"] = pagina
+        extra = f" _({' · '.join(sub)})_" if sub else ""
+        lineas.append(f"*{i}.* {c['nombre']}{extra}")
+    lista_txt = "\n".join(lineas)
+    pregunta = (
+        "📂 *Elegí los campos a los que repartir el gasto.*\n"
+        "⚠️ WhatsApp no deja tildar varios de una lista. Mandame los "
+        "números separados por coma en UN solo mensaje.\n\n"
+        f"{lista_txt}\n\n"
+        "Ejemplos:\n"
+        "  • `1, 3, 5` → los campos 1, 3 y 5\n"
+        "  • `erlicher, fraga` → por nombre\n"
+        "  • `todos` → todos los campos\n\n"
+        "Para salir escribí `cancelar`."
+    )
+    # Guardamos el orden para que los números sean estables entre mensajes.
+    datos["multi_lista_ids"] = [c["id"] for c in campos]
     await _wa_set_conv(numero, "k_gasto_multi_pick", datos)
-    await kapso.enviar_lista(numero, body, "Elegir", filas, "Tus campos")
+    await kapso.enviar_texto(numero, pregunta)
 
 
 async def _kapso_pedir_distribucion_gasto(
@@ -3186,88 +3157,79 @@ async def _kapso_flujo(ident: dict, numero: str, m, conv: dict) -> None:
         return
 
     if estado == "k_gasto_multi_pick":
-        # El user está armando la selección en una lista interactiva. Cada
-        # toque alterna (toggle) un campo; Listo confirma; Cancelar sale;
-        # Más pagina. Como fallback admite texto libre con números/nombres.
+        # El user mandó números/nombres separados por coma en UN mensaje.
+        # Admite también "todos" y "cancelar".
         campos_user = ident.get("campos") or []
-        elegidos_ids = list(datos.get("elegidos_multi") or [])
+        lista_ids = datos.get("multi_lista_ids") or [c["id"] for c in campos_user]
+        ids_to_campo = {c["id"]: c for c in campos_user}
+        campos_ordenados = [ids_to_campo[i] for i in lista_ids if i in ids_to_campo]
 
-        if accion == "multi:cancelar":
-            await _wa_clear_conv(numero)
-            await kapso.enviar_texto(
-                numero, "Cancelado. Mandame el gasto de nuevo cuando quieras.")
-            return
-        if accion == "multi:mas":
-            datos["multi_pagina"] = int(datos.get("multi_pagina") or 0) + 1
-            await _kapso_pedir_multi_seleccion_campos(ident, numero, datos)
-            return
-        if accion == "multi:listo":
-            if len(elegidos_ids) < 2:
-                await kapso.enviar_texto(numero, "Necesito al menos 2 campos para repartir.")
-                await _kapso_pedir_multi_seleccion_campos(ident, numero, datos)
-                return
-            elegidos = [c for c in campos_user if c["id"] in elegidos_ids]
-            elegidos_ha = [c for c in elegidos if float(c.get("hectareas") or 0) > 0]
-            if len(elegidos_ha) < 2:
-                await kapso.enviar_texto(
-                    numero,
-                    "Al menos 2 de los campos elegidos tienen que tener "
-                    "hectáreas cargadas para repartir por ha.")
-                await _kapso_pedir_multi_seleccion_campos(ident, numero, datos)
-                return
-            datos["campo_ids_multi"] = [c["id"] for c in elegidos_ha]
-            datos["campo_id"] = elegidos_ha[0]["id"]
-            datos["campo_nombre"] = f"{len(elegidos_ha)} campos"
-            datos.pop("elegidos_multi", None)
-            datos.pop("multi_pagina", None)
-            await _kapso_finalizar_gasto_multi(ident, numero, datos)
-            return
-        if accion.startswith("campo:"):
-            cid = accion.split(":", 1)[1]
-            if cid in elegidos_ids:
-                elegidos_ids.remove(cid)
-            else:
-                elegidos_ids.append(cid)
-            datos["elegidos_multi"] = elegidos_ids
-            await _kapso_pedir_multi_seleccion_campos(ident, numero, datos)
-            return
-
-        # Fallback: texto libre con números y/o nombres separados por coma.
         t = (texto or "").strip().lower()
         if t in ("cancelar", "cancel", "salir", "no", "nada"):
             await _wa_clear_conv(numero)
             await kapso.enviar_texto(
                 numero, "Cancelado. Mandame el gasto de nuevo cuando quieras.")
             return
-        if t in ("listo", "ok", "confirmar"):
-            accion_sim = "multi:listo"
-        if t in ("todos", "todo", "a todos"):
-            elegidos_ids = [c["id"] for c in campos_user
-                            if float(c.get("hectareas") or 0) > 0]
-            datos["elegidos_multi"] = elegidos_ids
-            await _kapso_pedir_multi_seleccion_campos(ident, numero, datos)
-            return
-        tokens = [p.strip() for p in re.split(r"[,\n/;]|\s+y\s+", texto or "") if p.strip()]
-        if tokens:
-            cambio = False
-            for tk in tokens:
-                campo = None
-                if tk.isdigit():
-                    idx = int(tk) - 1
-                    if 0 <= idx < len(campos_user):
-                        campo = campos_user[idx]
-                else:
-                    campo = _buscar_campo(tk, campos_user)
-                if campo and campo["id"] not in elegidos_ids:
-                    elegidos_ids.append(campo["id"])
-                    cambio = True
-            if cambio:
-                datos["elegidos_multi"] = elegidos_ids
-                await _kapso_pedir_multi_seleccion_campos(ident, numero, datos)
+        if t in ("todos", "todo", "todos los campos", "a todos"):
+            elegidos = [c for c in campos_ordenados if float(c.get("hectareas") or 0) > 0]
+            if len(elegidos) < 2:
+                await kapso.enviar_texto(
+                    numero,
+                    "Tengo que tener al menos 2 campos con hectáreas cargadas "
+                    "para repartir. Cargalas desde la app y probá de nuevo.")
+                await _wa_clear_conv(numero)
                 return
-        await kapso.enviar_texto(
-            numero, "No entendí. Tocá los campos de la lista o escribí los nombres separados por coma.")
-        await _kapso_pedir_multi_seleccion_campos(ident, numero, datos)
+            datos["campo_ids_multi"] = [c["id"] for c in elegidos]
+            datos["campo_id"] = elegidos[0]["id"]
+            datos["campo_nombre"] = f"{len(elegidos)} campos"
+            datos.pop("multi_lista_ids", None)
+            await _kapso_finalizar_gasto_multi(ident, numero, datos)
+            return
+
+        tokens = [p.strip() for p in re.split(r"[,\n/;]|\s+y\s+", texto or "") if p.strip()]
+        elegidos_ids_seen: list[str] = []
+        no_encontrados: list[str] = []
+        for tk in tokens:
+            if tk.isdigit():
+                idx = int(tk) - 1
+                if 0 <= idx < len(campos_ordenados):
+                    cid = campos_ordenados[idx]["id"]
+                    if cid not in elegidos_ids_seen:
+                        elegidos_ids_seen.append(cid)
+                    continue
+                no_encontrados.append(tk)
+                continue
+            c = _buscar_campo(tk, campos_user)
+            if c and c["id"] not in elegidos_ids_seen:
+                elegidos_ids_seen.append(c["id"])
+            elif not c:
+                no_encontrados.append(tk)
+
+        if no_encontrados:
+            await kapso.enviar_texto(
+                numero,
+                f"No reconocí: *{', '.join(no_encontrados)}*.\n"
+                "Mandame los números (ej: `1, 3, 5`) o los nombres completos.")
+            return
+        if len(elegidos_ids_seen) < 2:
+            await kapso.enviar_texto(
+                numero,
+                "Necesito al menos 2 campos para repartir. "
+                "Mandame los números o nombres separados por coma.")
+            return
+        elegidos = [ids_to_campo[i] for i in elegidos_ids_seen if i in ids_to_campo]
+        elegidos_ha = [c for c in elegidos if float(c.get("hectareas") or 0) > 0]
+        if len(elegidos_ha) < 2:
+            await kapso.enviar_texto(
+                numero,
+                "Al menos 2 de los campos elegidos tienen que tener hectáreas "
+                "cargadas para repartir por ha. Cargalas desde la app y probá de nuevo.")
+            return
+        datos["campo_ids_multi"] = [c["id"] for c in elegidos_ha]
+        datos["campo_id"] = elegidos_ha[0]["id"]
+        datos["campo_nombre"] = f"{len(elegidos_ha)} campos"
+        datos.pop("multi_lista_ids", None)
+        await _kapso_finalizar_gasto_multi(ident, numero, datos)
         return
 
     if estado == "k_flete_campo":
