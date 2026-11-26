@@ -6212,8 +6212,20 @@ async def _kapso_aplicar_intencion(ident: dict, numero: str, intencion: dict,
         # Resolver cultivo: Claude → único del campo → pedir.
         # NUNCA guardamos bajo "otro": la app filtra por los cultivos reales del
         # campo y una venta bajo "otro" queda invisible (caso real 2026-11-24).
+        # Además matcheamos contra cultivos ya existentes en el campo
+        # (por nombre normalizado, ignorando acentos y mayúsculas) para no
+        # crear keys duplicadas tipo "Maíz" vs "maiz" (caso real 2026-11-26).
+        sembrados = await _wa_cultivos_del_campo(campo["id"])
+        if cultivo:
+            cultivo_norm = _norm_cultivo(cultivo)
+            for s in sembrados:
+                if _norm_cultivo(s) == cultivo_norm:
+                    if s != cultivo:
+                        print(f"[WA ING IA] normalizo cultivo {cultivo!r} → {s!r} "
+                              f"(ya existe en {campo['nombre']!r})")
+                    cultivo = s
+                    break
         if not cultivo:
-            sembrados = await _wa_cultivos_del_campo(campo["id"])
             if len(sembrados) == 1:
                 cultivo = sembrados[0]
                 print(f"[WA ING IA] auto-cultivo={cultivo!r} (único sembrado en {campo['nombre']!r})")
