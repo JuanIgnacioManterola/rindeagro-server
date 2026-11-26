@@ -4272,19 +4272,22 @@ Para INVITAR: si el user menciona el rol ("de administrador", "como operario", "
 finanzas") poné rol_invitado con uno de: "administrador", "operario", "admin_sin_finanzas". Si \
 menciona el número de teléfono ("el +54 9 11 1234-5678") poné telefono_invitado con los dígitos.
 - eliminar: quiere borrar el último registro recién cargado ("eliminar el último gasto", "borrar \
-la venta que cargué", "cancelar la última lluvia", "borrar ese cheque"). Poné tipo_eliminar con \
-el tipo: "gasto", "ingreso", "lluvia", "insumo", "pago" o "tarea". Si dice "el último" sin \
-decir de qué tipo, poné tipo_eliminar="ultimo" (el servidor busca el más reciente de cualquier \
-tipo). El servidor sólo borra lo cargado en los últimos 30 minutos y siempre pide confirmación.
+la venta que cargué", "cancelar la última lluvia", "borrar ese cheque", "borrá el último flete"). \
+Poné tipo_eliminar con el tipo: "gasto", "ingreso", "lluvia", "insumo", "pago", "tarea" o \
+"flete". Si dice "el último" sin decir de qué tipo, poné tipo_eliminar="ultimo" (el servidor \
+busca el más reciente de cualquier tipo). El servidor sólo borra lo cargado en los últimos 30 \
+minutos (60 para tareas) y siempre pide confirmación.
 - modificar_ultimo: quiere corregir algo del último registro ("cambiar el último gasto a 180 \
 dólares", "el gasto no era glifosato era urea", "la lluvia era en Fraga no en Erlicher", "el \
 precio del cheque eran 10 millones", "asignale la tarea a Juan", "cambiá la tarea a prioridad \
-baja"). Poné tipo_eliminar con el tipo de registro (gasto, lluvia, insumo, pago, tarea, \
-ingreso), campo_a_cambiar con QUÉ cambiar ("total", "descripcion", "campo", "precio", \
-"cantidad", "fecha", "banco", "numero", "beneficiario", "comprador", "titulo", "asignado", \
-"prioridad") y valor_nuevo con el valor como string ("180" para montos, "Urea" para \
-descripción, "Fraga" para campo, "Agustina" para asignado, "alta/media/baja" para prioridad). \
-El servidor sólo toca registros de los últimos 30 minutos y pide confirmación.
+baja", "el flete era desde Erlicher", "el flete iba a Cargill no a Bunge"). Poné tipo_eliminar \
+con el tipo de registro (gasto, lluvia, insumo, pago, tarea, ingreso, flete), campo_a_cambiar \
+con QUÉ cambiar ("total", "descripcion", "campo", "precio", "cantidad", "fecha", "banco", \
+"numero", "beneficiario", "comprador", "titulo", "asignado", "prioridad", "destino", "patente", \
+"ctg", "toneladas", "cultivo") y valor_nuevo con el valor como string ("180" para montos, \
+"Urea" para descripción, "Fraga" para campo/origen de flete, "Agustina" para asignado, \
+"alta/media/baja" para prioridad, "Cargill" para destino, "ABD245" para patente). \
+El servidor sólo toca registros de los últimos 30 minutos (60 para tareas) y pide confirmación.
 
 Para eliminar y modificar_ultimo, si el user dice "la primera" / "la primer" / "la vieja" / \
 "la anterior" / "la de antes", el servidor va a buscar el más antiguo de la ventana en vez del \
@@ -5045,13 +5048,38 @@ async def _wa_buscar_ultimo_registro(ident: dict, tipo: str,
             return {"kind": "tarea", "id": r["id"], "table": "tareas",
                     "label": f"Tarea · {r.get('titulo') or 'sin título'}",
                     "creado_en": r["created_at"]}
+        if kind == "flete":
+            rows = await _sb_get("fletes", {
+                "owner_id": f"eq.{owner_id}",
+                "created_at": f"gt.{corte}",
+                "select": "id,toneladas,cultivo,destino,patente_camion,campo_id,created_at",
+                "order": f"created_at.{orden}",
+                "limit": "1",
+            }) or []
+            if not rows:
+                return None
+            r = rows[0]
+            nombre_campo = next((c["nombre"] for c in ident.get("campos", [])
+                                 if c["id"] == r.get("campo_id")), "")
+            partes = ["Flete"]
+            if r.get("toneladas"):
+                partes.append(f"{_num(r['toneladas'])} tn")
+            if r.get("cultivo"):
+                partes.append(f"de {r['cultivo']}")
+            if r.get("destino"):
+                partes.append(f"a {r['destino']}")
+            if nombre_campo:
+                partes.append(f"desde {nombre_campo}")
+            return {"kind": "flete", "id": r["id"], "table": "fletes",
+                    "label": " · ".join(partes),
+                    "creado_en": r["created_at"]}
         return None
 
     if tipo == "ultimo":
         # Probamos todos y nos quedamos con el más reciente (o el más antiguo
         # si el user pidió "la primera") por creado_en.
         candidatos = []
-        for k in ("gasto", "lluvia", "insumo", "pago", "tarea"):
+        for k in ("gasto", "lluvia", "insumo", "pago", "tarea", "flete"):
             r = await _buscar(k)
             if r:
                 candidatos.append(r)
@@ -5829,7 +5857,7 @@ async def _wa_consultar(ident: dict, numero: str, intencion: dict) -> None:
 async def _wa_modificar_ultimo(ident: dict, numero: str, intencion: dict) -> None:
     """Modifica el último registro del tipo indicado. Pide confirmación."""
     tipo = (intencion.get("tipo_eliminar") or "ultimo").strip().lower()
-    if tipo not in ("gasto", "ingreso", "lluvia", "insumo", "pago", "tarea", "ultimo"):
+    if tipo not in ("gasto", "ingreso", "lluvia", "insumo", "pago", "tarea", "flete", "ultimo"):
         tipo = "ultimo"
     campo_cambiar = (intencion.get("campo_a_cambiar") or "").strip().lower()
     valor_nuevo = (intencion.get("valor_nuevo") or "").strip()
@@ -5935,13 +5963,39 @@ async def _wa_modificar_ultimo(ident: dict, numero: str, intencion: dict) -> Non
                     if nombre_norm == n_pedido or n_pedido in nombre_norm or nombre_norm in n_pedido:
                         patch["asignado_a"] = m["miembro_id"]
                         break
+        elif kind == "flete":
+            # Editar flete: campo de origen, destino, patente, ctg,
+            # toneladas, cultivo, precio, fecha.
+            if cm in ("campo", "campo_origen", "origen", "desde"):
+                # Resolver el campo por fuzzy match contra los campos del user.
+                campo = _wa_resolver_campo_fuzzy(ident, valor_nuevo, None)
+                if campo:
+                    patch["campo_id"] = campo["id"]
+            elif cm in ("destino", "destinatario", "a donde", "adonde"):
+                patch["destino"] = valor_nuevo[:200]
+            elif cm in ("patente", "patente_camion", "camion", "camión"):
+                patch["patente_camion"] = valor_nuevo[:20]
+            elif cm in ("ctg", "carta_porte", "carta de porte"):
+                patch["ctg"] = valor_nuevo[:50]
+            elif cm in ("toneladas", "tn", "cantidad", "kilos"):
+                patch["toneladas"] = float(valor_nuevo.replace(",", "."))
+            elif cm in ("cultivo", "grano", "cereal"):
+                patch["cultivo"] = valor_nuevo.strip().lower()[:50]
+            elif cm in ("precio", "precio_flete", "flete"):
+                patch["precio_flete_usd"] = float(valor_nuevo.replace(",", "."))
+            elif cm == "fecha":
+                f = _parsear_fecha_natural(valor_nuevo)
+                if f:
+                    patch["fecha"] = f
     except (ValueError, TypeError):
         pass
 
     if not patch:
+        # Articulo correcto por kind ("en una tarea/lluvia" vs "en un gasto").
+        art = "una" if kind in ("tarea", "lluvia") else "un"
         await kapso.enviar_texto(
             numero,
-            f"No entendí cómo cambiar *{campo_cambiar}* en un {kind}. Probá otra forma.")
+            f"No entendí cómo cambiar *{campo_cambiar}* en {art} {kind}. Probá otra forma.")
         return
 
     # Confirmación: estado + botones
@@ -6040,7 +6094,7 @@ async def _kapso_aplicar_intencion(ident: dict, numero: str, intencion: dict,
 
     if accion == "eliminar":
         tipo = (intencion.get("tipo_eliminar") or "ultimo").strip().lower()
-        if tipo not in ("gasto", "ingreso", "lluvia", "insumo", "pago", "tarea", "ultimo"):
+        if tipo not in ("gasto", "ingreso", "lluvia", "insumo", "pago", "tarea", "flete", "ultimo"):
             tipo = "ultimo"
         cual = _detectar_cual_registro(intencion.get("_texto_crudo") or "")
         registro = await _wa_buscar_ultimo_registro(ident, tipo, cual)
