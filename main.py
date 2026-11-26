@@ -4798,7 +4798,61 @@ async def _kapso_guardar_multi_insumo(ident: dict, numero: str, datos: dict) -> 
     )
 
 
-_ELIMINAR_MAX_MIN = 30  # solo se puede borrar lo cargado en los últimos 30 minutos
+_ELIMINAR_MAX_MIN = 30  # ventana por defecto (gastos, pagos, lluvia, insumos, ingresos)
+# Las tareas no mueven plata ni stock, así que una ventana más amplia tiene
+# poco riesgo y cubre el caso real "cargué la tarea hace media hora y la
+# quiero borrar" que con 30 min quedaba raspado (caso 2026-11-26: 31.6 min).
+_ELIMINAR_MAX_MIN_TAREA = 60
+
+
+def _ventana_minutos(tipo: str) -> int:
+    """Minutos de la ventana de edición según el tipo de registro."""
+    return _ELIMINAR_MAX_MIN_TAREA if tipo == "tarea" else _ELIMINAR_MAX_MIN
+
+
+async def _wa_edad_ultimo_registro(ident: dict, tipo: str) -> int | None:
+    """
+    Minutos desde el último registro del user de ese tipo, ignorando la ventana
+    de edición. Sirve para decirle al user "la última fue hace X min" cuando no
+    cae dentro de la ventana. Devuelve None si no tiene ninguno.
+    """
+    owner_id = ident["owner_id"]
+    tabla_col = {
+        "gasto":   ("gastos",           "creado_en",   "usuario_id"),
+        "lluvia":  ("lluvias",          "creado_en",   "usuario_id"),
+        "insumo":  ("stock_insumos",    "created_at",  "owner_id"),
+        "pago":    ("compromisos_pago", "created_at",  "owner_id"),
+        "tarea":   ("tareas",           "created_at",  "owner_id"),
+    }
+    mejor = None
+    pares = tabla_col.values() if tipo == "ultimo" else [tabla_col.get(tipo)]
+    for par in pares:
+        if not par:
+            continue
+        tabla, col, col_owner = par
+        rows = await _sb_get(tabla, {
+            f"{col_owner}": f"eq.{owner_id}",
+            "select": col,
+            "order": f"{col}.desc",
+            "limit": "1",
+        }) or []
+        if not rows:
+            continue
+        v = rows[0].get(col)
+        if not v:
+            continue
+        if mejor is None or v > mejor:
+            mejor = v
+    if not mejor:
+        return None
+    try:
+        # created_at viene con tz offset (+00). Lo parseamos con fromisoformat.
+        dt = datetime.fromisoformat(mejor.replace("Z", "+00:00"))
+    except Exception:
+        return None
+    ahora = datetime.now(AR_TZ)
+    delta = (ahora - dt).total_seconds() / 60
+    return max(0, int(delta))
 
 
 def _detectar_cual_registro(texto: str) -> str:
@@ -4835,10 +4889,15 @@ async def _wa_buscar_ultimo_registro(ident: dict, tipo: str,
     ventana, cuando el user dijo "la primera" / "la vieja" / "la anterior").
     Devuelve {kind, id, label, extra} o None.
     """
-    corte = (datetime.now(AR_TZ) - timedelta(minutes=_ELIMINAR_MAX_MIN)).isoformat()
     owner_id = ident["owner_id"]
     # Orden por created_at: ascendente cuando el user pidió "la primera".
     orden = "asc" if cual == "primero" else "desc"
+    # La ventana depende del tipo (tareas = 60 min, resto = 30 min). En el
+    # branch "ultimo" cada kind usa su propia ventana dentro de _buscar().
+    ahora = datetime.now(AR_TZ)
+    def _corte(kind: str) -> str:
+        return (ahora - timedelta(minutes=_ventana_minutos(kind))).isoformat()
+    corte = _corte(tipo if tipo != "ultimo" else "gasto")
 
     async def _buscar(kind: str) -> dict | None:
         if kind == "gasto":
@@ -4953,9 +5012,12 @@ async def _wa_buscar_ultimo_registro(ident: dict, tipo: str,
                              f"{r.get('beneficiario') or ''}",
                     "creado_en": r["created_at"]}
         if kind == "tarea":
+            # Las tareas usan su propia ventana (60 min vs 30 min del resto),
+            # para cubrir el caso frecuente de "borrá la tarea de hace un rato"
+            # que con 30 min quedaba raspado (2026-11-26: raspó por 1.6 min).
             rows = await _sb_get("tareas", {
                 "owner_id": f"eq.{owner_id}",
-                "created_at": f"gt.{corte}",
+                "created_at": f"gt.{_corte('tarea')}",
                 "select": "id,titulo,created_at",
                 "order": f"created_at.{orden}",
                 "limit": "1",
@@ -5764,10 +5826,18 @@ async def _wa_modificar_ultimo(ident: dict, numero: str, intencion: dict) -> Non
     registro = await _wa_buscar_ultimo_registro(ident, tipo, cual)
     if not registro:
         tipo_lbl = "nada reciente" if tipo == "ultimo" else f"ningún {tipo}"
+        ventana = _ventana_minutos(tipo if tipo != "ultimo" else "gasto")
+        edad = await _wa_edad_ultimo_registro(ident, tipo)
+        if edad is not None and edad > ventana:
+            extra = (f" El más reciente que tenés es de hace *{edad} min*, "
+                     f"pasó la ventana de {ventana} min. Para editarlo entrá "
+                     f"desde la app.")
+        else:
+            extra = (f" Para editar algo más viejo que {ventana} min, entrá "
+                     f"desde la app.")
         await kapso.enviar_texto(
             numero,
-            f"No encontré {tipo_lbl} tuyo cargado en los últimos {_ELIMINAR_MAX_MIN} minutos. "
-            "Para editar algo más viejo, la app.")
+            f"No encontré {tipo_lbl} tuyo cargado en los últimos {ventana} minutos.{extra}")
         return
 
     # Armo el patch según el campo que quiere cambiar
@@ -5957,10 +6027,18 @@ async def _kapso_aplicar_intencion(ident: dict, numero: str, intencion: dict,
         registro = await _wa_buscar_ultimo_registro(ident, tipo, cual)
         if not registro:
             tipo_lbl = "nada reciente" if tipo == "ultimo" else f"ningún {tipo}"
+            ventana = _ventana_minutos(tipo if tipo != "ultimo" else "gasto")
+            edad = await _wa_edad_ultimo_registro(ident, tipo)
+            if edad is not None and edad > ventana:
+                extra = (f" El más reciente que tenés es de hace *{edad} min*, "
+                         f"pasó la ventana de {ventana} min. Para borrarlo "
+                         f"entrá desde la app.")
+            else:
+                extra = (f" Para borrar algo más viejo que {ventana} min, "
+                         f"entrá desde la app.")
             await kapso.enviar_texto(
                 numero,
-                f"No encontré {tipo_lbl} tuyo cargado en los últimos {_ELIMINAR_MAX_MIN} minutos. "
-                "Para borrar algo más viejo, entrá desde la app.")
+                f"No encontré {tipo_lbl} tuyo cargado en los últimos {ventana} minutos.{extra}")
             return True
         await _kapso_confirmar_eliminar(numero, registro)
         return True
