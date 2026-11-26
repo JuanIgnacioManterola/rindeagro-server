@@ -4252,11 +4252,17 @@ decir de qué tipo, poné tipo_eliminar="ultimo" (el servidor busca el más reci
 tipo). El servidor sólo borra lo cargado en los últimos 30 minutos y siempre pide confirmación.
 - modificar_ultimo: quiere corregir algo del último registro ("cambiar el último gasto a 180 \
 dólares", "el gasto no era glifosato era urea", "la lluvia era en Fraga no en Erlicher", "el \
-precio del cheque eran 10 millones"). Poné tipo_eliminar con el tipo de registro, \
-campo_a_cambiar con QUÉ cambiar ("total", "descripcion", "campo", "precio", "cantidad", \
-"fecha", "banco", "numero", "beneficiario", "comprador") y valor_nuevo con el valor como \
-string ("180" para montos, "Urea" para descripción, "Fraga" para campo). El servidor sólo \
-toca registros de los últimos 30 minutos y pide confirmación.
+precio del cheque eran 10 millones", "asignale la tarea a Juan", "cambiá la tarea a prioridad \
+baja"). Poné tipo_eliminar con el tipo de registro (gasto, lluvia, insumo, pago, tarea, \
+ingreso), campo_a_cambiar con QUÉ cambiar ("total", "descripcion", "campo", "precio", \
+"cantidad", "fecha", "banco", "numero", "beneficiario", "comprador", "titulo", "asignado", \
+"prioridad") y valor_nuevo con el valor como string ("180" para montos, "Urea" para \
+descripción, "Fraga" para campo, "Agustina" para asignado, "alta/media/baja" para prioridad). \
+El servidor sólo toca registros de los últimos 30 minutos y pide confirmación.
+
+Para eliminar y modificar_ultimo, si el user dice "la primera" / "la primer" / "la vieja" / \
+"la anterior" / "la de antes", el servidor va a buscar el más antiguo de la ventana en vez del \
+más reciente. No pongas nada especial por eso, el servidor detecta esas palabras solo.
 - consultar: hace una pregunta. Poné tipo_consulta con uno de los valores de abajo. Si pregunta \
 por un campo, poné campo_id. Si pregunta por un cultivo, poné cultivo. Si pregunta por un rubro, \
 poné rubro. Si pregunta por un producto/insumo específico, poné descripcion.
@@ -4786,15 +4792,44 @@ async def _kapso_guardar_multi_insumo(ident: dict, numero: str, datos: dict) -> 
 _ELIMINAR_MAX_MIN = 30  # solo se puede borrar lo cargado en los últimos 30 minutos
 
 
-async def _wa_buscar_ultimo_registro(ident: dict, tipo: str) -> dict | None:
+def _detectar_cual_registro(texto: str) -> str:
     """
-    Busca el último registro del user del tipo pedido, cargado en los últimos
+    Si el user habla de "la PRIMERA", "la PRIMER", "la VIEJA", "la de antes",
+    "la que cargué antes", "la anterior", "el PRIMERO" → quiere el más antiguo
+    dentro de la ventana de edición. Default: "ultimo" (el más reciente), que
+    es lo que el user quiere la mayoría de las veces ("el último gasto que cargué").
+    Caso real 2026-11-26: "eliminar la primer tarea que te pase de revisar
+    pulverizadora a agustina" y el bot borraba la última (la bien cargada).
+    """
+    n = (texto or "").strip().lower()
+    patrones_primero = (
+        "primer tarea", "primera tarea", "primer gasto", "primer ingreso",
+        "primer pago", "primer cheque", "primer insumo", "primera lluvia",
+        "primer ", "primera ", "primero ",
+        "la vieja", "el viejo", "la de antes", "el de antes",
+        "la anterior", "el anterior", "la previa", "el previo",
+        "la que cargue antes", "la que cargué antes",
+    )
+    for p in patrones_primero:
+        if p in n:
+            return "primero"
+    return "ultimo"
+
+
+async def _wa_buscar_ultimo_registro(ident: dict, tipo: str,
+                                     cual: str = "ultimo") -> dict | None:
+    """
+    Busca un registro del user del tipo pedido, cargado en los últimos
     _ELIMINAR_MAX_MIN minutos. tipo puede ser: gasto, ingreso, lluvia, insumo,
     pago, tarea, o "ultimo" (el más reciente de cualquier tipo).
+    cual: "ultimo" (default, el más reciente) o "primero" (el más antiguo de la
+    ventana, cuando el user dijo "la primera" / "la vieja" / "la anterior").
     Devuelve {kind, id, label, extra} o None.
     """
     corte = (datetime.now(AR_TZ) - timedelta(minutes=_ELIMINAR_MAX_MIN)).isoformat()
     owner_id = ident["owner_id"]
+    # Orden por created_at: ascendente cuando el user pidió "la primera".
+    orden = "asc" if cual == "primero" else "desc"
 
     async def _buscar(kind: str) -> dict | None:
         if kind == "gasto":
@@ -4802,7 +4837,7 @@ async def _wa_buscar_ultimo_registro(ident: dict, tipo: str) -> dict | None:
                 "usuario_id": f"eq.{owner_id}",
                 "creado_en": f"gt.{corte}",
                 "select": "id,rubro,descripcion,total_de_usd,creado_en,campo_id",
-                "order": "creado_en.desc",
+                "order": f"creado_en.{orden}",
                 "limit": "1",
             }) or []
             if not rows:
@@ -4838,7 +4873,12 @@ async def _wa_buscar_ultimo_registro(ident: dict, tipo: str) -> dict | None:
                 for cultivo, info in (data or {}).items():
                     for v in (info.get("ventas") or []):
                         f = v.get("fecha") or ""
-                        if f and (mejor_fecha is None or f > mejor_fecha):
+                        if not f:
+                            continue
+                        es_mejor = (mejor_fecha is None
+                                    or (f < mejor_fecha if cual == "primero"
+                                        else f > mejor_fecha))
+                        if es_mejor:
                             mejor_fecha = f
                             mejor = {"campo_id": c["id"], "campo_nombre": c["nombre"],
                                      "cultivo": cultivo, "venta": v}
@@ -4860,7 +4900,7 @@ async def _wa_buscar_ultimo_registro(ident: dict, tipo: str) -> dict | None:
                 "usuario_id": f"eq.{owner_id}",
                 "creado_en": f"gt.{corte}",
                 "select": "id,mm,fecha,creado_en,campo_id",
-                "order": "creado_en.desc",
+                "order": f"creado_en.{orden}",
                 "limit": "1",
             }) or []
             if not rows:
@@ -4877,7 +4917,7 @@ async def _wa_buscar_ultimo_registro(ident: dict, tipo: str) -> dict | None:
                 "owner_id": f"eq.{owner_id}",
                 "created_at": f"gt.{corte}",
                 "select": "id,nombre,tipo,stock_actual,unidad,created_at",
-                "order": "created_at.desc",
+                "order": f"created_at.{orden}",
                 "limit": "1",
             }) or []
             if not rows:
@@ -4892,7 +4932,7 @@ async def _wa_buscar_ultimo_registro(ident: dict, tipo: str) -> dict | None:
                 "owner_id": f"eq.{owner_id}",
                 "created_at": f"gt.{corte}",
                 "select": "id,tipo,beneficiario,importe,moneda,fecha_cobro,created_at",
-                "order": "created_at.desc",
+                "order": f"created_at.{orden}",
                 "limit": "1",
             }) or []
             if not rows:
@@ -4908,7 +4948,7 @@ async def _wa_buscar_ultimo_registro(ident: dict, tipo: str) -> dict | None:
                 "owner_id": f"eq.{owner_id}",
                 "created_at": f"gt.{corte}",
                 "select": "id,titulo,created_at",
-                "order": "created_at.desc",
+                "order": f"created_at.{orden}",
                 "limit": "1",
             }) or []
             if not rows:
@@ -4920,7 +4960,8 @@ async def _wa_buscar_ultimo_registro(ident: dict, tipo: str) -> dict | None:
         return None
 
     if tipo == "ultimo":
-        # Probamos todos y nos quedamos con el más reciente por creado_en.
+        # Probamos todos y nos quedamos con el más reciente (o el más antiguo
+        # si el user pidió "la primera") por creado_en.
         candidatos = []
         for k in ("gasto", "lluvia", "insumo", "pago", "tarea"):
             r = await _buscar(k)
@@ -4928,7 +4969,8 @@ async def _wa_buscar_ultimo_registro(ident: dict, tipo: str) -> dict | None:
                 candidatos.append(r)
         if not candidatos:
             return None
-        return max(candidatos, key=lambda x: x.get("creado_en") or "")
+        picker = min if cual == "primero" else max
+        return picker(candidatos, key=lambda x: x.get("creado_en") or "")
     return await _buscar(tipo)
 
 
@@ -5709,7 +5751,8 @@ async def _wa_modificar_ultimo(ident: dict, numero: str, intencion: dict) -> Non
                      "_el gasto no era glifosato era urea_")
         return
 
-    registro = await _wa_buscar_ultimo_registro(ident, tipo)
+    cual = _detectar_cual_registro(intencion.get("_texto_crudo") or "")
+    registro = await _wa_buscar_ultimo_registro(ident, tipo, cual)
     if not registro:
         tipo_lbl = "nada reciente" if tipo == "ultimo" else f"ningún {tipo}"
         await kapso.enviar_texto(
@@ -5767,6 +5810,33 @@ async def _wa_modificar_ultimo(ident: dict, numero: str, intencion: dict) -> Non
                 f = _parsear_fecha_natural(valor_nuevo)
                 if f:
                     patch["fecha_cobro"] = f
+        elif kind == "tarea":
+            # Editar tarea: titulo, descripcion, prioridad, fecha,
+            # asignado (resuelto contra el equipo del user).
+            if cm in ("titulo", "título", "nombre"):
+                patch["titulo"] = valor_nuevo[:200]
+            elif cm in ("descripcion", "descripción", "detalle"):
+                patch["descripcion"] = valor_nuevo[:500]
+            elif cm == "prioridad":
+                prio = valor_nuevo.strip().lower()
+                if prio in ("alta", "media", "baja"):
+                    patch["prioridad"] = prio
+            elif cm == "fecha":
+                f = _parsear_fecha_natural(valor_nuevo)
+                if f:
+                    patch["fecha_vencimiento"] = f
+            elif cm in ("asignado", "asignada", "persona", "a quien", "a quién"):
+                # Match contra el equipo del user, igual criterio que k_tar_asignado
+                # (match por nombre normalizado). Si no matchea nadie, no se aplica.
+                equipo = await _wa_equipo_del_user(ident["owner_id"])
+                n_pedido = _norm(valor_nuevo)
+                for m in equipo:
+                    nombre_norm = _norm(str(m.get("nombre_display") or ""))
+                    if not nombre_norm:
+                        continue
+                    if nombre_norm == n_pedido or n_pedido in nombre_norm or nombre_norm in n_pedido:
+                        patch["asignado_a"] = m["miembro_id"]
+                        break
     except (ValueError, TypeError):
         pass
 
@@ -5874,7 +5944,8 @@ async def _kapso_aplicar_intencion(ident: dict, numero: str, intencion: dict,
         tipo = (intencion.get("tipo_eliminar") or "ultimo").strip().lower()
         if tipo not in ("gasto", "ingreso", "lluvia", "insumo", "pago", "tarea", "ultimo"):
             tipo = "ultimo"
-        registro = await _wa_buscar_ultimo_registro(ident, tipo)
+        cual = _detectar_cual_registro(intencion.get("_texto_crudo") or "")
+        registro = await _wa_buscar_ultimo_registro(ident, tipo, cual)
         if not registro:
             tipo_lbl = "nada reciente" if tipo == "ultimo" else f"ningún {tipo}"
             await kapso.enviar_texto(
