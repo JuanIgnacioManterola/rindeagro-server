@@ -2826,6 +2826,21 @@ async def _kapso_flujo(ident: dict, numero: str, m, conv: dict) -> None:
                                        intencion.get("_texto_crudo") or "")
         return
 
+    if estado == "k_flete_campo":
+        campo = None
+        if accion.startswith("campo:"):
+            cid = accion.split(":", 1)[1]
+            campo = next((c for c in ident.get("campos", []) if c["id"] == cid), None)
+        if not campo:
+            campo = _buscar_campo(texto, ident.get("campos") or [])
+        if not campo:
+            await kapso.enviar_texto(numero, "No reconocí ese campo. Tocá uno de la lista de arriba.")
+            return
+        datos.setdefault("flete", {})["campo_id"] = campo["id"]
+        datos["flete"]["campo_nombre"] = campo["nombre"]
+        await _kapso_guardar_flete(ident, numero, datos)
+        return
+
     if estado in ("k_gasto_campo", "k_lluvia_campo"):
         campo = None
         if accion.startswith("campo:"):
@@ -4221,9 +4236,11 @@ dejalo "".
 - siembra: dice que se sembró un campo ("sembré La Escondida con soja el 10/12"). cultivo, campo_id, \
 fecha_siembra (YYYY-MM-DD). Se guarda como gasto de semillas con la fecha.
 - flete: cargar un flete / carta de porte ("mandé 30 tn de soja a Rosario, patente ABC123, CTG \
-456789"). cultivo, toneladas, destino, patente_camion (del camión), ctg (número CTG), campo_id, \
-fecha_venc (fecha del flete), precio_unit_usd (si da precio por tonelada), monto_usd (si da \
-total). El servidor va a pedir lo que falte.
+456789", "flete desde Erlicher, 28 tn de soja a Cargill con patente DEF456"). cultivo, \
+toneladas, destino, patente_camion (del camión), ctg (número CTG), campo_id (el campo DESDE \
+donde salió el cereal, si lo menciona: "desde Erlicher", "salió de Fraga", "del lote La \
+Escondida"), fecha_venc (fecha del flete), precio_unit_usd (si da precio por tonelada), \
+monto_usd (si da total). El servidor va a pedir el campo si no lo decís.
 - rendimiento_real: cosechó un campo y quiere registrar el rendimiento real ("rindió 3.2 \
 toneladas por hectárea de maíz en Erlicher", "el rendimiento fue de 4 t/ha"). cultivo, campo_id, \
 rendimiento_tha (número en toneladas por hectárea).
@@ -5119,6 +5136,8 @@ async def _kapso_guardar_flete(ident: dict, numero: str, datos: dict) -> None:
     partes = [f"🚚 Flete cargado."]
     if f.get("toneladas"):
         partes.append(f"⚖️ {_num(f['toneladas'])} tn" + (f" de {f['cultivo']}" if f.get("cultivo") else ""))
+    if f.get("campo_nombre"):
+        partes.append(f"🌱 Desde: {f['campo_nombre']}")
     if f.get("destino"):
         partes.append(f"📍 Destino: {f['destino']}")
     if f.get("patente_camion"):
@@ -6059,6 +6078,7 @@ async def _kapso_aplicar_intencion(ident: dict, numero: str, intencion: dict,
                                         intencion.get("campo_id"))
         datos = {"flete": {
             "campo_id": campo["id"] if campo else None,
+            "campo_nombre": campo["nombre"] if campo else None,
             "cultivo": intencion.get("cultivo") or None,
             "fecha": intencion.get("fecha_venc") or datetime.now(AR_TZ).date().isoformat(),
             "patente_camion": intencion.get("patente_camion") or None,
@@ -6074,6 +6094,23 @@ async def _kapso_aplicar_intencion(ident: dict, numero: str, intencion: dict,
                 "Necesito más datos del flete: cuántas toneladas, de qué cultivo, "
                 "patente del camión, destino. Probá mandándolos juntos.")
             return True
+        # Sin campo de origen → preguntar (así el flete queda atribuido al
+        # campo correspondiente para la rentabilidad). Si el user tiene un
+        # solo campo, _kapso_pedir_campo lo elige solo y sigue de largo.
+        if not datos["flete"].get("campo_id"):
+            tn = datos["flete"].get("toneladas")
+            cultivo = datos["flete"].get("cultivo")
+            pregunta = "¿De qué campo salió el cereal?"
+            if tn and cultivo:
+                pregunta = f"¿De qué campo salieron las {_num(tn)} tn de {cultivo}?"
+            elif tn:
+                pregunta = f"¿De qué campo salieron las {_num(tn)} tn?"
+            if await _kapso_pedir_campo(ident, numero, "k_flete_campo", datos, pregunta):
+                return True
+            # Un solo campo: _kapso_pedir_campo seteó datos["campo_id"], lo
+            # pasamos al dict del flete.
+            datos["flete"]["campo_id"] = datos.get("campo_id")
+            datos["flete"]["campo_nombre"] = datos.get("campo_nombre")
         await _kapso_guardar_flete(ident, numero, datos)
         return True
 
