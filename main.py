@@ -797,6 +797,50 @@ def _num(v) -> str:
     return str(int(f)) if f == int(f) else f"{f:.1f}".replace(".", ",")
 
 
+def _parsear_ars(txt: str) -> float:
+    """
+    Parsea un número en formato argentino.
+    - "55.000" → 55000.0 (punto como miles)
+    - "55,5"   → 55.5 (coma decimal)
+    - "55.000,50" → 55000.5 (miles + decimal AR)
+    - "55000" → 55000.0
+    - "55k" / "55 mil" → 55000.0
+    - "1,2 millones" / "1.2M" → 1200000.0
+    """
+    s = (txt or "").strip().lower()
+    # Soporte "55k" / "55 mil"
+    m = re.search(r"(\d+(?:[.,]\d+)?)\s*(?:k|mil)\b", s)
+    if m:
+        return float(m.group(1).replace(",", ".")) * 1000
+    # Soporte "1.2 millones" / "1,2M"
+    m = re.search(r"(\d+(?:[.,]\d+)?)\s*(?:m\b|millones?|palos?)", s)
+    if m:
+        return float(m.group(1).replace(",", ".")) * 1_000_000
+    # Extraer solo el número con separadores
+    m = re.search(r"\d[\d.,]*", s)
+    if not m:
+        raise ValueError(f"no reconozco el número en {txt!r}")
+    raw = m.group(0)
+    # Normalizar separadores:
+    if "," in raw and "." in raw:
+        # Ambos → el último que aparece es decimal
+        if raw.rfind(",") > raw.rfind("."):
+            raw = raw.replace(".", "").replace(",", ".")
+        else:
+            raw = raw.replace(",", "")
+    elif "," in raw:
+        # Solo coma: decimal AR → "55,5" = 55.5
+        raw = raw.replace(",", ".")
+    elif raw.count(".") >= 1:
+        # Uno o más puntos sin coma: si hay varios o el grupo final es de 3 cifras,
+        # son separadores de miles → "55.000" = 55000, "1.234.567" = 1234567.
+        partes = raw.split(".")
+        if len(partes) > 2 or (len(partes) == 2 and len(partes[1]) == 3 and len(partes[0]) <= 3):
+            raw = raw.replace(".", "")
+        # Si no (ej "55.5"), es decimal normal y lo dejamos.
+    return float(raw)
+
+
 async def _kapso_pedir_campo(ident: dict, numero: str, estado: str, datos: dict, texto: str) -> bool:
     """
     Pide elegir campo. Devuelve True si preguntó, False si había uno solo
@@ -2846,22 +2890,15 @@ async def _kapso_flujo(ident: dict, numero: str, m, conv: dict) -> None:
 
     if estado == "k_flete_precio":
         # Esperamos un número: el precio por tonelada en ARS.
-        # Si el user escribe "20000", "$ 20.000", "20mil", tomamos 20000.
-        # Aceptamos "20k" o "20mil" como 20000.
-        t = (texto or "").lower().replace(".", "")
-        # Soporte para "20k" / "20 mil".
-        mk = re.search(r"(\d+(?:[.,]\d+)?)\s*(?:k|mil)\b", t)
-        if mk:
-            precio_por_tn = float(mk.group(1).replace(",", ".")) * 1000
-        else:
-            m = re.search(r"(\d+(?:[.,]\d+)?)", t)
-            if not m:
-                await kapso.enviar_texto(
-                    numero,
-                    "No entendí el precio. Mandame un número en pesos "
-                    "(ej: *25000* para $25.000/tn).")
-                return
-            precio_por_tn = float(m.group(1).replace(",", "."))
+        # Acepta "20000", "$ 20.000", "20mil", "20k", "20.000", "20,5" (decimal AR).
+        try:
+            precio_por_tn = _parsear_ars(texto or "")
+        except (ValueError, TypeError):
+            await kapso.enviar_texto(
+                numero,
+                "No entendí el precio. Mandame un número en pesos "
+                "(ej: *25000* para $25.000/tn).")
+            return
         tn = float(datos.get("flete", {}).get("toneladas") or 0)
         if tn <= 0:
             await kapso.enviar_texto(
@@ -5109,6 +5146,7 @@ async def _wa_buscar_ultimo_registro(ident: dict, tipo: str,
                 partes.append(f"desde {nombre_campo}")
             return {"kind": "flete", "id": r["id"], "table": "fletes",
                     "label": " · ".join(partes),
+                    "toneladas": float(r.get("toneladas")) if r.get("toneladas") else None,
                     "creado_en": r["created_at"]}
         return None
 
@@ -6057,11 +6095,33 @@ async def _wa_modificar_ultimo(ident: dict, numero: str, intencion: dict) -> Non
                 patch["toneladas"] = float(valor_nuevo.replace(",", "."))
             elif cm in ("cultivo", "grano", "cereal"):
                 patch["cultivo"] = valor_nuevo.strip().lower()[:50]
-            elif cm in ("precio", "precio_flete", "flete"):
-                # Por defecto el precio del flete por WhatsApp se maneja en
-                # ARS (la conversión a USD la hace el user desde la app).
-                patch["precio_flete_ars"] = float(valor_nuevo.replace(",", "."))
+            elif cm in ("precio", "precio_flete", "flete",
+                        "precio_por_tn", "precio_tn", "por_tonelada", "tonelada"):
+                # El precio del flete por WhatsApp se maneja en ARS y por
+                # tonelada (así se cierra con el fletero). Si el user dice
+                # "cambiá el precio del flete a 55000" interpretamos 55000/tn
+                # y multiplicamos por las toneladas del flete para calcular
+                # el total (igual al flujo de carga). La conversión a USD
+                # queda para la app.
+                precio_por_tn_nuevo = _parsear_ars(valor_nuevo)
+                tn_reg = float(registro.get("toneladas") or 0)
+                patch["precio_por_tn_ars"] = precio_por_tn_nuevo
+                if tn_reg > 0:
+                    patch["precio_flete_ars"] = round(precio_por_tn_nuevo * tn_reg, 2)
                 patch["precio_flete_moneda"] = "ARS"
+                # Pisamos USD si lo había, para que la app tenga que
+                # reconvertir con el nuevo precio ARS.
+                patch["precio_flete_usd"] = None
+                patch["precio_por_tn_usd"] = None
+            elif cm in ("total", "total_flete", "precio_total"):
+                total_nuevo = _parsear_ars(valor_nuevo)
+                tn_reg = float(registro.get("toneladas") or 0)
+                patch["precio_flete_ars"] = total_nuevo
+                if tn_reg > 0:
+                    patch["precio_por_tn_ars"] = round(total_nuevo / tn_reg, 2)
+                patch["precio_flete_moneda"] = "ARS"
+                patch["precio_flete_usd"] = None
+                patch["precio_por_tn_usd"] = None
             elif cm == "fecha":
                 f = _parsear_fecha_natural(valor_nuevo)
                 if f:
@@ -6077,10 +6137,32 @@ async def _wa_modificar_ultimo(ident: dict, numero: str, intencion: dict) -> Non
             f"No entendí cómo cambiar *{campo_cambiar}* en {art} {kind}. Probá otra forma.")
         return
 
-    # Confirmación: estado + botones
+    # Confirmación: estado + botones. Para fletes mostramos el precio con el
+    # formato que el user espera (precio por tonelada + total). Para el resto
+    # cae en el genérico key → value.
     await _wa_set_conv(numero, "k_mod_confirmar",
                        {"registro": registro, "patch": patch})
-    cambios = ", ".join(f"*{k}* → *{v}*" for k, v in patch.items())
+    lineas_cambios: list[str] = []
+    patch_restante = dict(patch)
+    if kind == "flete":
+        pr_tn = patch_restante.pop("precio_por_tn_ars", None)
+        pr_total = patch_restante.pop("precio_flete_ars", None)
+        patch_restante.pop("precio_flete_moneda", None)
+        patch_restante.pop("precio_flete_usd", None)
+        patch_restante.pop("precio_por_tn_usd", None)
+        if pr_tn is not None:
+            lineas_cambios.append(f"💰 Precio/tn: *$ {_miles(pr_tn)}*")
+        if pr_total is not None:
+            tn_reg = registro.get("toneladas")
+            if tn_reg:
+                lineas_cambios.append(
+                    f"📦 Total: *$ {_miles(pr_total)}* ({_num(tn_reg)} tn × $ {_miles(pr_tn or 0)})")
+            else:
+                lineas_cambios.append(f"📦 Total: *$ {_miles(pr_total)}*")
+    # El resto de los campos del patch, formato key → valor.
+    for k, v in patch_restante.items():
+        lineas_cambios.append(f"• *{k}* → *{v}*")
+    cambios = "\n".join(lineas_cambios) if lineas_cambios else "(sin cambios)"
     await kapso.enviar_botones(
         numero,
         f"✏️ Cambios para:\n{registro.get('label') or ''}\n\n{cambios}\n\n¿Lo aplico?",
