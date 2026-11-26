@@ -869,6 +869,47 @@ async def _kapso_pedir_campo(ident: dict, numero: str, estado: str, datos: dict,
     return True
 
 
+async def _kapso_pedir_distribucion_gasto(
+    ident: dict, numero: str, estado_campo: str, datos: dict, texto_pregunta: str
+) -> bool:
+    """
+    Antes de pedir el campo de un gasto, pregunta cómo se distribuye:
+    - *Un campo*: flujo normal (pide uno).
+    - *Varios*: el user manda los nombres por texto.
+    - *Todos*: se divide entre todos los campos del user, proporcional a hectáreas.
+
+    Si el user tiene 0/1 campos, salteamos la pregunta y seguimos directo
+    (0 → aviso; 1 → ese es el campo). Devuelve True si preguntó algo (hay
+    que cortar el flujo), False si ya resolvió el campo en datos.
+    """
+    campos = ident.get("campos") or []
+    if not campos:
+        await kapso.enviar_texto(
+            numero, f"No tenés campos cargados todavía. Creá uno en {APP_URL} y volvé.")
+        await _wa_clear_conv(numero)
+        return True
+    if len(campos) == 1:
+        datos["campo_id"] = campos[0]["id"]
+        datos["campo_nombre"] = campos[0]["nombre"]
+        return False
+
+    # Guardamos qué estado seguir si el user elige "un solo campo" y el texto
+    # original de la pregunta, para re-usarlo en ese caso.
+    datos["__estado_campo__"] = estado_campo
+    datos["__texto_campo__"] = texto_pregunta
+    await _wa_set_conv(numero, "k_gasto_distribucion", datos)
+    await kapso.enviar_botones(
+        numero,
+        f"{texto_pregunta}\n\n¿A cuántos campos imputo este gasto?",
+        [
+            ("dist:uno", "📍 Un solo campo"),
+            ("dist:varios", "📂 Varios campos"),
+            ("dist:todos", "🌍 Todos (por ha)"),
+        ],
+    )
+    return True
+
+
 # ── Gastos ────────────────────────────────────
 
 # Lista de rubros oficial de la app (paridad con index.html). Los primeros 4
@@ -1289,6 +1330,69 @@ async def _kapso_gasto_desde_archivo(ident: dict, numero: str, m) -> None:
                                 "\n".join(resumen) + "\n\n¿A qué campo lo cargo?"):
         return
     await _kapso_guardar_gasto(ident, numero, datos)
+
+
+async def _kapso_finalizar_gasto_multi(ident: dict, numero: str, datos: dict) -> None:
+    """Divide un gasto entre varios campos en proporción a sus hectáreas.
+    Crea una fila por campo en la tabla gastos. Toma el total_de_usd del
+    gasto ya armado en datos["gasto"] y lo reparte: cada campo recibe
+    total * (ha_campo / ha_total)."""
+    ids = datos.get("campo_ids_multi") or []
+    g = dict(datos.get("gasto") or {})
+    if not ids or len(ids) < 2 or not g:
+        # Sin ids o con uno solo, cae al flujo normal (single-campo).
+        if ids:
+            datos["campo_id"] = ids[0]
+            # Nombre del campo para el mensaje de éxito.
+            uno = next((c for c in ident.get("campos", []) if c["id"] == ids[0]), None)
+            datos["campo_nombre"] = (uno or {}).get("nombre") or datos.get("campo_nombre") or ""
+        await _kapso_guardar_gasto(ident, numero, datos)
+        return
+    campos_elegidos = [c for c in (ident.get("campos") or []) if c["id"] in ids]
+    ha_total = sum(float(c.get("hectareas") or 0) for c in campos_elegidos)
+    if ha_total <= 0:
+        await kapso.enviar_texto(
+            numero, "Ninguno de los campos elegidos tiene hectáreas cargadas.")
+        await _wa_clear_conv(numero)
+        return
+    monto_total_usd = float(g.get("total_de_usd") or 0)
+    if monto_total_usd <= 0:
+        await kapso.enviar_texto(numero, "Me falta el monto para poder dividirlo.")
+        await _wa_clear_conv(numero)
+        return
+    rubro = (g.get("rubro") or "otros").strip().lower()
+    desc_base = (g.get("descripcion") or rubro.capitalize()).strip()
+    fecha_g = g.get("fecha") or datetime.now(AR_TZ).date().isoformat()
+    cultivo = g.get("cultivo")
+    lineas = [
+        f"✅ Gasto repartido entre *{len(campos_elegidos)}* campos "
+        f"({_num(ha_total)} ha):",
+        f"_{rubro.capitalize()} · USD {_num(monto_total_usd)} total_",
+        "",
+    ]
+    for c in campos_elegidos:
+        ha_c = float(c.get("hectareas") or 0)
+        prop = ha_c / ha_total if ha_total > 0 else 0
+        monto_c = round(monto_total_usd * prop, 2)
+        payload = {
+            "campo_id": c["id"],
+            "usuario_id": ident["owner_id"],
+            "rubro": rubro,
+            "fecha": fecha_g,
+            "total_de_usd": monto_c,
+            "descripcion": f"{desc_base} · proporcional {_num(round(prop * 100, 1))}%",
+        }
+        if ha_c > 0:
+            payload["usd_ha"] = round(monto_c / ha_c, 2)
+        if cultivo:
+            payload["cultivo"] = cultivo.strip().lower()[:50] if isinstance(cultivo, str) else cultivo
+        await _sb_post("gastos", payload)
+        usd_ha_txt = _num(round(monto_c / ha_c, 2)) if ha_c else "—"
+        lineas.append(
+            f"• *{c['nombre']}* ({_num(ha_c)} ha): USD {_num(monto_c)} "
+            f"· USD {usd_ha_txt}/ha")
+    await _wa_clear_conv(numero)
+    await kapso.enviar_texto(numero, "\n".join(lineas))
 
 
 async def _kapso_guardar_gasto(ident: dict, numero: str, datos: dict) -> None:
@@ -2880,6 +2984,83 @@ async def _kapso_flujo(ident: dict, numero: str, m, conv: dict) -> None:
         await _wa_clear_conv(numero)
         await _kapso_aplicar_intencion(ident, numero, intencion,
                                        intencion.get("_texto_crudo") or "")
+        return
+
+    if estado == "k_gasto_distribucion":
+        # El user eligió cómo repartir el gasto: un campo, varios o todos.
+        estado_campo = datos.pop("__estado_campo__", "k_gasto_campo")
+        texto_campo = datos.pop("__texto_campo__", "¿En qué campo fue el gasto?")
+        campos_user = ident.get("campos") or []
+        if accion == "dist:uno":
+            # Volvemos al flujo normal: pedir UN campo.
+            await _kapso_pedir_campo(ident, numero, estado_campo, datos, texto_campo)
+            return
+        if accion == "dist:todos":
+            # Reparto proporcional entre TODOS los campos con hectáreas > 0.
+            elegibles = [c for c in campos_user if float(c.get("hectareas") or 0) > 0]
+            if not elegibles:
+                await kapso.enviar_texto(
+                    numero,
+                    "Ninguno de tus campos tiene hectáreas cargadas, no puedo "
+                    "repartir. Cargalas desde la app y probá de nuevo.")
+                await _wa_clear_conv(numero)
+                return
+            datos["campo_ids_multi"] = [c["id"] for c in elegibles]
+            datos["campo_id"] = elegibles[0]["id"]
+            datos["campo_nombre"] = f"{len(elegibles)} campos"
+            await _kapso_finalizar_gasto_multi(ident, numero, datos)
+            return
+        if accion == "dist:varios":
+            # Pedimos los nombres por texto libre, resolvemos por fuzzy.
+            await _wa_set_conv(numero, "k_gasto_varios_sel", datos)
+            nombres = ", ".join(c["nombre"] for c in campos_user[:8])
+            if len(campos_user) > 8:
+                nombres += ", ..."
+            await kapso.enviar_texto(
+                numero,
+                "Pasame los nombres separados por coma. Por ejemplo:\n"
+                f"_{campos_user[0]['nombre']}, {campos_user[1]['nombre']}_\n\n"
+                f"Tus campos: {nombres}")
+            return
+        await kapso.enviar_texto(numero, "No entendí la opción, tocá un botón.")
+        return
+
+    if estado == "k_gasto_varios_sel":
+        # El user mandó los nombres de los campos a los que repartir.
+        # Los separamos por coma / " y " / salto de línea y resolvemos con fuzzy.
+        campos_user = ident.get("campos") or []
+        partes = [p.strip() for p in re.split(r"[,\n]|\s+y\s+", texto or "") if p.strip()]
+        elegidos = []
+        no_encontrados = []
+        for p in partes:
+            c = _buscar_campo(p, campos_user)
+            if c and c["id"] not in [e["id"] for e in elegidos]:
+                elegidos.append(c)
+            elif not c:
+                no_encontrados.append(p)
+        if no_encontrados:
+            await kapso.enviar_texto(
+                numero,
+                f"No reconocí: *{', '.join(no_encontrados)}*. "
+                "Mandame los nombres de nuevo o tocá *Cargar otra cosa*.")
+            return
+        if len(elegidos) < 2:
+            await kapso.enviar_texto(
+                numero,
+                "Necesito al menos 2 campos para repartir. "
+                "Mandame los nombres separados por coma.")
+            return
+        elegidos_ha = [c for c in elegidos if float(c.get("hectareas") or 0) > 0]
+        if len(elegidos_ha) < 2:
+            await kapso.enviar_texto(
+                numero,
+                "Al menos 2 de los campos elegidos tienen que tener hectáreas "
+                "cargadas para repartir por ha.")
+            return
+        datos["campo_ids_multi"] = [c["id"] for c in elegidos_ha]
+        datos["campo_id"] = elegidos_ha[0]["id"]
+        datos["campo_nombre"] = f"{len(elegidos_ha)} campos"
+        await _kapso_finalizar_gasto_multi(ident, numero, datos)
         return
 
     if estado == "k_flete_campo":
@@ -6823,15 +7004,26 @@ async def _kapso_aplicar_intencion(ident: dict, numero: str, intencion: dict,
 
         if campo is None:
             # Sin campo todavía (y ningún item era por hectárea): guardamos
-            # el primer gasto y pedimos el campo con el flujo single-item
-            # existente, así no perdemos retrocompatibilidad.
+            # el primer gasto y preguntamos distribución (un campo, varios o
+            # todos). Para gastos multi-producto (gastos_extra), el flujo
+            # multi-campo no está soportado — pedimos UN campo como antes.
             datos = {"gasto": gastos_calculados[0]}
             if len(gastos_calculados) > 1:
                 datos["gastos_extra"] = gastos_calculados[1:]
             datos["confirmar"] = True
-            if await _kapso_pedir_campo(ident, numero, "k_gasto_campo", datos,
-                                        "¿A qué campo lo cargo?"):
-                return True
+            if len(gastos_calculados) > 1:
+                # Multi-producto: flujo viejo (un campo).
+                if await _kapso_pedir_campo(ident, numero, "k_gasto_campo", datos,
+                                            "¿A qué campo lo cargo?"):
+                    return True
+            else:
+                # Gasto simple: ofrecer distribución.
+                if await _kapso_pedir_distribucion_gasto(
+                        ident, numero, "k_gasto_campo", datos,
+                        "¿A qué campo lo cargo?"):
+                    return True
+                # Un solo campo del user: ya quedó resuelto en datos.
+                campo = {"id": datos["campo_id"], "nombre": datos["campo_nombre"]}
 
         print(f"[WA GASTO IA] campo={campo.get('nombre')!r} items={len(gastos_calculados)} "
               f"totales={[g['total_de_usd'] for g in gastos_calculados]}")
