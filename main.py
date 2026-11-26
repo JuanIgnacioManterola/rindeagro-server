@@ -869,6 +869,55 @@ async def _ocr_factura(contenido: bytes, mime: str) -> list | None:
     return None
 
 
+async def _ocr_llamar(slug: str, contenido: bytes, mime: str, extra: dict = None) -> dict | None:
+    """Helper genérico para OCR de pago/carta-porte/gasto-estructura/activo.
+    Devuelve el dict "data" de la respuesta, o None si falló."""
+    import base64
+    try:
+        b64 = base64.b64encode(contenido).decode()
+        body = {"image_base64": b64, "mime_type": mime or "image/jpeg"}
+        if extra:
+            body.update(extra)
+        async with httpx.AsyncClient(timeout=60) as c:
+            r = await c.post(
+                f"{_sb_url()}/functions/v1/{slug}",
+                headers={"Authorization": f"Bearer {_sb_key()}", "Content-Type": "application/json"},
+                json=body,
+            )
+            if r.status_code == 200:
+                js = r.json() or {}
+                if js.get("ok"):
+                    return js.get("data") or {}
+                print(f"[OCR {slug}] respondió ok=false: {str(js)[:200]}")
+            else:
+                print(f"[OCR {slug}] HTTP {r.status_code}: {r.text[:200]}")
+    except Exception as e:
+        print(f"[OCR {slug}] excepción: {e}")
+    return None
+
+
+def _detectar_tipo_adjunto(texto: str) -> str | None:
+    """Detecta qué tipo de documento es por el caption del archivo.
+    Devuelve: 'factura', 'cheque', 'credito', 'carta_porte', 'gasto_estr', 'activo'
+    o None si no puede decidir."""
+    n = _norm(texto or "")
+    if not n:
+        return None
+    if re.search(r"\b(carta\s+de\s+porte|cpe|flete|carta\s+porte)\b", n):
+        return "carta_porte"
+    if re.search(r"\b(cr(é|e)dito|pr(é|e)stamo|financiaci(ó|o)n)\b", n):
+        return "credito"
+    if re.search(r"\b(cheque|echeq|ecocheq|transferencia|pago)\b", n):
+        return "cheque"
+    if re.search(r"\b(sueldo|salario|honorarios|contador|seguro|p(ó|o)liza|alquiler|oficina)\b", n):
+        return "gasto_estr"
+    if re.search(r"\b(pulverizadora|tractor|cosechadora|sembradora|camioneta|camion|maquinaria|herramienta)\b", n):
+        return "activo"
+    if re.search(r"\b(factura|remito|comprobante|ticket|insumo)\b", n):
+        return "factura"
+    return None
+
+
 RUBROS_FACTURA = {"herbicidas", "fungicidas", "insecticidas", "fertilizantes", "semillas"}
 
 
@@ -884,6 +933,236 @@ def _subtotal_renglon(it: dict) -> float:
     if it.get("precio_unitario") is not None:
         return float(it.get("cantidad") or 0) * float(it["precio_unitario"])
     return 0.0
+
+
+async def _kapso_adjunto_router(ident: dict, numero: str, m) -> None:
+    """
+    Decide qué tipo de documento es el archivo (factura / cheque / crédito /
+    carta de porte / gasto estructura / activo) y llama al OCR correcto.
+    Si no puede decidir por el caption, guarda el archivo en estado y pide
+    al user que elija con botones.
+    """
+    # 1. Intento detectar por el caption/texto que vino con el archivo.
+    tipo_adj = _detectar_tipo_adjunto(m.texto or "")
+
+    # 2. Si no detecto, guardo bytes en memoria del estado y pregunto.
+    if not tipo_adj:
+        # Para no cargarnos el payload del estado con el binario, lo subimos
+        # a una carpeta temporal del bucket y guardamos solo la URL + path.
+        contenido = await kapso.descargar_media(m.media_url)
+        if not contenido:
+            await kapso.enviar_texto(numero, "No pude bajar el archivo. ¿Me lo reenviás?")
+            return
+        nombre = m.media_nombre or ("adjunto.pdf" if m.es_pdf else "adjunto.jpg")
+        path = f"{ident['owner_id']}/tmp/{int(datetime.utcnow().timestamp())}_{nombre}"
+        url = await _sb_storage_subir("insumos-facturas", path, contenido, m.media_tipo)
+        if not url:
+            await kapso.enviar_texto(numero, "No pude subir el archivo. Probá de nuevo.")
+            return
+        await _wa_set_conv(numero, "k_adjunto_tipo", {
+            "path": path, "url": url, "mime": m.media_tipo,
+            "nombre": nombre,
+        })
+        await kapso.enviar_botones(
+            numero, "📎 ¿Qué es este archivo?",
+            [("adj_factura", "🧾 Factura"),
+             ("adj_cheque", "💳 Cheque"),
+             ("adj_cp", "🚚 Carta porte")])
+        return
+
+    # 3. Si detecté, llamo directo al OCR
+    contenido = await kapso.descargar_media(m.media_url)
+    if not contenido:
+        await kapso.enviar_texto(numero, "No pude bajar el archivo. ¿Me lo reenviás?")
+        return
+    nombre = m.media_nombre or ("adjunto.pdf" if m.es_pdf else "adjunto.jpg")
+    path = f"{ident['owner_id']}/{int(datetime.utcnow().timestamp())}_{nombre}"
+
+    if tipo_adj == "factura":
+        await _kapso_gasto_desde_archivo(ident, numero, m)
+        return
+    if tipo_adj == "carta_porte":
+        await _kapso_procesar_ocr_cp(ident, numero, contenido, m.media_tipo, nombre, path)
+        return
+    if tipo_adj in ("cheque", "credito"):
+        await _kapso_procesar_ocr_pago(ident, numero, contenido, m.media_tipo,
+                                       nombre, path, tipo_adj)
+        return
+    if tipo_adj == "gasto_estr":
+        await _kapso_procesar_ocr_gasto_estr(ident, numero, contenido, m.media_tipo,
+                                              nombre, path)
+        return
+    if tipo_adj == "activo":
+        await _kapso_procesar_ocr_activo(ident, numero, contenido, m.media_tipo,
+                                          nombre, path)
+        return
+
+
+async def _kapso_procesar_ocr_cp(ident: dict, numero: str, contenido: bytes,
+                                  mime: str, nombre: str, path: str) -> None:
+    if not _wa_puede(ident, "gastos", "editar"):
+        await kapso.enviar_texto(numero, "Tu usuario no tiene permiso para cargar fletes.")
+        return
+    await kapso.enviar_texto(numero, "🔍 Leyendo la carta de porte...")
+    data = await _ocr_llamar("ocr-carta-porte", contenido, mime)
+    if not data:
+        await kapso.enviar_texto(numero, "No pude leer la carta de porte. Cargala desde la app.")
+        return
+    url = await _sb_storage_subir("insumos-facturas", path, contenido, mime)
+    datos = {"flete": {
+        "campo_id": None,
+        "cultivo": (data.get("cultivo") or "").lower() or None,
+        "fecha": data.get("fecha") or datetime.now(AR_TZ).date().isoformat(),
+        "patente_camion": data.get("patente_camion"),
+        "patente_acoplado": data.get("patente_acoplado"),
+        "nombre_camionero": data.get("nombre_camionero"),
+        "nombre_transporte": data.get("nombre_transporte"),
+        "toneladas": data.get("toneladas"),
+        "destino": data.get("destino"),
+        "empresa_destino": data.get("empresa_destino"),
+        "ctg": data.get("ctg"),
+        "carta_porte_nro": data.get("carta_porte_nro"),
+        "peso_bruto_kg": data.get("peso_bruto_kg"),
+        "peso_tara_kg": data.get("peso_tara_kg"),
+        "peso_neto_kg": data.get("peso_neto_kg"),
+        "humedad_porcentaje": data.get("humedad_porcentaje"),
+        "archivo_url": url, "archivo_path": path,
+    }}
+    await _wa_set_conv(numero, "k_cp_confirmar", datos)
+    partes = ["🚚 *Entendí esta carta de porte:*"]
+    if data.get("cultivo"):
+        partes.append(f"🌾 Cultivo: *{data['cultivo']}*")
+    if data.get("toneladas"):
+        partes.append(f"⚖️ Toneladas: *{_num(data['toneladas'])}*")
+    if data.get("patente_camion"):
+        partes.append(f"🚛 Patente: {data['patente_camion']}")
+    if data.get("empresa_destino") or data.get("destino"):
+        partes.append(f"📍 Destino: {data.get('empresa_destino') or data.get('destino')}")
+    if data.get("ctg"):
+        partes.append(f"🧾 CTG: {data['ctg']}")
+    partes.append("\n¿La cargo así?")
+    await kapso.enviar_botones(numero, "\n".join(partes),
+        [("cp_ok", "✅ Sí, cargala"), ("cp_cancel", "❌ Cancelar")])
+
+
+async def _kapso_procesar_ocr_pago(ident: dict, numero: str, contenido: bytes,
+                                     mime: str, nombre: str, path: str,
+                                     tipo: str) -> None:
+    if not _wa_puede(ident, "compromisos_pago", "editar"):
+        await kapso.enviar_texto(numero, "No tenés permiso para cargar pagos.")
+        return
+    tipo_lbl = "cheque" if tipo == "cheque" else "crédito"
+    await kapso.enviar_texto(numero, f"🔍 Leyendo el {tipo_lbl}...")
+    data = await _ocr_llamar("ocr-pago", contenido, mime, {"tipo": tipo})
+    if not data:
+        await kapso.enviar_texto(numero, f"No pude leer el {tipo_lbl}. Cargalo desde la app.")
+        return
+    url = await _sb_storage_subir("insumos-facturas", path, contenido, mime)
+
+    if tipo == "cheque":
+        datos = {"pago": {
+            "tipo": "cheque",
+            "beneficiario": data.get("beneficiario") or "",
+            "importe": float(data.get("importe") or 0),
+            "moneda": data.get("moneda") or "ARS",
+            "fecha": data.get("fecha_cobro") or datetime.now(AR_TZ).date().isoformat(),
+            "fecha_emision": data.get("fecha_emision"),
+            "banco": data.get("banco"),
+            "numero_cheque": data.get("numero_cheque"),
+            "archivo_url": url, "archivo_path": path,
+        }}
+        await _wa_set_conv(numero, "k_pago_confirmar", datos)
+        partes = ["💳 *Entendí este cheque:*"]
+        partes.append(f"👤 Beneficiario: *{data.get('beneficiario') or '—'}*")
+        partes.append(f"💰 Importe: *{data.get('moneda', 'ARS')} {_miles(data.get('importe') or 0)}*")
+        if data.get("fecha_cobro"):
+            partes.append(f"📅 Cobro: {_wa_fecha_corta(data['fecha_cobro'])}")
+        if data.get("banco"):
+            partes.append(f"🏦 Banco: {data['banco']}")
+        if data.get("numero_cheque"):
+            partes.append(f"#️⃣ Nº: {data['numero_cheque']}")
+        partes.append("\n¿Lo cargo así?")
+        await kapso.enviar_botones(numero, "\n".join(partes),
+            [("pago_ok", "✅ Sí, cargalo"), ("pago_cancel", "❌ Cancelar")])
+        return
+
+    # credito
+    datos = {"pago_credito": {
+        "descripcion": data.get("descripcion") or "",
+        "beneficiario": data.get("beneficiario") or "",
+        "cuota_importe": float(data.get("cuota_importe") or 0),
+        "moneda": data.get("moneda") or "ARS",
+        "n_cuotas": int(data.get("n_cuotas") or 1),
+        "frecuencia": data.get("frecuencia") or "mensual",
+        "fecha_primera": data.get("fecha_primera") or datetime.now(AR_TZ).date().isoformat(),
+        "archivo_url": url, "archivo_path": path,
+    }}
+    await _wa_set_conv(numero, "k_pago_confirmar", datos)
+    partes = ["💳 *Entendí este crédito:*"]
+    if data.get("descripcion"):
+        partes.append(f"📝 {data['descripcion']}")
+    partes.append(f"💰 {data.get('n_cuotas')} cuotas de "
+                  f"*{data.get('moneda', 'ARS')} {_miles(data.get('cuota_importe') or 0)}*")
+    partes.append(f"🔁 Frecuencia: {data.get('frecuencia')}")
+    partes.append(f"📅 Primera: {_wa_fecha_corta(data.get('fecha_primera'))}")
+    partes.append("\n¿Lo cargo así?")
+    await kapso.enviar_botones(numero, "\n".join(partes),
+        [("pago_ok", "✅ Sí, cargalo"), ("pago_cancel", "❌ Cancelar")])
+
+
+async def _kapso_procesar_ocr_gasto_estr(ident: dict, numero: str, contenido: bytes,
+                                           mime: str, nombre: str, path: str) -> None:
+    if not _wa_puede(ident, "gastos", "editar"):
+        return
+    await kapso.enviar_texto(numero, "🔍 Leyendo el comprobante...")
+    data = await _ocr_llamar("ocr-gasto-estr", contenido, mime)
+    if not data:
+        await kapso.enviar_texto(numero, "No pude leer el comprobante. Cargalo desde la app.")
+        return
+    datos = {"gasto_estructura_ocr": {
+        "descripcion": data.get("descripcion") or "",
+        "tipo": (data.get("tipo") or "otros").lower(),
+        "importe_usd": float(data.get("importe_usd") or 0),
+        "frecuencia": (data.get("frecuencia") or "mensual").lower(),
+        "fecha_inicio": data.get("fecha") or datetime.now(AR_TZ).date().isoformat(),
+    }}
+    await _wa_set_conv(numero, "k_estr_confirmar", datos)
+    g = datos["gasto_estructura_ocr"]
+    partes = ["🏢 *Entendí este gasto de estructura:*",
+              f"📝 {g['descripcion']}",
+              f"💰 USD {_num(g['importe_usd'])} ({g['frecuencia']})",
+              f"📂 {g['tipo'].capitalize()}",
+              "\n¿Lo cargo así?"]
+    await kapso.enviar_botones(numero, "\n".join(partes),
+        [("estr_ok", "✅ Sí, cargalo"), ("estr_cancel", "❌ Cancelar")])
+
+
+async def _kapso_procesar_ocr_activo(ident: dict, numero: str, contenido: bytes,
+                                       mime: str, nombre: str, path: str) -> None:
+    if not _wa_puede(ident, "gastos", "editar"):
+        return
+    await kapso.enviar_texto(numero, "🔍 Leyendo la factura del activo...")
+    data = await _ocr_llamar("ocr-activo", contenido, mime)
+    if not data:
+        await kapso.enviar_texto(numero, "No pude leer la factura. Cargala desde la app.")
+        return
+    datos = {"activo_ocr": {
+        "descripcion": data.get("descripcion") or "",
+        "tipo": (data.get("tipo") or "otros").lower(),
+        "valor_compra_usd": float(data.get("valor_compra_usd") or 0),
+        "vida_util_anos": int(data.get("vida_util_anos") or 10),
+        "fecha_compra": data.get("fecha_compra") or datetime.now(AR_TZ).date().isoformat(),
+    }}
+    await _wa_set_conv(numero, "k_act_confirmar", datos)
+    a = datos["activo_ocr"]
+    amort = a["valor_compra_usd"] / a["vida_util_anos"] if a["vida_util_anos"] else 0
+    partes = ["🚜 *Entendí este activo:*",
+              f"📝 {a['descripcion']}",
+              f"💰 USD {_miles(a['valor_compra_usd'])} · vida útil {a['vida_util_anos']} años",
+              f"📉 Amortización anual: USD {_miles(round(amort, 2))}",
+              "\n¿Lo cargo así?"]
+    await kapso.enviar_botones(numero, "\n".join(partes),
+        [("act_ok", "✅ Sí, cargalo"), ("act_cancel", "❌ Cancelar")])
 
 
 async def _kapso_gasto_desde_archivo(ident: dict, numero: str, m) -> None:
@@ -6291,6 +6570,130 @@ async def _kapso_procesar(m) -> None:
         await kapso.enviar_texto(numero, "Avisos reactivados 🌾")
         return
 
+    # Botones para elegir el tipo de un adjunto cuando no pudimos detectar.
+    if accion in ("adj_factura", "adj_cheque", "adj_cp"):
+        conv_tmp = await _wa_get_conv(numero)
+        datos_tmp = (conv_tmp or {}).get("datos_parciales") or {}
+        if (conv_tmp or {}).get("estado") != "k_adjunto_tipo":
+            await kapso.enviar_texto(numero, "Ya no tengo ese archivo en memoria.")
+            await _wa_clear_conv(numero)
+            return
+        # Bajamos el archivo del bucket temporal
+        path = datos_tmp.get("path")
+        mime = datos_tmp.get("mime") or "image/jpeg"
+        nombre = datos_tmp.get("nombre") or "adjunto"
+        contenido = None
+        try:
+            async with httpx.AsyncClient(timeout=30) as c:
+                r = await c.get(f"{_sb_url()}/storage/v1/object/insumos-facturas/{path}",
+                                headers={"Authorization": f"Bearer {_sb_key()}"})
+                if r.status_code == 200:
+                    contenido = r.content
+        except Exception as e:
+            print(f"[ADJ] error leyendo {path}: {e}")
+        if not contenido:
+            await _wa_clear_conv(numero)
+            await kapso.enviar_texto(numero, "No pude recuperar el archivo. Mandámelo de nuevo.")
+            return
+        await _wa_clear_conv(numero)
+        if accion == "adj_factura":
+            # Reusa el flujo existente de factura (que hace OCR + guarda gasto)
+            # Necesitamos un m simulado. Simplificamos: llamamos al OCR directo
+            # y guardamos como factura genérica adjunta si no hay items.
+            items = await _ocr_factura(contenido, mime)
+            if not items:
+                datos = {"gasto": {"factura_url":
+                                    f"{_sb_url()}/storage/v1/object/public/insumos-facturas/{path}",
+                                    "factura_path": path, "factura_tipo": "factura"}}
+                if not await _kapso_pedir_campo(ident, numero, "k_gasto_campo", datos,
+                                                "No pude leer los renglones. "
+                                                "¿A qué campo cargamos el gasto?"):
+                    await _wa_set_conv(numero, "k_gasto_rubro", datos)
+                    await _kapso_pedir_rubro(numero)
+                return
+            await kapso.enviar_texto(numero, f"🧾 Leí {len(items)} renglones de la factura. "
+                                              "Seguimos en la app o mandame el detalle acá.")
+            return
+        if accion == "adj_cheque":
+            await _kapso_procesar_ocr_pago(ident, numero, contenido, mime, nombre, path, "cheque")
+            return
+        if accion == "adj_cp":
+            await _kapso_procesar_ocr_cp(ident, numero, contenido, mime, nombre, path)
+            return
+
+    # Botones de confirmación de OCR (carta porte / pago / estructura / activo)
+    if accion in ("cp_ok", "cp_cancel"):
+        conv_tmp = await _wa_get_conv(numero)
+        datos_tmp = (conv_tmp or {}).get("datos_parciales") or {}
+        if (conv_tmp or {}).get("estado") != "k_cp_confirmar":
+            await kapso.enviar_texto(numero, "Ya no tengo esa carta de porte en memoria.")
+            await _wa_clear_conv(numero)
+            return
+        if accion == "cp_ok":
+            await _kapso_guardar_flete(ident, numero, datos_tmp)
+        else:
+            await _wa_clear_conv(numero)
+            await kapso.enviar_texto(numero, "Listo, no cargué el flete. 👌")
+        return
+
+    if accion in ("pago_ok", "pago_cancel"):
+        conv_tmp = await _wa_get_conv(numero)
+        datos_tmp = (conv_tmp or {}).get("datos_parciales") or {}
+        if (conv_tmp or {}).get("estado") != "k_pago_confirmar":
+            await kapso.enviar_texto(numero, "Ya no tengo ese pago en memoria.")
+            await _wa_clear_conv(numero)
+            return
+        if accion == "pago_ok":
+            if datos_tmp.get("pago"):
+                await _kapso_guardar_pago(ident, numero, datos_tmp)
+            elif datos_tmp.get("pago_credito"):
+                # Mapeamos a la estructura que espera _kapso_guardar_pago_credito
+                pc = datos_tmp["pago_credito"]
+                await _kapso_guardar_pago_credito(ident, numero, {"pago": {
+                    "tipo": "cuota_credito",
+                    "descripcion": pc.get("descripcion"),
+                    "beneficiario": pc.get("beneficiario"),
+                    "importe_cuota": pc.get("cuota_importe"),
+                    "moneda": pc.get("moneda"),
+                    "cantidad_cuotas": pc.get("n_cuotas"),
+                    "frecuencia": pc.get("frecuencia"),
+                    "fecha_primera": pc.get("fecha_primera"),
+                }})
+        else:
+            await _wa_clear_conv(numero)
+            await kapso.enviar_texto(numero, "Listo, no cargué el pago. 👌")
+        return
+
+    if accion in ("estr_ok", "estr_cancel"):
+        conv_tmp = await _wa_get_conv(numero)
+        datos_tmp = (conv_tmp or {}).get("datos_parciales") or {}
+        if (conv_tmp or {}).get("estado") != "k_estr_confirmar":
+            await kapso.enviar_texto(numero, "Ya no tengo ese gasto en memoria.")
+            await _wa_clear_conv(numero)
+            return
+        if accion == "estr_ok":
+            await _kapso_guardar_gasto_estructura(
+                ident, numero, {"gasto_estructura": datos_tmp.get("gasto_estructura_ocr")})
+        else:
+            await _wa_clear_conv(numero)
+            await kapso.enviar_texto(numero, "Listo, no cargué el gasto. 👌")
+        return
+
+    if accion in ("act_ok", "act_cancel"):
+        conv_tmp = await _wa_get_conv(numero)
+        datos_tmp = (conv_tmp or {}).get("datos_parciales") or {}
+        if (conv_tmp or {}).get("estado") != "k_act_confirmar":
+            await kapso.enviar_texto(numero, "Ya no tengo ese activo en memoria.")
+            await _wa_clear_conv(numero)
+            return
+        if accion == "act_ok":
+            await _kapso_guardar_activo(
+                ident, numero, {"activo": datos_tmp.get("activo_ocr")})
+        else:
+            await _wa_clear_conv(numero)
+            await kapso.enviar_texto(numero, "Listo, no cargué el activo. 👌")
+        return
+
     # Botones del flujo de modificación
     if accion in ("mod_ok", "mod_cancel"):
         conv_tmp = await _wa_get_conv(numero)
@@ -6516,7 +6919,10 @@ async def _kapso_procesar(m) -> None:
                               "k_gasto_multi_campo", "k_ins_multi_confirmar",
                               "k_ing_confirmar", "k_lluvia_confirmar",
                               "k_elim_confirmar", "k_mod_confirmar",
-                              "k_tarea_adjunto"}
+                              "k_tarea_adjunto",
+                              "k_adjunto_tipo", "k_cp_confirmar",
+                              "k_pago_confirmar", "k_estr_confirmar",
+                              "k_act_confirmar"}
     if (conv and texto and m.tipo in ("text", "audio")
             and conv.get("estado") not in estados_edicion_activa
             and _texto_es_nueva_intencion(texto)):
@@ -6524,9 +6930,10 @@ async def _kapso_procesar(m) -> None:
         await _wa_clear_conv(numero)
         conv = None
 
-    # Un adjunto sin conversación en curso es, casi siempre, una factura
+    # Un adjunto sin conversación en curso: router decide qué OCR usar según
+    # el caption del archivo (si hay) y llama a la edge function correcta.
     if m.tiene_media and not conv:
-        await _kapso_gasto_desde_archivo(ident, numero, m)
+        await _kapso_adjunto_router(ident, numero, m)
         return
 
     if conv:
