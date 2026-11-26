@@ -2845,23 +2845,32 @@ async def _kapso_flujo(ident: dict, numero: str, m, conv: dict) -> None:
         return
 
     if estado == "k_flete_precio":
-        # Esperamos un número: el precio por tonelada en USD.
-        # Si el user escribe "20", "USD 20", "20/tn", "20 por tn", tomamos 20.
-        m = re.search(r"(\d+(?:[.,]\d+)?)", texto or "")
-        if not m:
-            await kapso.enviar_texto(
-                numero,
-                "No entendí el precio. Mandame un número (ej: *20* para USD 20/tn).")
-            return
-        precio_por_tn = float(m.group(1).replace(",", "."))
+        # Esperamos un número: el precio por tonelada en ARS.
+        # Si el user escribe "20000", "$ 20.000", "20mil", tomamos 20000.
+        # Aceptamos "20k" o "20mil" como 20000.
+        t = (texto or "").lower().replace(".", "")
+        # Soporte para "20k" / "20 mil".
+        mk = re.search(r"(\d+(?:[.,]\d+)?)\s*(?:k|mil)\b", t)
+        if mk:
+            precio_por_tn = float(mk.group(1).replace(",", ".")) * 1000
+        else:
+            m = re.search(r"(\d+(?:[.,]\d+)?)", t)
+            if not m:
+                await kapso.enviar_texto(
+                    numero,
+                    "No entendí el precio. Mandame un número en pesos "
+                    "(ej: *25000* para $25.000/tn).")
+                return
+            precio_por_tn = float(m.group(1).replace(",", "."))
         tn = float(datos.get("flete", {}).get("toneladas") or 0)
         if tn <= 0:
             await kapso.enviar_texto(
                 numero, "No tengo las toneladas del flete, no puedo calcular el total.")
             await _wa_clear_conv(numero)
             return
-        datos["flete"]["precio_flete_usd"] = round(precio_por_tn * tn, 2)
-        datos["flete"]["precio_por_tn_usd"] = precio_por_tn
+        datos["flete"]["precio_flete_ars"] = round(precio_por_tn * tn, 2)
+        datos["flete"]["precio_por_tn_ars"] = precio_por_tn
+        datos["flete"]["precio_flete_moneda"] = "ARS"
         await _kapso_guardar_flete(ident, numero, datos)
         return
 
@@ -4263,8 +4272,12 @@ fecha_siembra (YYYY-MM-DD). Se guarda como gasto de semillas con la fecha.
 456789", "flete desde Erlicher, 28 tn de soja a Cargill con patente DEF456"). cultivo, \
 toneladas, destino, patente_camion (del camión), ctg (número CTG), campo_id (el campo DESDE \
 donde salió el cereal, si lo menciona: "desde Erlicher", "salió de Fraga", "del lote La \
-Escondida"), fecha_venc (fecha del flete), precio_unit_usd (si da precio por tonelada), \
-monto_usd (si da total). El servidor va a pedir el campo si no lo decís.
+Escondida"), fecha_venc (fecha del flete). PRECIO: el precio del flete por tn se maneja en \
+PESOS ARGENTINOS por default (el productor cierra en pesos con el fletero). Si menciona el \
+precio sin aclarar moneda ("a 25 mil la tonelada", "25000 por tn", "$ 25.000/tn"), poné \
+precio_unit_ars=25000. Si menciona total ("el flete salió 700 mil", "$ 700.000"), poné \
+monto_ars=700000. Sólo usá precio_unit_usd / monto_usd si el user dice explícitamente "dólares" \
+o "USD". El servidor pide el campo y el precio si faltan.
 - rendimiento_real: cosechó un campo y quiere registrar el rendimiento real ("rindió 3.2 \
 toneladas por hectárea de maíz en Erlicher", "el rendimiento fue de 4 t/ha"). cultivo, campo_id, \
 rendimiento_tha (número en toneladas por hectárea).
@@ -5174,11 +5187,12 @@ async def _kapso_ejecutar_eliminar(ident: dict, numero: str, registro: dict) -> 
 
 
 async def _kapso_flete_pedir_precio(numero: str, datos: dict) -> bool:
-    """Si el flete no tiene precio_flete_usd todavía, pregunta el precio por
-    tonelada y deja la conversación en k_flete_precio. Devuelve True si
-    preguntó (hay que cortar el flujo), False si ya había precio."""
+    """Si el flete no tiene precio todavía (ni en ARS ni en USD), pregunta el
+    precio por tonelada en pesos argentinos y deja la conversación en
+    k_flete_precio. Devuelve True si preguntó (hay que cortar el flujo), False
+    si ya había precio."""
     f = datos.get("flete") or {}
-    if f.get("precio_flete_usd"):
+    if f.get("precio_flete_ars") or f.get("precio_flete_usd"):
         return False
     tn = f.get("toneladas")
     cultivo = f.get("cultivo")
@@ -5189,7 +5203,10 @@ async def _kapso_flete_pedir_precio(numero: str, datos: dict) -> bool:
     else:
         pregunta = "¿A cuánto cerraste el flete por tonelada?"
     await _wa_set_conv(numero, "k_flete_precio", datos)
-    await kapso.enviar_texto(numero, pregunta + "\nMandame el precio en USD/tn (ej: *20*).")
+    await kapso.enviar_texto(
+        numero,
+        pregunta + "\nMandame el precio en pesos por tn (ej: *25000* para "
+                   "$25.000/tn). Después lo convertís a USD desde la app.")
     return True
 
 
@@ -5200,7 +5217,8 @@ async def _kapso_guardar_flete(ident: dict, numero: str, datos: dict) -> None:
     for k in ("campo_id", "cultivo", "fecha", "patente_camion", "nombre_transporte",
               "toneladas", "destino", "empresa_destino", "ctg", "carta_porte_nro",
               "peso_bruto_kg", "peso_tara_kg", "peso_neto_kg", "humedad_porcentaje",
-              "precio_flete_usd", "km_recorridos", "notas"):
+              "precio_flete_usd", "precio_flete_ars", "precio_por_tn_usd",
+              "precio_por_tn_ars", "precio_flete_moneda", "km_recorridos", "notas"):
         if f.get(k) is not None:
             payload[k] = f[k]
     await _sb_post("fletes", payload)
@@ -5216,7 +5234,17 @@ async def _kapso_guardar_flete(ident: dict, numero: str, datos: dict) -> None:
         partes.append(f"🚛 Patente: {f['patente_camion']}")
     if f.get("ctg"):
         partes.append(f"🧾 CTG: {f['ctg']}")
-    if f.get("precio_flete_usd"):
+    # Mostrar el precio en la moneda cargada. Si fue ARS, agregar nota de
+    # conversión en la app.
+    if f.get("precio_flete_ars"):
+        precio_tn = f.get("precio_por_tn_ars")
+        if precio_tn:
+            partes.append(
+                f"💰 Precio: $ {_miles(precio_tn)}/tn · total $ {_miles(f['precio_flete_ars'])}")
+        else:
+            partes.append(f"💰 Precio: $ {_miles(f['precio_flete_ars'])}")
+        partes.append("🪙 Convertilo a USD desde la app cuando quieras.")
+    elif f.get("precio_flete_usd"):
         precio_tn = f.get("precio_por_tn_usd")
         if precio_tn:
             partes.append(f"💰 Precio: USD {_num(precio_tn)}/tn · total USD {_num(f['precio_flete_usd'])}")
@@ -6030,7 +6058,10 @@ async def _wa_modificar_ultimo(ident: dict, numero: str, intencion: dict) -> Non
             elif cm in ("cultivo", "grano", "cereal"):
                 patch["cultivo"] = valor_nuevo.strip().lower()[:50]
             elif cm in ("precio", "precio_flete", "flete"):
-                patch["precio_flete_usd"] = float(valor_nuevo.replace(",", "."))
+                # Por defecto el precio del flete por WhatsApp se maneja en
+                # ARS (la conversión a USD la hace el user desde la app).
+                patch["precio_flete_ars"] = float(valor_nuevo.replace(",", "."))
+                patch["precio_flete_moneda"] = "ARS"
             elif cm == "fecha":
                 f = _parsear_fecha_natural(valor_nuevo)
                 if f:
@@ -6179,12 +6210,24 @@ async def _kapso_aplicar_intencion(ident: dict, numero: str, intencion: dict,
         campo = _wa_resolver_campo_fuzzy(ident, intencion.get("_texto_crudo") or "",
                                         intencion.get("campo_id"))
         tn_val = float(intencion["toneladas"]) if intencion.get("toneladas") else None
-        # El precio puede venir como total (monto_usd) o por tn (precio_unit_usd).
-        # Si viene por tn y tenemos las toneladas, calculamos el total para la DB.
-        precio_por_tn = float(intencion["precio_unit_usd"]) if intencion.get("precio_unit_usd") else None
-        precio_total = float(intencion["monto_usd"]) if intencion.get("monto_usd") else None
-        if precio_total is None and precio_por_tn is not None and tn_val:
-            precio_total = round(precio_por_tn * tn_val, 2)
+        # El precio puede venir en ARS o USD, como total o por tn. Priorizamos
+        # ARS porque es lo que el user maneja en el día a día (la conversión a
+        # USD se hace en la app).
+        precio_por_tn_ars = float(intencion["precio_unit_ars"]) if intencion.get("precio_unit_ars") else None
+        precio_total_ars = float(intencion["monto_ars"]) if intencion.get("monto_ars") else None
+        if precio_total_ars is None and precio_por_tn_ars is not None and tn_val:
+            precio_total_ars = round(precio_por_tn_ars * tn_val, 2)
+        precio_por_tn_usd = float(intencion["precio_unit_usd"]) if intencion.get("precio_unit_usd") else None
+        precio_total_usd = float(intencion["monto_usd"]) if intencion.get("monto_usd") else None
+        if precio_total_usd is None and precio_por_tn_usd is not None and tn_val:
+            precio_total_usd = round(precio_por_tn_usd * tn_val, 2)
+        # Si vino ARS, moneda=ARS; si vino solo USD, moneda=USD; si no vino
+        # nada, dejamos null y el flujo lo pide en ARS más abajo.
+        moneda = None
+        if precio_total_ars is not None:
+            moneda = "ARS"
+        elif precio_total_usd is not None:
+            moneda = "USD"
         datos = {"flete": {
             "campo_id": campo["id"] if campo else None,
             "campo_nombre": campo["nombre"] if campo else None,
@@ -6194,8 +6237,11 @@ async def _kapso_aplicar_intencion(ident: dict, numero: str, intencion: dict,
             "toneladas": tn_val,
             "destino": intencion.get("destino") or None,
             "ctg": intencion.get("ctg") or None,
-            "precio_flete_usd": precio_total,
-            "precio_por_tn_usd": precio_por_tn,
+            "precio_flete_ars": precio_total_ars,
+            "precio_por_tn_ars": precio_por_tn_ars,
+            "precio_flete_usd": precio_total_usd,
+            "precio_por_tn_usd": precio_por_tn_usd,
+            "precio_flete_moneda": moneda,
         }}
         # Faltan datos clave → mandar a menú guiado
         if not datos["flete"].get("toneladas") and not datos["flete"].get("patente_camion"):
