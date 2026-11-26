@@ -1552,6 +1552,46 @@ async def _kapso_ingreso_guiado(ident: dict, numero: str) -> None:
         await _wa_set_conv(numero, "k_ing_cultivo", datos)
 
 
+async def _kapso_confirmar_lluvia(numero: str, campo: dict, mm: float, fecha: str = "") -> None:
+    """Muestra el resumen de la lluvia y espera el ✅ antes de escribir."""
+    datos = {"mm": float(mm), "campo_id": campo.get("id"),
+             "campo_nombre": campo.get("nombre") or ""}
+    if fecha:
+        datos["fecha"] = fecha
+    await _wa_set_conv(numero, "k_lluvia_confirmar", datos)
+    fecha_txt = _wa_fecha_corta(fecha) if fecha else "hoy"
+    await kapso.enviar_botones(
+        numero,
+        f"🌧️ Entendí esta lluvia:\n"
+        f"💧 *{_num(mm)} mm* en *{campo.get('nombre') or ''}*\n"
+        f"📅 {fecha_txt}\n\n¿La cargo así?",
+        [("llu_ok", "✅ Sí, cargala"), ("llu_cancel", "❌ Cancelar")],
+    )
+
+
+async def _kapso_confirmar_ingreso(numero: str, datos: dict) -> None:
+    """Muestra el resumen del ingreso y espera el ✅ antes de escribir."""
+    ing = datos.get("ingreso") or {}
+    tn = float(ing.get("tn") or 0)
+    precio = float(ing.get("precio") or 0)
+    total = tn * precio
+    cultivo = ing.get("cultivo") or "sin cultivo"
+    campo = ing.get("campo_nombre") or ""
+    comprador = ing.get("comprador") or ""
+
+    await _wa_set_conv(numero, "k_ing_confirmar", datos)
+    partes = [f"💰 Entendí esta venta en *{campo}*:",
+              f"🌾 {_num(tn)} tn de *{cultivo}* a USD {_num(precio)}/tn",
+              f"📊 Total: *USD {_miles(total)}*"]
+    if comprador:
+        partes.append(f"🤝 Comprador: *{comprador}*")
+    partes.append("\n¿La cargo así?")
+    await kapso.enviar_botones(numero, "\n".join(partes), [
+        ("ing_ok", "✅ Sí, cargala"),
+        ("ing_cancel", "❌ Cancelar"),
+    ])
+
+
 async def _kapso_guardar_ingreso(ident: dict, numero: str, datos: dict) -> None:
     """
     Los ingresos no tienen tabla propia: viven como JSON en campos.ingresos_cultivos.
@@ -3768,7 +3808,32 @@ glifosato a $5 el litro" la confianza es alta, aunque falte el campo.
 - Para los campos opcionales que el mensaje NO menciona: strings devolvelos como cadena vacía "" \
 (no inventes un string), números devolvelos como 0, por_hectarea como false. items: si no es \
 una pulverización con varios productos, devolvelo como array vacío []. El servidor los trata \
-como "no mencionado" y no los usa. No inventes datos."""
+como "no mencionado" y no los usa. No inventes datos.
+
+Ejemplos reales de mensajes que recibimos en producción (basados en casos del user, 2026-11):
+
+Ejemplo A — venta con comprador: "Agregar otra venta a Erlicher de 70 toneladas a 178 usd por \
+tonelada en cerealista moldes" → accion=ingreso, campo_id=<Erlicher>, toneladas=70, \
+precio_tn_usd=178, comprador="Cerealista Moldes", cultivo="". El servidor pone el cultivo del \
+campo si tiene uno solo sembrado.
+
+Ejemplo B — cheque: "Quiero cargar un pago. Entrega de echeq fecha de pago el 26/12/2026 \
+importe 8.000.000 de pesos. Entregado a cerealista moldes para pagar insumos" → accion=pago, \
+tipo_pago="cheque", beneficiario="Cerealista Moldes", monto_ars=8000000, monto_usd=0, \
+fecha_venc="2026-12-26", descripcion="pagar insumos". "Echeq" (electronic check) o "ecocheq" o \
+"ecocheque" también son cheque.
+
+Ejemplo C — insumo con ubicación: "Agregar 700 litros de glifosato 48% en cerealista moldes" → \
+accion=insumo, items=[{rubro:"herbicidas", descripcion:"Glifosato 48%", cantidad:700, \
+unidad:"litros", ubicacion:"cerealista moldes"}]. "en" + un nombre que no es un campo del user \
+suele ser una UBICACIÓN (galpón, sucursal, cliente), no el campo donde se aplicó. Si dudás, \
+tratalo como ubicacion del insumo, no como campo_id del gasto.
+
+Ejemplo D — lluvia sin fecha: "llovieron 25 mm en Fraga" → accion=lluvia, mm=25, campo_id=<Fraga>, \
+fecha_venc="". El servidor asume hoy si no dijo fecha; si dijo ayer o una fecha, respetala.
+
+Ejemplo E — texto corto ambiguo: "484828 banco nacional" después de un cheque recién cargado → \
+accion=nada, confianza=baja. El servidor tiene un handler aparte para info adicional de cheque."""
 
 
 def _miles(v: float) -> str:
@@ -4227,16 +4292,19 @@ async def _kapso_aplicar_intencion(ident: dict, numero: str, intencion: dict,
         campo = _wa_resolver_campo_fuzzy(ident, intencion.get("_texto_crudo") or "",
                                         intencion.get("campo_id"))
         if campo is not None:
-            await _kapso_guardar_lluvia(ident, numero, campo, float(intencion["mm"]))
+            await _kapso_confirmar_lluvia(numero, campo, float(intencion["mm"]),
+                                           intencion.get("fecha_venc") or "")
             return True
-        # No se pudo inferir: preguntar.
+        # No se pudo inferir: preguntar campo primero, después confirmar.
         datos = {"mm": float(intencion["mm"])}
+        if intencion.get("fecha_venc"):
+            datos["fecha"] = intencion["fecha_venc"]
         if await _kapso_pedir_campo(ident, numero, "k_lluvia_campo", datos,
                                     f"¿Dónde llovieron {_num(intencion['mm'])} mm?"):
             return True
-        await _kapso_guardar_lluvia(
-            ident, numero, {"id": datos["campo_id"], "nombre": datos["campo_nombre"]},
-            float(intencion["mm"]))
+        await _kapso_confirmar_lluvia(
+            numero, {"id": datos["campo_id"], "nombre": datos["campo_nombre"]},
+            float(intencion["mm"]), datos.get("fecha") or "")
         return True
 
     # Gasto desde texto libre. Dos formas:
@@ -4407,7 +4475,9 @@ async def _kapso_aplicar_intencion(ident: dict, numero: str, intencion: dict,
         datos["ingreso"]["cultivo"] = cultivo
         print(f"[WA ING IA] campo={campo['nombre']!r} cultivo={cultivo!r} "
               f"tn={intencion['toneladas']} precio={intencion['precio_tn_usd']}")
-        await _kapso_guardar_ingreso(ident, numero, datos)
+        # Confirmación obligatoria antes de guardar (pedido user 2026-11-25
+        # alineado con cómo FieldData maneja audios: siempre confirmar).
+        await _kapso_confirmar_ingreso(numero, datos)
         return True
 
     # ── Pago (cheque/credito/otro) ───────────────────
@@ -4725,6 +4795,39 @@ async def _kapso_procesar(m) -> None:
         await kapso.enviar_texto(numero, "Avisos reactivados 🌾")
         return
 
+    # Botones del flujo de confirmación de ingreso
+    if accion in ("ing_ok", "ing_cancel"):
+        conv_tmp = await _wa_get_conv(numero)
+        datos_tmp = (conv_tmp or {}).get("datos_parciales") or {}
+        if (conv_tmp or {}).get("estado") != "k_ing_confirmar":
+            await kapso.enviar_texto(numero, "Ya no tengo esa venta en memoria. "
+                                              "Mandala de nuevo si querés cargarla.")
+            await _wa_clear_conv(numero)
+            return
+        if accion == "ing_ok":
+            await _kapso_guardar_ingreso(ident, numero, datos_tmp)
+            return
+        await _wa_clear_conv(numero)
+        await kapso.enviar_texto(numero, "Listo, no cargué la venta. 👌")
+        return
+
+    # Botones del flujo de confirmación de lluvia
+    if accion in ("llu_ok", "llu_cancel"):
+        conv_tmp = await _wa_get_conv(numero)
+        datos_tmp = (conv_tmp or {}).get("datos_parciales") or {}
+        if (conv_tmp or {}).get("estado") != "k_lluvia_confirmar":
+            await kapso.enviar_texto(numero, "Ya no tengo esa lluvia en memoria.")
+            await _wa_clear_conv(numero)
+            return
+        if accion == "llu_ok":
+            campo = {"id": datos_tmp.get("campo_id"), "nombre": datos_tmp.get("campo_nombre")}
+            mm = float(datos_tmp.get("mm") or 0)
+            await _kapso_guardar_lluvia(ident, numero, campo, mm)
+            return
+        await _wa_clear_conv(numero)
+        await kapso.enviar_texto(numero, "Listo, no cargué la lluvia. 👌")
+        return
+
     # Botones del flujo multi-insumo (análogo a multi-gasto)
     if accion in ("i_multi_ok", "i_multi_cancel"):
         conv_tmp = await _wa_get_conv(numero)
@@ -4884,7 +4987,8 @@ async def _kapso_procesar(m) -> None:
     # intencionales: el user está corrigiendo un item del resumen y el audio
     # largo es esperado — no descartamos.
     estados_edicion_activa = {"k_gasto_multi_edit_texto", "k_gasto_multi_confirmar",
-                              "k_gasto_multi_campo", "k_ins_multi_confirmar"}
+                              "k_gasto_multi_campo", "k_ins_multi_confirmar",
+                              "k_ing_confirmar", "k_lluvia_confirmar"}
     if (conv and texto and m.tipo in ("text", "audio")
             and conv.get("estado") not in estados_edicion_activa
             and _texto_es_nueva_intencion(texto)):
