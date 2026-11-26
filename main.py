@@ -890,14 +890,17 @@ async def _kapso_pedir_distribucion_estructura(
     if desc and desc != "sin detalle":
         resumen += f"\n_{desc}_"
     await _wa_set_conv(numero, "k_gasto_estr_distribucion", datos)
-    await kapso.enviar_botones(
+    await kapso.enviar_lista(
         numero,
         f"{resumen}\n\n¿Cómo lo imputo?",
+        "Elegir",
         [
-            ("dist_e:estructura", "🏢 Gasto general"),
-            ("dist_e:uno", "📍 A un campo"),
-            ("dist_e:todos", "🌍 Repartir entre todos"),
+            ("dist_e:estructura", "🏢 Gasto general", "No se imputa a ningún campo"),
+            ("dist_e:uno", "📍 A un solo campo", "Lo cargo entero en uno"),
+            ("dist_e:varios", "📂 A varios campos", "Vos elegís cuáles, reparto por ha"),
+            ("dist_e:todos", "🌍 A todos los campos", "Reparto por ha entre todos"),
         ],
+        "Imputación",
     )
     return True
 
@@ -3060,6 +3063,15 @@ async def _kapso_flujo(ident: dict, numero: str, m, conv: dict) -> None:
 
     if estado == "k_gasto_estr_distribucion":
         g = datos.get("gasto_estructura") or {}
+
+        def _convertir_a_gasto_base() -> dict:
+            return {
+                "rubro": (g.get("tipo") or "otros").lower(),
+                "descripcion": g.get("descripcion") or (g.get("tipo") or "").capitalize(),
+                "total_de_usd": float(g.get("importe_usd") or 0),
+                "fecha": g.get("fecha_inicio") or datetime.now(AR_TZ).date().isoformat(),
+            }
+
         if accion == "dist_e:estructura":
             # Flujo original: guardar como gasto de estructura (sin campo).
             await _kapso_guardar_gasto_estructura(ident, numero, datos)
@@ -3068,16 +3080,30 @@ async def _kapso_flujo(ident: dict, numero: str, m, conv: dict) -> None:
             # Pedir un campo y guardar como gasto normal con rubro=tipo.
             # Armamos un "gasto" a partir del gasto_estructura para reusar
             # el flujo normal de k_gasto_campo.
-            datos["gasto"] = {
-                "rubro": (g.get("tipo") or "otros").lower(),
-                "descripcion": g.get("descripcion") or (g.get("tipo") or "").capitalize(),
-                "total_de_usd": float(g.get("importe_usd") or 0),
-                "fecha": g.get("fecha_inicio") or datetime.now(AR_TZ).date().isoformat(),
-            }
+            datos["gasto"] = _convertir_a_gasto_base()
             datos.pop("gasto_estructura", None)
             datos["confirmar"] = False
             await _kapso_pedir_campo(ident, numero, "k_gasto_campo", datos,
                                      "¿A qué campo lo cargo?")
+            return
+        if accion == "dist_e:varios":
+            # El user elige qué campos. Reusamos k_gasto_varios_sel del
+            # flujo de gasto normal, pero armando el gasto base antes.
+            datos["gasto"] = _convertir_a_gasto_base()
+            datos.pop("gasto_estructura", None)
+            campos_user = ident.get("campos") or []
+            await _wa_set_conv(numero, "k_gasto_varios_sel", datos)
+            nombres = ", ".join(c["nombre"] for c in campos_user[:8])
+            if len(campos_user) > 8:
+                nombres += ", ..."
+            ejemplo = (
+                f"{campos_user[0]['nombre']}, {campos_user[1]['nombre']}"
+                if len(campos_user) >= 2 else "Erlicher, Fraga"
+            )
+            await kapso.enviar_texto(
+                numero,
+                f"Pasame los nombres separados por coma. Por ejemplo:\n"
+                f"_{ejemplo}_\n\nTus campos: {nombres}")
             return
         if accion == "dist_e:todos":
             # Dividir proporcional entre TODOS los campos con ha > 0.
@@ -3090,21 +3116,14 @@ async def _kapso_flujo(ident: dict, numero: str, m, conv: dict) -> None:
                     "Lo guardo como gasto de estructura.")
                 await _kapso_guardar_gasto_estructura(ident, numero, datos)
                 return
-            # Armamos el "gasto" base y campo_ids_multi para reusar
-            # _kapso_finalizar_gasto_multi.
-            datos["gasto"] = {
-                "rubro": (g.get("tipo") or "otros").lower(),
-                "descripcion": g.get("descripcion") or (g.get("tipo") or "").capitalize(),
-                "total_de_usd": float(g.get("importe_usd") or 0),
-                "fecha": g.get("fecha_inicio") or datetime.now(AR_TZ).date().isoformat(),
-            }
+            datos["gasto"] = _convertir_a_gasto_base()
             datos.pop("gasto_estructura", None)
             datos["campo_ids_multi"] = [c["id"] for c in elegibles]
             datos["campo_id"] = elegibles[0]["id"]
             datos["campo_nombre"] = f"{len(elegibles)} campos"
             await _kapso_finalizar_gasto_multi(ident, numero, datos)
             return
-        await kapso.enviar_texto(numero, "Tocá un botón para seguir.")
+        await kapso.enviar_texto(numero, "Tocá una opción para seguir.")
         return
 
     if estado == "k_gasto_varios_sel":
