@@ -1970,7 +1970,7 @@ async def _kapso_guardar_ingreso(ident: dict, numero: str, datos: dict) -> None:
     import json
     ing = datos.get("ingreso", {})
     campo_id = ing.get("campo_id")
-    cultivo = ing.get("cultivo") or "otro"
+    cultivo_pedido = ing.get("cultivo") or "otro"
     tn = float(ing.get("tn") or 0)
     precio = float(ing.get("precio") or 0)
     comprador = (ing.get("comprador") or "").strip()[:150]
@@ -1990,6 +1990,18 @@ async def _kapso_guardar_ingreso(ident: dict, numero: str, datos: dict) -> None:
             datos_cultivos = {}
     except Exception:
         datos_cultivos = {}
+
+    # Normalizar el cultivo al casing que ya usa el campo. Si el campo tiene
+    # "Maíz" en ingresos_cultivos o hectareas_cultivo, el ingreso nuevo va a
+    # esa misma key; sin esto, la app partía los ingresos en dos cultivos
+    # distintos ("maiz" por whatsapp vs "Maíz" por la app).
+    cultivos_existentes = await _wa_cultivos_del_campo(campo_id)
+    n_pedido = _norm_cultivo(cultivo_pedido)
+    cultivo = cultivo_pedido
+    for cult in cultivos_existentes:
+        if _norm_cultivo(cult) == n_pedido:
+            cultivo = cult
+            break
 
     venta = {
         "tn": tn,
@@ -5356,12 +5368,31 @@ async def _kapso_guardar_flete(ident: dict, numero: str, datos: dict) -> None:
 
 
 async def _kapso_guardar_rendimiento(ident: dict, numero: str, datos: dict) -> None:
-    """Guarda rendimiento en campanas (si hay año + cultivo) o en campos.rendimiento."""
+    """Guarda el rendimiento en DOS lados a la vez:
+    - campanas (histórico por año + cultivo).
+    - campos.rendimiento + campos.cultivo (lo que lee la vista del campo en
+      la app). Si no sincronizamos acá, la app sigue mostrando el valor
+      viejo y parece que WhatsApp no cargó nada.
+    Además, el cultivo se normaliza al label que ya usa el campo (por
+    ejemplo: "maiz" → "Maíz" si campos.hectareas_cultivo lo tiene así),
+    así no se parte en dos cultivos distintos por casing."""
     r = datos.get("rendimiento", {})
     campo_id = r.get("campo_id")
-    cultivo = (r.get("cultivo") or "").strip()
+    cultivo_pedido = (r.get("cultivo") or "").strip()
     rend = float(r.get("rendimiento_tha") or 0)
     anio = datetime.now(AR_TZ).year
+
+    # Resolver el cultivo al casing real del campo (match por normalización).
+    cultivo_label = cultivo_pedido or None
+    if campo_id and cultivo_pedido:
+        cultivos_existentes = await _wa_cultivos_del_campo(campo_id)
+        n_pedido = _norm_cultivo(cultivo_pedido)
+        for cult in cultivos_existentes:
+            if _norm_cultivo(cult) == n_pedido:
+                cultivo_label = cult
+                break
+
+    # 1) Campaña histórica.
     campanas_filas = await _sb_get("campanas", {
         "campo_id": f"eq.{campo_id}",
         "anio": f"eq.{anio}",
@@ -5369,21 +5400,26 @@ async def _kapso_guardar_rendimiento(ident: dict, numero: str, datos: dict) -> N
         "limit": "1"}) or []
     if campanas_filas:
         await _sb_patch(f"campanas?id=eq.{campanas_filas[0]['id']}",
-                        {"rendimiento": rend, "cultivo": cultivo or None})
-    elif cultivo:
+                        {"rendimiento": rend, "cultivo": cultivo_label})
+    else:
         await _sb_post("campanas", {
             "campo_id": campo_id, "usuario_id": ident["owner_id"],
-            "anio": anio, "cultivo": cultivo, "rendimiento": rend})
-    else:
-        # Fallback: actualizar campos.rendimiento (no es por campaña, pero
-        # al menos queda registrado).
-        await _sb_patch(f"campos?id=eq.{campo_id}", {"rendimiento": rend})
+            "anio": anio, "cultivo": cultivo_label, "rendimiento": rend})
+
+    # 2) Rendimiento vigente del campo (lo que muestra la vista "Erlicher"
+    # en la app). Se sobrescribe porque es el último valor conocido.
+    patch_campo = {"rendimiento": rend}
+    if cultivo_label:
+        patch_campo["cultivo"] = cultivo_label
+    await _sb_patch(f"campos?id=eq.{campo_id}", patch_campo)
+
     await _wa_clear_conv(numero)
     campo_nombre = r.get("campo_nombre") or ""
     ha = float(r.get("hectareas") or 0)
     tn_total = rend * ha if ha else 0
+    cultivo_mostrar = cultivo_label or cultivo_pedido
     partes = [f"🌾 Rendimiento cargado: *{_num(rend)} t/ha*"
-              + (f" de {cultivo}" if cultivo else "")
+              + (f" de {cultivo_mostrar}" if cultivo_mostrar else "")
               + (f" en {campo_nombre}" if campo_nombre else "")]
     if tn_total:
         partes.append(f"📊 Total: {_num(tn_total)} tn ({_num(ha)} ha)")
@@ -7048,7 +7084,7 @@ async def _kapso_aplicar_intencion(ident: dict, numero: str, intencion: dict,
     if accion == "siembra" and intencion.get("cultivo"):
         if not _wa_puede(ident, "gastos", "editar"):
             return False
-        cultivo = intencion["cultivo"].strip().lower()
+        cultivo_pedido = intencion["cultivo"].strip()
         fecha = intencion.get("fecha_siembra") or datetime.now(AR_TZ).date().isoformat()
         # Campo: Claude → fuzzy → único del user.
         campo = _wa_resolver_campo_fuzzy(ident, intencion.get("_texto_crudo") or "",
@@ -7056,20 +7092,29 @@ async def _kapso_aplicar_intencion(ident: dict, numero: str, intencion: dict,
         if campo is None:
             datos = {"gasto": {
                 "rubro": "Semillas",
-                "descripcion": f"Siembra de {cultivo}",
-                "cultivo": cultivo,
+                "descripcion": f"Siembra de {cultivo_pedido}",
+                "cultivo": cultivo_pedido.lower(),
                 "fecha": fecha,
                 "total_de_usd": float(intencion.get("monto_usd") or 0),
             }, "confirmar": True}
             if await _kapso_pedir_campo(ident, numero, "k_gasto_campo", datos,
-                                        f"¿En qué campo sembraste {cultivo}?"):
+                                        f"¿En qué campo sembraste {cultivo_pedido}?"):
                 return True
             campo = {"id": datos["campo_id"], "nombre": datos["campo_nombre"]}
         if not campo:
             return False
-        cid = campo["id"]
+        # Normalizar al casing que ya usa el campo (igual que rendimiento),
+        # para no partir "Maíz" en dos cultivos distintos por "maiz" vs "Maíz".
+        cultivos_existentes = await _wa_cultivos_del_campo(campo["id"])
+        n_pedido = _norm_cultivo(cultivo_pedido)
+        cultivo_label = cultivo_pedido
+        for cult in cultivos_existentes:
+            if _norm_cultivo(cult) == n_pedido:
+                cultivo_label = cult
+                break
+        cultivo = cultivo_label.lower()  # gastos.cultivo se guarda en minúsculas por convención.
         variedad = (intencion.get("variedad") or "").strip()
-        desc = f"Siembra de {cultivo}" + (f" · variedad {variedad}" if variedad else "")
+        desc = f"Siembra de {cultivo_label}" + (f" · variedad {variedad}" if variedad else "")
         payload = {
             "campo_id": campo["id"],
             "usuario_id": ident["owner_id"],
@@ -7080,28 +7125,28 @@ async def _kapso_aplicar_intencion(ident: dict, numero: str, intencion: dict,
             "cultivo": cultivo,
         }
         await _sb_post("gastos", payload)
-        # Si viene variedad, además actualizamos la campaña del año para
-        # dejarla registrada en campanas (donde la app la lee).
+        # Siempre dejamos la siembra reflejada en campanas (fecha_siembra +
+        # cultivo + variedad, con el casing del campo). Si no hay fila del
+        # año, la creamos.
+        anio = datetime.now(AR_TZ).year
+        camps = await _sb_get("campanas", {
+            "campo_id": f"eq.{campo['id']}", "anio": f"eq.{anio}",
+            "select": "id", "limit": "1"}) or []
+        campana_payload = {"cultivo": cultivo_label, "fecha_siembra": fecha}
         if variedad:
-            anio = datetime.now(AR_TZ).year
-            camps = await _sb_get("campanas", {
-                "campo_id": f"eq.{campo['id']}", "anio": f"eq.{anio}",
-                "select": "id", "limit": "1"}) or []
-            if camps:
-                await _sb_patch(f"campanas?id=eq.{camps[0]['id']}",
-                                {"variedad": variedad, "fecha_siembra": fecha,
-                                 "cultivo": cultivo})
-            else:
-                await _sb_post("campanas", {
-                    "campo_id": campo["id"], "usuario_id": ident["owner_id"],
-                    "anio": anio, "cultivo": cultivo, "variedad": variedad,
-                    "fecha_siembra": fecha})
+            campana_payload["variedad"] = variedad
+        if camps:
+            await _sb_patch(f"campanas?id=eq.{camps[0]['id']}", campana_payload)
+        else:
+            await _sb_post("campanas", {
+                "campo_id": campo["id"], "usuario_id": ident["owner_id"],
+                "anio": anio, **campana_payload})
         await _wa_clear_conv(numero)
         var_line = f"\n🌱 Variedad: *{variedad}*" if variedad else ""
         await kapso.enviar_texto(
             numero,
             f"🌱 Siembra registrada en *{campo['nombre']}*\n"
-            f"Cultivo: *{cultivo.capitalize()}*{var_line}\n"
+            f"Cultivo: *{cultivo_label}*{var_line}\n"
             f"📅 {_wa_fecha_corta(fecha)}\n\n"
             f"_El evento queda en la timeline del campo (tab Cultivo)._"
         )
