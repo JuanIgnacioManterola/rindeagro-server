@@ -2184,7 +2184,8 @@ async def _kapso_texto_libre(ident: dict, numero: str, texto: str,
     # sabe de precio_unit y pisa el audio con un total mal (caso 2026-11:
     # "10 L de glifosato a $5/L" → legacy guardaba USD 3). Mejor menú guiado.
     if intencion_claude and intencion_claude.get("accion") in (
-            "gasto", "lluvia", "ingreso", "pago", "insumo", "tarea_nueva", "siembra"):
+            "gasto", "lluvia", "ingreso", "pago", "insumo", "tarea_nueva", "siembra",
+            "flete", "rendimiento_real", "gasto_estructura", "activo"):
         print(f"[WA FALLBACK] Claude entendió accion={intencion_claude.get('accion')} "
               f"confianza={intencion_claude.get('confianza')} pero no se pudo aplicar — voy a menú")
         await _kapso_menu(ident, numero, "Entendí lo que me mandaste pero me falta info 🤔\n"
@@ -3610,7 +3611,8 @@ ESQUEMA_INTENCION = {
             "enum": ["completar_tarea", "iniciar_tarea", "nota_tarea", "ver_tareas",
                      "gasto", "lluvia", "invitar", "menu", "nada",
                      "ingreso", "pago", "insumo", "tarea_nueva", "siembra",
-                     "eliminar", "modificar_ultimo", "consultar"],
+                     "eliminar", "modificar_ultimo", "consultar",
+                     "flete", "rendimiento_real", "gasto_estructura", "activo"],
         },
         "tarea_id":        {"type": "string"},
         "nota":            {"type": "string"},
@@ -3681,6 +3683,16 @@ ESQUEMA_INTENCION = {
         # "precio", "cantidad", "fecha") y valor nuevo ya extraído.
         "campo_a_cambiar": {"type": "string"},
         "valor_nuevo":     {"type": "string"},
+        # Flete: datos del camión y la carga.
+        "patente_camion":  {"type": "string"},
+        "destino":         {"type": "string"},
+        "ctg":             {"type": "string"},
+        # Rendimiento: toneladas por hectárea cosechadas.
+        "rendimiento_tha": {"type": "number"},
+        # Gasto de estructura / activo: con qué periodicidad se repite.
+        "frecuencia_pago": {"type": "string"},
+        # Activo amortizable: vida útil en años.
+        "vida_util_anos":  {"type": "number"},
         "confianza":       {"type": "string", "enum": ["alta", "media", "baja"]},
     },
     "required": ["accion", "tarea_id", "nota", "campo_id", "rubro", "monto_usd", "monto_ars",
@@ -3691,6 +3703,8 @@ ESQUEMA_INTENCION = {
                  "precio_unit_usd", "precio_unit_ars", "por_hectarea", "items",
                  "titulo_tarea", "prioridad", "fecha_siembra", "tipo_eliminar",
                  "tipo_consulta", "campo_a_cambiar", "valor_nuevo",
+                 "patente_camion", "destino", "ctg", "rendimiento_tha",
+                 "frecuencia_pago", "vida_util_anos",
                  "confianza"],
     "additionalProperties": False,
 }
@@ -3701,12 +3715,14 @@ ESQUEMA_INTENCION = {
 _KEYS_NUM_OPCIONALES = (
     "monto_usd", "monto_ars", "mm", "toneladas", "precio_tn_usd",
     "cantidad", "precio_unit_usd", "precio_unit_ars",
+    "rendimiento_tha", "vida_util_anos",
 )
 _KEYS_STR_OPCIONALES = (
     "tarea_id", "nota", "campo_id", "rubro", "descripcion", "nombre_invitado",
     "cultivo", "comprador", "tipo_pago", "beneficiario", "fecha_venc",
     "tipo_insumo", "unidad", "titulo_tarea", "prioridad", "fecha_siembra",
     "tipo_eliminar", "tipo_consulta", "campo_a_cambiar", "valor_nuevo",
+    "patente_camion", "destino", "ctg", "frecuencia_pago",
 )
 
 
@@ -3828,6 +3844,22 @@ cantidad:280, unidad:"litros", ubicacion:"Fraga"}].
 prioridad entre alta, media, baja. fecha_venc si menciona cuándo.
 - siembra: dice que se sembró un campo ("sembré La Escondida con soja el 10/12"). cultivo, campo_id, \
 fecha_siembra (YYYY-MM-DD). Se guarda como gasto de semillas con la fecha.
+- flete: cargar un flete / carta de porte ("mandé 30 tn de soja a Rosario, patente ABC123, CTG \
+456789"). cultivo, toneladas, destino, patente_camion (del camión), ctg (número CTG), campo_id, \
+fecha_venc (fecha del flete), precio_unit_usd (si da precio por tonelada), monto_usd (si da \
+total). El servidor va a pedir lo que falte.
+- rendimiento_real: cosechó un campo y quiere registrar el rendimiento real ("rindió 3.2 \
+toneladas por hectárea de maíz en Erlicher", "el rendimiento fue de 4 t/ha"). cultivo, campo_id, \
+rendimiento_tha (número en toneladas por hectárea).
+- gasto_estructura: carga un gasto fijo o estructural que no es de un campo específico (sueldos, \
+honorarios, seguros, oficina, contadores). "pagué 1500 dólares de sueldo mensual al encargado", \
+"300 dólares por mes del contador". descripcion (concepto), monto_usd o monto_ars (importe), \
+frecuencia_pago ("mensual", "anual", "unico"), rubro ("sueldo", "honorarios", "seguro", \
+"oficina", "otros").
+- activo: carga un activo amortizable (vehículo, maquinaria, herramienta, construcción). "compré \
+una pulverizadora por 45000 dólares con vida útil de 10 años". descripcion (qué compró), \
+monto_usd (valor de compra), rubro ("vehiculo", "maquinaria", "herramienta", "construccion"), \
+vida_util_anos (años de vida útil, default 10 si no lo dice), fecha_venc (fecha de compra).
 - eliminar: quiere borrar el último registro recién cargado ("eliminar el último gasto", "borrar \
 la venta que cargué", "cancelar la última lluvia", "borrar ese cheque"). Poné tipo_eliminar con \
 el tipo: "gasto", "ingreso", "lluvia", "insumo", "pago" o "tarea". Si dice "el último" sin \
@@ -4561,6 +4593,110 @@ async def _kapso_ejecutar_eliminar(ident: dict, numero: str, registro: dict) -> 
         await kapso.enviar_texto(numero, f"✅ Borré: {registro.get('label') or ''}")
     else:
         await kapso.enviar_texto(numero, "No pude borrarlo. Probá desde la app.")
+
+
+async def _kapso_guardar_flete(ident: dict, numero: str, datos: dict) -> None:
+    """Inserta un flete en la tabla fletes."""
+    f = datos.get("flete", {})
+    payload = {"owner_id": ident["owner_id"], "fuente": "whatsapp"}
+    for k in ("campo_id", "cultivo", "fecha", "patente_camion", "nombre_transporte",
+              "toneladas", "destino", "empresa_destino", "ctg", "carta_porte_nro",
+              "peso_bruto_kg", "peso_tara_kg", "peso_neto_kg", "humedad_porcentaje",
+              "precio_flete_usd", "km_recorridos", "notas"):
+        if f.get(k) is not None:
+            payload[k] = f[k]
+    await _sb_post("fletes", payload)
+    await _wa_clear_conv(numero)
+    partes = [f"🚚 Flete cargado."]
+    if f.get("toneladas"):
+        partes.append(f"⚖️ {_num(f['toneladas'])} tn" + (f" de {f['cultivo']}" if f.get("cultivo") else ""))
+    if f.get("destino"):
+        partes.append(f"📍 Destino: {f['destino']}")
+    if f.get("patente_camion"):
+        partes.append(f"🚛 Patente: {f['patente_camion']}")
+    if f.get("ctg"):
+        partes.append(f"🧾 CTG: {f['ctg']}")
+    if f.get("precio_flete_usd"):
+        partes.append(f"💰 Precio: USD {_num(f['precio_flete_usd'])}")
+    await kapso.enviar_texto(numero, "\n".join(partes))
+
+
+async def _kapso_guardar_rendimiento(ident: dict, numero: str, datos: dict) -> None:
+    """Guarda rendimiento en campanas (si hay año + cultivo) o en campos.rendimiento."""
+    r = datos.get("rendimiento", {})
+    campo_id = r.get("campo_id")
+    cultivo = (r.get("cultivo") or "").strip()
+    rend = float(r.get("rendimiento_tha") or 0)
+    anio = datetime.now(AR_TZ).year
+    campanas_filas = await _sb_get("campanas", {
+        "campo_id": f"eq.{campo_id}",
+        "anio": f"eq.{anio}",
+        "select": "id",
+        "limit": "1"}) or []
+    if campanas_filas:
+        await _sb_patch(f"campanas?id=eq.{campanas_filas[0]['id']}",
+                        {"rendimiento": rend, "cultivo": cultivo or None})
+    elif cultivo:
+        await _sb_post("campanas", {
+            "campo_id": campo_id, "usuario_id": ident["owner_id"],
+            "anio": anio, "cultivo": cultivo, "rendimiento": rend})
+    else:
+        # Fallback: actualizar campos.rendimiento (no es por campaña, pero
+        # al menos queda registrado).
+        await _sb_patch(f"campos?id=eq.{campo_id}", {"rendimiento": rend})
+    await _wa_clear_conv(numero)
+    campo_nombre = r.get("campo_nombre") or ""
+    ha = float(r.get("hectareas") or 0)
+    tn_total = rend * ha if ha else 0
+    partes = [f"🌾 Rendimiento cargado: *{_num(rend)} t/ha*"
+              + (f" de {cultivo}" if cultivo else "")
+              + (f" en {campo_nombre}" if campo_nombre else "")]
+    if tn_total:
+        partes.append(f"📊 Total: {_num(tn_total)} tn ({_num(ha)} ha)")
+    await kapso.enviar_texto(numero, "\n".join(partes))
+
+
+async def _kapso_guardar_gasto_estructura(ident: dict, numero: str, datos: dict) -> None:
+    g = datos.get("gasto_estructura", {})
+    payload = {
+        "owner_id": ident["owner_id"],
+        "descripcion": (g.get("descripcion") or "sin detalle")[:200],
+        "tipo": (g.get("tipo") or "otros").lower(),
+        "importe_usd": float(g.get("importe_usd") or 0),
+        "frecuencia": (g.get("frecuencia") or "mensual").lower(),
+    }
+    if g.get("fecha_inicio"):
+        payload["fecha_inicio"] = g["fecha_inicio"]
+    await _sb_post("gastos_estructura", payload)
+    await _wa_clear_conv(numero)
+    await kapso.enviar_texto(
+        numero,
+        f"🏢 Gasto de estructura cargado.\n"
+        f"📝 {payload['descripcion']}\n"
+        f"💰 USD {_num(payload['importe_usd'])} ({payload['frecuencia']})\n"
+        f"📂 Rubro: {payload['tipo']}")
+
+
+async def _kapso_guardar_activo(ident: dict, numero: str, datos: dict) -> None:
+    a = datos.get("activo", {})
+    payload = {
+        "owner_id": ident["owner_id"],
+        "descripcion": (a.get("descripcion") or "sin detalle")[:200],
+        "tipo": (a.get("tipo") or "otros").lower(),
+        "valor_compra_usd": float(a.get("valor_compra_usd") or 0),
+        "vida_util_anos": int(a.get("vida_util_anos") or 10),
+    }
+    if a.get("fecha_compra"):
+        payload["fecha_compra"] = a["fecha_compra"]
+    await _sb_post("activos_amortizables", payload)
+    await _wa_clear_conv(numero)
+    amort = payload["valor_compra_usd"] / payload["vida_util_anos"] if payload["vida_util_anos"] else 0
+    await kapso.enviar_texto(
+        numero,
+        f"🚜 Activo cargado.\n"
+        f"📝 {payload['descripcion']}\n"
+        f"💰 USD {_miles(payload['valor_compra_usd'])} · vida útil {payload['vida_util_anos']} años\n"
+        f"📉 Amortización anual: USD {_miles(round(amort, 2))}")
 
 
 def _wa_resolver_campo_consulta(ident: dict, intencion: dict) -> dict | None:
@@ -5307,6 +5443,95 @@ async def _kapso_aplicar_intencion(ident: dict, numero: str, intencion: dict,
 
     if accion == "consultar":
         await _wa_consultar(ident, numero, intencion)
+        return True
+
+    # ── Flete ────────────────────────────────────────
+    if accion == "flete":
+        if not _wa_puede(ident, "gastos", "editar"):
+            return False
+        campo = _wa_resolver_campo_fuzzy(ident, intencion.get("_texto_crudo") or "",
+                                        intencion.get("campo_id"))
+        datos = {"flete": {
+            "campo_id": campo["id"] if campo else None,
+            "cultivo": intencion.get("cultivo") or None,
+            "fecha": intencion.get("fecha_venc") or datetime.now(AR_TZ).date().isoformat(),
+            "patente_camion": intencion.get("patente_camion") or None,
+            "toneladas": float(intencion["toneladas"]) if intencion.get("toneladas") else None,
+            "destino": intencion.get("destino") or None,
+            "ctg": intencion.get("ctg") or None,
+            "precio_flete_usd": float(intencion["monto_usd"]) if intencion.get("monto_usd") else None,
+        }}
+        # Faltan datos clave → mandar a menú guiado
+        if not datos["flete"].get("toneladas") and not datos["flete"].get("patente_camion"):
+            await kapso.enviar_texto(
+                numero,
+                "Necesito más datos del flete: cuántas toneladas, de qué cultivo, "
+                "patente del camión, destino. Probá mandándolos juntos.")
+            return True
+        await _kapso_guardar_flete(ident, numero, datos)
+        return True
+
+    # ── Rendimiento real ─────────────────────────────
+    if accion == "rendimiento_real" and intencion.get("rendimiento_tha"):
+        if not _wa_puede(ident, "gastos", "editar"):
+            return False
+        campo = _wa_resolver_campo_fuzzy(ident, intencion.get("_texto_crudo") or "",
+                                        intencion.get("campo_id"))
+        if not campo:
+            await kapso.enviar_texto(numero, "¿De qué campo es el rendimiento?")
+            return True
+        datos = {"rendimiento": {
+            "campo_id": campo["id"],
+            "campo_nombre": campo["nombre"],
+            "hectareas": campo.get("hectareas") or 0,
+            "cultivo": intencion.get("cultivo") or "",
+            "rendimiento_tha": float(intencion["rendimiento_tha"]),
+        }}
+        await _kapso_guardar_rendimiento(ident, numero, datos)
+        return True
+
+    # ── Gasto de estructura ──────────────────────────
+    if accion == "gasto_estructura" and (
+            intencion.get("monto_usd") is not None or intencion.get("monto_ars") is not None):
+        if not _wa_puede(ident, "gastos", "editar"):
+            return False
+        if intencion.get("monto_usd") is not None:
+            importe_usd = float(intencion["monto_usd"])
+        else:
+            ars = float(intencion["monto_ars"])
+            tc = await _dolar_venta()
+            importe_usd = round(ars / tc, 2)
+        tipo = (intencion.get("rubro") or "otros").strip().lower()
+        if tipo not in ("sueldo", "honorarios", "seguro", "oficina", "combustible", "otros"):
+            tipo = "otros"
+        frec = (intencion.get("frecuencia_pago") or "mensual").strip().lower()
+        if frec not in ("mensual", "anual", "unico", "trimestral", "semestral"):
+            frec = "mensual"
+        datos = {"gasto_estructura": {
+            "descripcion": intencion.get("descripcion") or "sin detalle",
+            "tipo": tipo,
+            "importe_usd": importe_usd,
+            "frecuencia": frec,
+            "fecha_inicio": intencion.get("fecha_venc") or datetime.now(AR_TZ).date().isoformat(),
+        }}
+        await _kapso_guardar_gasto_estructura(ident, numero, datos)
+        return True
+
+    # ── Activo amortizable ───────────────────────────
+    if accion == "activo" and intencion.get("monto_usd"):
+        if not _wa_puede(ident, "gastos", "editar"):
+            return False
+        tipo = (intencion.get("rubro") or "otros").strip().lower()
+        if tipo not in ("vehiculo", "maquinaria", "herramienta", "construccion", "otros"):
+            tipo = "otros"
+        datos = {"activo": {
+            "descripcion": intencion.get("descripcion") or "sin detalle",
+            "tipo": tipo,
+            "valor_compra_usd": float(intencion["monto_usd"]),
+            "vida_util_anos": int(intencion.get("vida_util_anos") or 10),
+            "fecha_compra": intencion.get("fecha_venc") or datetime.now(AR_TZ).date().isoformat(),
+        }}
+        await _kapso_guardar_activo(ident, numero, datos)
         return True
 
     if accion in ("completar_tarea", "iniciar_tarea", "nota_tarea"):
