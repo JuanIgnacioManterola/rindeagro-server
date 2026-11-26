@@ -931,35 +931,37 @@ async def _kapso_pedir_multi_seleccion_campos(
     elegidos = [c for c in campos if c["id"] in elegidos_ids]
     no_elegidos = [c for c in campos if c["id"] not in elegidos_ids]
 
-    if elegidos:
-        titulo = "🧮 Ya elegiste: " + ", ".join(c["nombre"] for c in elegidos)
-    else:
-        titulo = "Tocá los campos a los que querés repartir el gasto."
-    if len(elegidos) >= 2:
-        pregunta = f"{titulo}\n\nAgregá otro o tocá *Listo* para repartir."
+    if len(elegidos) == 0:
+        pregunta = ("Tocá un campo para agregarlo al reparto.\n"
+                    "Después vas a poder seguir agregando más.")
     elif len(elegidos) == 1:
-        pregunta = f"{titulo}\n\nAgregá al menos uno más."
+        pregunta = (f"🧮 Elegiste: *{elegidos[0]['nombre']}*\n"
+                    "Tocá otro campo para agregarlo. Necesito al menos 2.")
     else:
-        pregunta = titulo
+        nombres = ", ".join(c["nombre"] for c in elegidos)
+        pregunta = (f"🧮 Elegidos: *{nombres}*\n"
+                    "Agregá otro o tocá *Listo* para repartir.")
 
+    # Primero los campos, al final las acciones (así el user ve la lista de
+    # opciones a tocar y Cancelar no está en la línea superior tentándolo).
     filas = []
-    if len(elegidos) >= 2:
-        filas.append(
-            ("multi:listo",
-             f"✅ Listo con {len(elegidos)} campos",
-             "Reparto proporcional por ha"))
-    filas.append(("multi:cancelar", "❌ Cancelar", "Vuelvo al principio"))
-    cupo = 10 - len(filas)
-    for c in no_elegidos[:cupo]:
+    campos_cupo = 10 - (2 if len(elegidos) >= 2 else 1)
+    for c in no_elegidos[:campos_cupo]:
         sub = []
         if c.get("hectareas"):
             sub.append(f"{_num(c['hectareas'])} ha")
         if c.get("cultivo"):
             sub.append(str(c["cultivo"]))
         filas.append((f"campo:{c['id']}", c["nombre"], " · ".join(sub) or "agregar"))
+    if len(elegidos) >= 2:
+        filas.append(
+            ("multi:listo",
+             f"✅ Listo con {len(elegidos)} campos",
+             "Reparto proporcional por ha"))
+    filas.append(("multi:cancelar", "❌ Cancelar", "Vuelvo al principio"))
 
     await _wa_set_conv(numero, "k_gasto_multi_pick", datos)
-    await kapso.enviar_lista(numero, pregunta, "Elegir", filas, "Campos")
+    await kapso.enviar_lista(numero, pregunta, "Elegir", filas, "Tus campos")
 
 
 async def _kapso_pedir_distribucion_gasto(
