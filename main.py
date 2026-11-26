@@ -3964,6 +3964,9 @@ ESQUEMA_INTENCION = {
         "tipo_pago":       {"type": "string"},
         "beneficiario":    {"type": "string"},
         "fecha_venc":      {"type": "string"},
+        # Cheque: banco emisor + número impreso en el talón.
+        "banco":           {"type": "string"},
+        "numero_cheque":   {"type": "string"},
         # Insumo / gasto detallado
         "tipo_insumo":     {"type": "string"},
         "cantidad":        {"type": "number"},
@@ -4045,6 +4048,7 @@ ESQUEMA_INTENCION = {
                  "descripcion", "mm", "nombre_invitado",
                  "cultivo", "toneladas", "precio_tn_usd", "comprador",
                  "tipo_pago", "beneficiario", "fecha_venc",
+                 "banco", "numero_cheque",
                  "tipo_insumo", "cantidad", "unidad",
                  "precio_unit_usd", "precio_unit_ars", "por_hectarea", "items",
                  "titulo_tarea", "prioridad", "fecha_siembra", "tipo_eliminar",
@@ -4070,6 +4074,7 @@ _KEYS_NUM_OPCIONALES = (
 _KEYS_STR_OPCIONALES = (
     "tarea_id", "nota", "campo_id", "rubro", "descripcion", "nombre_invitado",
     "cultivo", "comprador", "tipo_pago", "beneficiario", "fecha_venc",
+    "banco", "numero_cheque",
     "tipo_insumo", "unidad", "titulo_tarea", "prioridad", "fecha_siembra",
     "tipo_eliminar", "tipo_consulta", "campo_a_cambiar", "valor_nuevo",
     "patente_camion", "destino", "ctg", "frecuencia_pago",
@@ -4179,7 +4184,10 @@ hay un campo del user que parezca razonable; sólo dejalo null si no mencionó n
 - ingreso: vendió cereal. cultivo (soja/maiz/trigo/girasol/sorgo), toneladas, precio_tn_usd, \
 comprador (si menciona), campo_id si lo indica.
 - pago: cheque, crédito u otro compromiso. tipo_pago entre cheque, cuota_credito, otro. \
-beneficiario, monto_usd o monto_ars, fecha_venc (vencimiento o cobro).
+beneficiario, monto_usd o monto_ars, fecha_venc (vencimiento o cobro). Para cheques, si el \
+mensaje menciona el banco emisor ("Banco Macro", "del Nación", "Galicia") ponelo en banco, y si \
+dice el número del cheque ("número 876543", "Nº 12345", "cheque 4521") ponelo en numero_cheque. \
+Si no los menciona dejalos vacíos "".
 - insumo: cargó al stock un producto. tipo_insumo entre herbicidas, fungicidas, insecticidas, \
 fertilizantes, semillas, otros. descripcion = nombre del producto (incluí la concentración si \
 la menciona, ej. "Glifosato 48%"). cantidad + unidad (litros/kg/bolsas/dosis). Si menciona \
@@ -4302,6 +4310,13 @@ importe 8.000.000 de pesos. Entregado a cerealista moldes para pagar insumos" �
 tipo_pago="cheque", beneficiario="Cerealista Moldes", monto_ars=8000000, monto_usd=0, \
 fecha_venc="2026-12-26", descripcion="pagar insumos". "Echeq" (electronic check) o "ecocheq" o \
 "ecocheque" también son cheque.
+
+Ejemplo B2 — cheque con banco y número: "Cargar un cheque para pagar insumos de 5.400.000 \
+pesos a Agropecuaria del Sur, se cobra el 15 de enero, Banco Macro número 876543" → \
+accion=pago, tipo_pago="cheque", beneficiario="Agropecuaria del Sur", monto_ars=5400000, \
+fecha_venc="2027-01-15", banco="Banco Macro", numero_cheque="876543", descripcion="insumos". \
+Si el mismo mensaje trae banco Y número, extraelos a los dos campos — el servidor no vuelve a \
+preguntar lo que ya está.
 
 Ejemplo C — insumo con ubicación: "Agregar 700 litros de glifosato 48% en cerealista moldes" → \
 accion=insumo, items=[{rubro:"herbicidas", descripcion:"Glifosato 48%", cantidad:700, \
@@ -6276,6 +6291,15 @@ async def _kapso_aplicar_intencion(ident: dict, numero: str, intencion: dict,
             datos["pago"]["fecha"] = intencion["fecha_venc"]
         if intencion.get("descripcion"):
             datos["pago"]["descripcion"] = intencion["descripcion"]
+        # Banco + número del cheque: si vinieron en el mismo mensaje, los
+        # tomamos de una. Así el bot no vuelve a pedir lo que el user ya dijo
+        # (caso real 2026-11-26: "cheque 5.400.000 a Agropecuaria del Sur,
+        # Banco Macro número 876543" y el bot preguntaba banco y número igual).
+        if tipo == "cheque":
+            if intencion.get("banco"):
+                datos["pago"]["banco"] = intencion["banco"][:100]
+            if intencion.get("numero_cheque"):
+                datos["pago"]["numero_cheque"] = intencion["numero_cheque"][:30]
 
         # Si es cheque pedimos lo que falta en el mismo orden del flujo guiado:
         # fecha → banco → número → alerta. El flujo k_pag_* ya encadena entre
@@ -6298,6 +6322,14 @@ async def _kapso_aplicar_intencion(ident: dict, numero: str, intencion: dict,
                 await kapso.enviar_texto(numero, "¿Cuál es el número del cheque? "
                                                  "(opcional, escribí _sin número_ para saltear)")
                 return True
+            # Fecha + banco + número ya están: cerramos pidiendo sólo la alerta.
+            # El paso de alerta es útil (recordatorio del vencimiento) y es el
+            # último en el flujo guiado, así cerramos igual que k_pag_numero.
+            await _wa_set_conv(numero, "k_pag_ch_alerta", datos)
+            await kapso.enviar_texto(
+                numero,
+                "¿Querés que te avise antes del vencimiento? (ej: _7 días antes_, _15 días_, o _sin alerta_)")
+            return True
 
         # Para pagos tipo "otro" o cuota_credito single: también pedir la
         # fecha si no viene, en vez de poner hoy silenciosamente.
