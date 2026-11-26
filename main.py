@@ -1438,8 +1438,8 @@ async def _kapso_guardar_tarea_nueva(ident: dict, numero: str, datos: dict) -> N
         payload["prioridad"] = t["prioridad"]
     if t.get("asignado_a"):
         payload["asignado_a"] = t["asignado_a"]
-    await _sb_post("tareas", payload)
-    await _wa_clear_conv(numero)
+    creada = await _sb_post("tareas", payload)
+    tarea_id = (creada or {}).get("id") if isinstance(creada, dict) else None
     partes = [f"✅ Tarea creada: *{t.get('titulo')}*"]
     if t.get("descripcion"):
         partes.append(f"📝 _{t['descripcion']}_")
@@ -1452,7 +1452,41 @@ async def _kapso_guardar_tarea_nueva(ident: dict, numero: str, datos: dict) -> N
         partes.append(f"🌱 {t['campo_nombre']}")
     if t.get("asignado_nombre"):
         partes.append(f"👤 Asignada a: *{t['asignado_nombre']}*")
+    if tarea_id:
+        # Dejamos la conversación esperando un archivo opcional. Si el user
+        # manda foto/PDF en los próximos minutos, se adjunta a la tarea.
+        await _wa_set_conv(numero, "k_tarea_adjunto", {"tarea_id": tarea_id,
+                                                        "titulo": t.get("titulo") or ""})
+        partes.append("\n📎 Si querés mandarme una *foto o PDF* ahora, lo "
+                      "adjunto a la tarea.")
+    else:
+        await _wa_clear_conv(numero)
     await kapso.enviar_texto(numero, "\n".join(partes))
+
+
+async def _kapso_tarea_nueva_adjuntar(ident: dict, numero: str, m, datos: dict) -> None:
+    """Adjunta un archivo a una tarea recién creada."""
+    tarea_id = datos.get("tarea_id")
+    titulo = datos.get("titulo") or "la tarea"
+    if not tarea_id or not m.tiene_media:
+        await _wa_clear_conv(numero)
+        return
+    contenido = await kapso.descargar_media(m.media_url)
+    nombre = m.media_nombre or "archivo"
+    path = f"{ident['owner_id']}/{int(datetime.utcnow().timestamp())}_{nombre}"
+    url = await _sb_storage_subir("tareas-archivos", path, contenido, m.media_tipo)
+    if not url:
+        await _wa_clear_conv(numero)
+        await kapso.enviar_texto(numero, "No pude subir el archivo. Probá desde la app.")
+        return
+    actuales = await _sb_get("tareas", {"id": f"eq.{tarea_id}", "select": "archivos"})
+    archivos = (actuales[0].get("archivos") if actuales else None) or []
+    if not isinstance(archivos, list):
+        archivos = []
+    archivos.append({"url": url, "path": path, "nombre": nombre, "tipo": m.media_tipo})
+    await _sb_patch(f"tareas?id=eq.{tarea_id}", {"archivos": archivos})
+    await _wa_clear_conv(numero)
+    await kapso.enviar_texto(numero, f"📎 Adjunté el archivo a *{titulo}*.")
 
 
 # ── Ingresos (ventas de cultivo) ──────────────
@@ -2185,7 +2219,8 @@ async def _kapso_texto_libre(ident: dict, numero: str, texto: str,
     # "10 L de glifosato a $5/L" → legacy guardaba USD 3). Mejor menú guiado.
     if intencion_claude and intencion_claude.get("accion") in (
             "gasto", "lluvia", "ingreso", "pago", "insumo", "tarea_nueva", "siembra",
-            "flete", "rendimiento_real", "gasto_estructura", "activo"):
+            "flete", "rendimiento_real", "gasto_estructura", "activo",
+            "analisis_suelo", "cerrar_campana"):
         print(f"[WA FALLBACK] Claude entendió accion={intencion_claude.get('accion')} "
               f"confianza={intencion_claude.get('confianza')} pero no se pudo aplicar — voy a menú")
         await _kapso_menu(ident, numero, "Entendí lo que me mandaste pero me falta info 🤔\n"
@@ -2273,6 +2308,23 @@ async def _kapso_flujo(ident: dict, numero: str, m, conv: dict) -> None:
     datos = conv.get("datos_parciales") or {}
     accion = m.accion or ""
     texto = m.texto or ""
+
+    if estado == "k_tarea_adjunto":
+        # Espera un archivo opcional para adjuntar a la tarea recién creada.
+        # Si viene archivo → adjuntar. Si viene texto largo (nueva intención) o
+        # botón del menú, descartar y seguir normal. Texto corto tipo "no" o
+        # "listo" también cierra sin adjuntar.
+        if m.tiene_media:
+            await _kapso_tarea_nueva_adjuntar(ident, numero, m, datos)
+            return
+        n = _norm(texto or "")
+        if n in ("no", "listo", "no gracias", "dejalo", "nada", "sin archivo"):
+            await _wa_clear_conv(numero)
+            return
+        # Cualquier otra cosa: descartamos el estado y reintentamos normal.
+        await _wa_clear_conv(numero)
+        await _kapso_texto_libre(ident, numero, texto)
+        return
 
     if estado == "k_tarea_activa":
         tid = datos.get("tarea_id")
@@ -3612,7 +3664,8 @@ ESQUEMA_INTENCION = {
                      "gasto", "lluvia", "invitar", "menu", "nada",
                      "ingreso", "pago", "insumo", "tarea_nueva", "siembra",
                      "eliminar", "modificar_ultimo", "consultar",
-                     "flete", "rendimiento_real", "gasto_estructura", "activo"],
+                     "flete", "rendimiento_real", "gasto_estructura", "activo",
+                     "analisis_suelo", "cerrar_campana"],
         },
         "tarea_id":        {"type": "string"},
         "nota":            {"type": "string"},
@@ -3693,6 +3746,20 @@ ESQUEMA_INTENCION = {
         "frecuencia_pago": {"type": "string"},
         # Activo amortizable: vida útil en años.
         "vida_util_anos":  {"type": "number"},
+        # Pulverización: momento fenológico de la aplicación.
+        "momento_pulverizacion": {"type": "string"},
+        # Siembra: variedad específica (ej "DK 7220", "Don Mario 60i62").
+        "variedad":        {"type": "string"},
+        # Invitar: rol propuesto + teléfono.
+        "rol_invitado":    {"type": "string"},
+        "telefono_invitado": {"type": "string"},
+        # Análisis de suelo: valores numéricos extraídos del texto.
+        "n_total":         {"type": "number"},
+        "p_disponible":    {"type": "number"},
+        "k_suelo":         {"type": "number"},
+        "ph":              {"type": "number"},
+        "materia_organica": {"type": "number"},
+        "laboratorio":     {"type": "string"},
         "confianza":       {"type": "string", "enum": ["alta", "media", "baja"]},
     },
     "required": ["accion", "tarea_id", "nota", "campo_id", "rubro", "monto_usd", "monto_ars",
@@ -3705,6 +3772,9 @@ ESQUEMA_INTENCION = {
                  "tipo_consulta", "campo_a_cambiar", "valor_nuevo",
                  "patente_camion", "destino", "ctg", "rendimiento_tha",
                  "frecuencia_pago", "vida_util_anos",
+                 "momento_pulverizacion", "variedad", "rol_invitado",
+                 "telefono_invitado", "n_total", "p_disponible", "k_suelo",
+                 "ph", "materia_organica", "laboratorio",
                  "confianza"],
     "additionalProperties": False,
 }
@@ -3716,6 +3786,7 @@ _KEYS_NUM_OPCIONALES = (
     "monto_usd", "monto_ars", "mm", "toneladas", "precio_tn_usd",
     "cantidad", "precio_unit_usd", "precio_unit_ars",
     "rendimiento_tha", "vida_util_anos",
+    "n_total", "p_disponible", "k_suelo", "ph", "materia_organica",
 )
 _KEYS_STR_OPCIONALES = (
     "tarea_id", "nota", "campo_id", "rubro", "descripcion", "nombre_invitado",
@@ -3723,6 +3794,8 @@ _KEYS_STR_OPCIONALES = (
     "tipo_insumo", "unidad", "titulo_tarea", "prioridad", "fecha_siembra",
     "tipo_eliminar", "tipo_consulta", "campo_a_cambiar", "valor_nuevo",
     "patente_camion", "destino", "ctg", "frecuencia_pago",
+    "momento_pulverizacion", "variedad", "rol_invitado", "telefono_invitado",
+    "laboratorio",
 )
 
 
@@ -3860,6 +3933,24 @@ frecuencia_pago ("mensual", "anual", "unico"), rubro ("sueldo", "honorarios", "s
 una pulverizadora por 45000 dólares con vida útil de 10 años". descripcion (qué compró), \
 monto_usd (valor de compra), rubro ("vehiculo", "maquinaria", "herramienta", "construccion"), \
 vida_util_anos (años de vida útil, default 10 si no lo dice), fecha_venc (fecha de compra).
+- analisis_suelo: cargar un análisis de suelo. "análisis de suelo del Erlicher, N 0.15%, P 25 \
+ppm, K 0.8, MO 3.2, pH 6.8, hecho en Agrolab". campo_id, laboratorio, n_total, p_disponible, \
+k_suelo, ph, materia_organica (poné los valores que menciones, el resto en 0).
+- cerrar_campana: el user terminó de cosechar y quiere marcar la campaña como cerrada / cosechada \
+("cerrar la campaña de maíz de Erlicher", "terminé de cosechar La Escondida"). campo_id, cultivo, \
+fecha_venc (fecha de cosecha, default hoy si no dice).
+
+Para acciones de GASTO con pulverización: si el user menciona el momento fenológico ("pulvericé \
+en barbecho", "aplicación de postemergente", "para la siembra", "en presiembra") poné \
+momento_pulverizacion con uno de: "barbecho", "presiembra", "postemergente", "aplicacion", \
+"preemergente". Solo cuando sea una pulverización, no para otros gastos.
+
+Para SIEMBRA: si menciona la variedad específica del cultivo ("sembré con DK 7220", "la \
+variedad fue Don Mario 60i62") poné variedad con ese texto exacto.
+
+Para INVITAR: si el user menciona el rol ("de administrador", "como operario", "admin sin \
+finanzas") poné rol_invitado con uno de: "administrador", "operario", "admin_sin_finanzas". Si \
+menciona el número de teléfono ("el +54 9 11 1234-5678") poné telefono_invitado con los dígitos.
 - eliminar: quiere borrar el último registro recién cargado ("eliminar el último gasto", "borrar \
 la venta que cargué", "cancelar la última lluvia", "borrar ese cheque"). Poné tipo_eliminar con \
 el tipo: "gasto", "ingreso", "lluvia", "insumo", "pago" o "tarea". Si dice "el último" sin \
@@ -4241,6 +4332,10 @@ async def _wa_armar_gasto(ident: dict, campo: dict | None, item: dict, tc_dolar:
         gasto["precio_unitario"] = float(p_unit_usd)
     elif p_unit_ars is not None:
         gasto["precio_unitario"] = round(float(p_unit_ars) / tc_dolar, 4)
+    # Momento fenológico (si lo mencionó): barbecho/presiembra/postemergente/etc.
+    mp = (item.get("momento_pulverizacion") or "").strip().lower()
+    if mp in ("barbecho", "presiembra", "preemergente", "postemergente", "aplicacion"):
+        gasto["momento_pulverizacion"] = mp
     return gasto
 
 
@@ -4675,6 +4770,58 @@ async def _kapso_guardar_gasto_estructura(ident: dict, numero: str, datos: dict)
         f"📝 {payload['descripcion']}\n"
         f"💰 USD {_num(payload['importe_usd'])} ({payload['frecuencia']})\n"
         f"📂 Rubro: {payload['tipo']}")
+
+
+async def _kapso_guardar_analisis_suelo(ident: dict, numero: str, datos: dict) -> None:
+    a = datos.get("analisis_suelo", {})
+    payload = {
+        "usuario_id": ident["owner_id"],
+        "campo_id": a.get("campo_id"),
+        "fecha": a.get("fecha") or datetime.now(AR_TZ).date().isoformat(),
+    }
+    for k in ("laboratorio", "n_total", "p_disponible", "k", "s",
+              "materia_org", "ph", "zinc", "boro", "notas"):
+        if a.get(k) is not None:
+            payload[k] = a[k]
+    await _sb_post("analisis_suelo", payload)
+    await _wa_clear_conv(numero)
+    partes = [f"🧪 Análisis de suelo cargado en *{a.get('campo_nombre') or ''}*"]
+    if a.get("laboratorio"):
+        partes.append(f"🏢 {a['laboratorio']}")
+    valores = []
+    for k, label in [("n_total", "N"), ("p_disponible", "P"), ("k", "K"),
+                     ("materia_org", "MO"), ("ph", "pH")]:
+        if a.get(k) is not None:
+            valores.append(f"{label} {a[k]}")
+    if valores:
+        partes.append("📊 " + " · ".join(valores))
+    await kapso.enviar_texto(numero, "\n".join(partes))
+
+
+async def _kapso_cerrar_campana(ident: dict, numero: str, datos: dict) -> None:
+    c = datos.get("campana", {})
+    campo_id = c.get("campo_id")
+    cultivo = (c.get("cultivo") or "").strip()
+    fecha_cosecha = c.get("fecha_cosecha") or datetime.now(AR_TZ).date().isoformat()
+    anio = datetime.now(AR_TZ).year
+    filas = await _sb_get("campanas", {
+        "campo_id": f"eq.{campo_id}", "anio": f"eq.{anio}",
+        "select": "id,cultivo", "limit": "1"}) or []
+    if filas:
+        await _sb_patch(f"campanas?id=eq.{filas[0]['id']}",
+                        {"fecha_cosecha": fecha_cosecha,
+                         "cultivo": cultivo or filas[0].get("cultivo")})
+    else:
+        await _sb_post("campanas", {
+            "campo_id": campo_id, "usuario_id": ident["owner_id"],
+            "anio": anio, "cultivo": cultivo or None,
+            "fecha_cosecha": fecha_cosecha})
+    await _wa_clear_conv(numero)
+    await kapso.enviar_texto(
+        numero,
+        f"🏁 Campaña {anio}" + (f" de *{cultivo}*" if cultivo else "") +
+        f" cerrada en *{c.get('campo_nombre') or ''}*\n"
+        f"📅 Fecha de cosecha: {_wa_fecha_corta(fecha_cosecha)}")
 
 
 async def _kapso_guardar_activo(ident: dict, numero: str, datos: dict) -> None:
@@ -5517,6 +5664,55 @@ async def _kapso_aplicar_intencion(ident: dict, numero: str, intencion: dict,
         await _kapso_guardar_gasto_estructura(ident, numero, datos)
         return True
 
+    # ── Análisis de suelo ────────────────────────────
+    if accion == "analisis_suelo":
+        if not _wa_puede(ident, "gastos", "editar"):
+            return False
+        campo = _wa_resolver_campo_fuzzy(ident, intencion.get("_texto_crudo") or "",
+                                        intencion.get("campo_id"))
+        if not campo:
+            await kapso.enviar_texto(numero, "¿De qué campo es el análisis?")
+            return True
+        tiene_algun_valor = any(intencion.get(k) is not None for k in
+                                ("n_total", "p_disponible", "k_suelo", "ph", "materia_organica"))
+        if not tiene_algun_valor:
+            await kapso.enviar_texto(
+                numero,
+                "Necesito al menos un valor del análisis. Probá: _N 0.15%, P 25, K 0.8, "
+                "MO 3.2, pH 6.8_.")
+            return True
+        datos = {"analisis_suelo": {
+            "campo_id": campo["id"],
+            "campo_nombre": campo["nombre"],
+            "fecha": intencion.get("fecha_venc"),
+            "laboratorio": intencion.get("laboratorio"),
+            "n_total": intencion.get("n_total"),
+            "p_disponible": intencion.get("p_disponible"),
+            "k": intencion.get("k_suelo"),  # mapeo: schema usa k_suelo, DB usa k
+            "ph": intencion.get("ph"),
+            "materia_org": intencion.get("materia_organica"),  # DB usa materia_org
+        }}
+        await _kapso_guardar_analisis_suelo(ident, numero, datos)
+        return True
+
+    # ── Cerrar campaña ───────────────────────────────
+    if accion == "cerrar_campana":
+        if not _wa_puede(ident, "gastos", "editar"):
+            return False
+        campo = _wa_resolver_campo_fuzzy(ident, intencion.get("_texto_crudo") or "",
+                                        intencion.get("campo_id"))
+        if not campo:
+            await kapso.enviar_texto(numero, "¿Qué campaña cerrar? Decime el campo.")
+            return True
+        datos = {"campana": {
+            "campo_id": campo["id"],
+            "campo_nombre": campo["nombre"],
+            "cultivo": intencion.get("cultivo") or "",
+            "fecha_cosecha": intencion.get("fecha_venc") or datetime.now(AR_TZ).date().isoformat(),
+        }}
+        await _kapso_cerrar_campana(ident, numero, datos)
+        return True
+
     # ── Activo amortizable ───────────────────────────
     if accion == "activo" and intencion.get("monto_usd"):
         if not _wa_puede(ident, "gastos", "editar"):
@@ -5629,7 +5825,16 @@ async def _kapso_aplicar_intencion(ident: dict, numero: str, intencion: dict,
             "monto_usd": intencion.get("monto_usd"),
             "monto_ars": intencion.get("monto_ars"),
             "por_hectarea": intencion.get("por_hectarea"),
+            "momento_pulverizacion": intencion.get("momento_pulverizacion"),
         }]
+        # Si viene momento_pulverizacion arriba, lo propagamos a todos los items
+        # que no lo tengan ya (típico de una pulverización multi-producto donde
+        # el usuario dice el momento una sola vez).
+        mp_global = (intencion.get("momento_pulverizacion") or "").strip().lower()
+        if items and mp_global:
+            for it in lista_items:
+                if not (it.get("momento_pulverizacion") or "").strip():
+                    it["momento_pulverizacion"] = mp_global
 
         # Si algún item es "por hectárea" necesitamos saber el campo antes de
         # calcular. Si Claude no dio el campo y el fuzzy no lo encontró,
@@ -5682,7 +5887,17 @@ async def _kapso_aplicar_intencion(ident: dict, numero: str, intencion: dict,
         return True
 
     if accion == "invitar":
-        await _kapso_invitar_inicio(ident, numero, intencion.get("nombre_invitado") or "")
+        nombre = intencion.get("nombre_invitado") or ""
+        rol = (intencion.get("rol_invitado") or "").strip().lower()
+        # Si ya nombró el rol, lo saltamos directo a crear la invitación.
+        if rol in ("administrador", "admin", "operario"):
+            if not (ident.get("es_dueño") or ident.get("rol") == "administrador"):
+                await kapso.enviar_texto(numero, "Solo el dueño puede sumar gente al equipo.")
+                return True
+            rol_ui = "administrador" if rol.startswith("admin") else "operario"
+            await _kapso_invitar_crear(ident, numero, rol_ui, {"nombre": nombre})
+            return True
+        await _kapso_invitar_inicio(ident, numero, nombre)
         return True
 
     # ── Ingreso (venta de cereal) ────────────────────
@@ -5927,21 +6142,40 @@ async def _kapso_aplicar_intencion(ident: dict, numero: str, intencion: dict,
         if not campo:
             return False
         cid = campo["id"]
+        variedad = (intencion.get("variedad") or "").strip()
+        desc = f"Siembra de {cultivo}" + (f" · variedad {variedad}" if variedad else "")
         payload = {
             "campo_id": campo["id"],
             "usuario_id": ident["owner_id"],
             "rubro": "semillas",
             "fecha": fecha,
             "total_de_usd": float(intencion.get("monto_usd") or 0),
-            "descripcion": f"Siembra de {cultivo}",
+            "descripcion": desc,
             "cultivo": cultivo,
         }
         await _sb_post("gastos", payload)
+        # Si viene variedad, además actualizamos la campaña del año para
+        # dejarla registrada en campanas (donde la app la lee).
+        if variedad:
+            anio = datetime.now(AR_TZ).year
+            camps = await _sb_get("campanas", {
+                "campo_id": f"eq.{campo['id']}", "anio": f"eq.{anio}",
+                "select": "id", "limit": "1"}) or []
+            if camps:
+                await _sb_patch(f"campanas?id=eq.{camps[0]['id']}",
+                                {"variedad": variedad, "fecha_siembra": fecha,
+                                 "cultivo": cultivo})
+            else:
+                await _sb_post("campanas", {
+                    "campo_id": campo["id"], "usuario_id": ident["owner_id"],
+                    "anio": anio, "cultivo": cultivo, "variedad": variedad,
+                    "fecha_siembra": fecha})
         await _wa_clear_conv(numero)
+        var_line = f"\n🌱 Variedad: *{variedad}*" if variedad else ""
         await kapso.enviar_texto(
             numero,
             f"🌱 Siembra registrada en *{campo['nombre']}*\n"
-            f"Cultivo: *{cultivo.capitalize()}*\n"
+            f"Cultivo: *{cultivo.capitalize()}*{var_line}\n"
             f"📅 {_wa_fecha_corta(fecha)}\n\n"
             f"_El evento queda en la timeline del campo (tab Cultivo)._"
         )
@@ -6281,7 +6515,8 @@ async def _kapso_procesar(m) -> None:
     estados_edicion_activa = {"k_gasto_multi_edit_texto", "k_gasto_multi_confirmar",
                               "k_gasto_multi_campo", "k_ins_multi_confirmar",
                               "k_ing_confirmar", "k_lluvia_confirmar",
-                              "k_elim_confirmar", "k_mod_confirmar"}
+                              "k_elim_confirmar", "k_mod_confirmar",
+                              "k_tarea_adjunto"}
     if (conv and texto and m.tipo in ("text", "audio")
             and conv.get("estado") not in estados_edicion_activa
             and _texto_es_nueva_intencion(texto)):
