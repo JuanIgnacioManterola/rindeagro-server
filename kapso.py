@@ -100,14 +100,18 @@ async def _post(payload: dict) -> dict:
         return {}
     url = f"{BASE_URL}/{_phone_number_id()}/messages"
     headers = {"X-API-Key": _api_key(), "Content-Type": "application/json"}
+    tipo = payload.get("type") or "?"
+    if tipo == "interactive":
+        tipo += "/" + (payload.get("interactive", {}).get("type") or "?")
     try:
         async with httpx.AsyncClient(timeout=15) as c:
             r = await c.post(url, headers=headers, json=payload)
             if r.status_code in (200, 201):
+                print(f"[KAPSO→] OK {tipo} → {payload.get('to')}")
                 return r.json()
-            print(f"[KAPSO→] HTTP {r.status_code}: {r.text[:300]}")
+            print(f"[KAPSO→] HTTP {r.status_code} {tipo}: {r.text[:400]}")
     except Exception as e:
-        print(f"[KAPSO→] excepción: {e}")
+        print(f"[KAPSO→] excepción {tipo}: {e}")
     return {}
 
 
