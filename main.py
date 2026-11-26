@@ -5368,11 +5368,13 @@ async def _kapso_guardar_flete(ident: dict, numero: str, datos: dict) -> None:
 
 
 async def _kapso_guardar_rendimiento(ident: dict, numero: str, datos: dict) -> None:
-    """Guarda el rendimiento en DOS lados a la vez:
+    """Guarda el rendimiento en TRES lados a la vez (la app los lee en
+    distintas vistas; cualquiera que no actualicemos queda desfasado):
     - campanas (histórico por año + cultivo).
-    - campos.rendimiento + campos.cultivo (lo que lee la vista del campo en
-      la app). Si no sincronizamos acá, la app sigue mostrando el valor
-      viejo y parece que WhatsApp no cargó nada.
+    - campos.rendimiento + campos.cultivo (vista principal del campo).
+    - campos.ingresos_cultivos.<Cultivo>.rendimiento + tn_cosechadas (la
+      pantalla "Ingresos del cultivo" lee de acá, es lo que calcula
+      "toneladas cosechadas" para la rentabilidad).
     Además, el cultivo se normaliza al label que ya usa el campo (por
     ejemplo: "maiz" → "Maíz" si campos.hectareas_cultivo lo tiene así),
     así no se parte en dos cultivos distintos por casing."""
@@ -5412,6 +5414,48 @@ async def _kapso_guardar_rendimiento(ident: dict, numero: str, datos: dict) -> N
     if cultivo_label:
         patch_campo["cultivo"] = cultivo_label
     await _sb_patch(f"campos?id=eq.{campo_id}", patch_campo)
+
+    # 3) ingresos_cultivos JSON: la pantalla "Ingresos del cultivo" lee el
+    # rendimiento y las toneladas cosechadas desde acá. Sin este update, el
+    # bloque "Rendimiento de la cosecha" seguía mostrando el valor viejo
+    # aunque campos.rendimiento estuviera al día.
+    if cultivo_label:
+        filas = await _sb_get("campos", {
+            "id": f"eq.{campo_id}",
+            "select": "ingresos_cultivos,hectareas_cultivo",
+            "limit": "1",
+        }) or []
+        if filas:
+            try:
+                ing = json.loads(filas[0].get("ingresos_cultivos") or "{}")
+                if not isinstance(ing, dict):
+                    ing = {}
+            except Exception:
+                ing = {}
+            try:
+                hc = json.loads(filas[0].get("hectareas_cultivo") or "{}")
+                if not isinstance(hc, dict):
+                    hc = {}
+            except Exception:
+                hc = {}
+            # ha del cultivo: primero de hectareas_cultivo (fuente de verdad
+            # de la app para superficie por cultivo), luego el fallback que
+            # ya traía el dict de ingreso, luego ha totales del campo.
+            ha_cultivo = None
+            if cultivo_label in hc:
+                try:
+                    ha_cultivo = float(hc[cultivo_label])
+                except (TypeError, ValueError):
+                    ha_cultivo = None
+            cultivo_json = ing.setdefault(cultivo_label, {})
+            if ha_cultivo is None:
+                ha_cultivo = cultivo_json.get("hectareas") or float(r.get("hectareas") or 0)
+            cultivo_json["rendimiento"] = rend
+            if ha_cultivo and ha_cultivo > 0:
+                cultivo_json["hectareas"] = ha_cultivo
+                cultivo_json["tn_cosechadas"] = round(rend * ha_cultivo, 2)
+            await _sb_patch(f"campos?id=eq.{campo_id}",
+                            {"ingresos_cultivos": json.dumps(ing)})
 
     await _wa_clear_conv(numero)
     campo_nombre = r.get("campo_nombre") or ""
