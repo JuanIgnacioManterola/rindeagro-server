@@ -2907,7 +2907,7 @@ async def _kapso_flujo(ident: dict, numero: str, m, conv: dict) -> None:
             return
         datos["flete"]["precio_flete_ars"] = round(precio_por_tn * tn, 2)
         datos["flete"]["precio_por_tn_ars"] = precio_por_tn
-        datos["flete"]["precio_flete_moneda"] = "ARS"
+        datos["flete"]["precio_flete_moneda"] = "ars"
         await _kapso_guardar_flete(ident, numero, datos)
         return
 
@@ -6172,7 +6172,7 @@ async def _wa_modificar_ultimo(ident: dict, numero: str, intencion: dict) -> Non
                 patch["precio_por_tn_ars"] = precio_por_tn_nuevo
                 if tn_reg > 0:
                     patch["precio_flete_ars"] = round(precio_por_tn_nuevo * tn_reg, 2)
-                patch["precio_flete_moneda"] = "ARS"
+                patch["precio_flete_moneda"] = "ars"
                 # Pisamos USD si lo había, para que la app tenga que
                 # reconvertir con el nuevo precio ARS.
                 patch["precio_flete_usd"] = None
@@ -6183,7 +6183,7 @@ async def _wa_modificar_ultimo(ident: dict, numero: str, intencion: dict) -> Non
                 patch["precio_flete_ars"] = total_nuevo
                 if tn_reg > 0:
                     patch["precio_por_tn_ars"] = round(total_nuevo / tn_reg, 2)
-                patch["precio_flete_moneda"] = "ARS"
+                patch["precio_flete_moneda"] = "ars"
                 patch["precio_flete_usd"] = None
                 patch["precio_por_tn_usd"] = None
             elif cm == "fecha":
@@ -6449,9 +6449,9 @@ async def _kapso_aplicar_intencion(ident: dict, numero: str, intencion: dict,
         # nada, dejamos null y el flujo lo pide en ARS más abajo.
         moneda = None
         if precio_total_ars is not None:
-            moneda = "ARS"
+            moneda = "ars"
         elif precio_total_usd is not None:
-            moneda = "USD"
+            moneda = "usd"
         datos = {"flete": {
             "campo_id": campo["id"] if campo else None,
             "campo_nombre": campo["nombre"] if campo else None,
