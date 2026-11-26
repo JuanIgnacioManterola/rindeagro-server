@@ -119,6 +119,19 @@ async def _sb_patch(path: str, payload: dict):
     except Exception as e:
         print(f"[SB PATCH {path}] excepción: {e}")
 
+async def _sb_delete(path: str) -> bool:
+    """DELETE /rest/v1/<path> (ej. "gastos?id=eq.abc"). Devuelve True si fue 2xx."""
+    try:
+        async with httpx.AsyncClient(timeout=10) as c:
+            r = await c.delete(f"{_sb_url()}/rest/v1/{path}", headers=_sb_headers())
+            if r.status_code in (200, 204):
+                return True
+            print(f"[SB DELETE {path}] HTTP {r.status_code}: {r.text[:200]}")
+    except Exception as e:
+        print(f"[SB DELETE {path}] excepción: {e}")
+    return False
+
+
 async def _sb_upsert(table: str, payload: dict, on_conflict: str = "") -> list:
     try:
         h = _sb_headers({"Prefer": "resolution=merge-duplicates,return=representation"})
@@ -2105,6 +2118,8 @@ async def _kapso_texto_libre(ident: dict, numero: str, texto: str,
         # Si el texto empieza con "agregar", "cargar", "sumar", "añadir" sin
         # ser un verbo de gasto, va a Claude (puede ser stock/insumo/ingreso).
         verbo_no_gasto = bool(re.match(r"^(agregar|cargar|sumar|añadir|anadir|anotar)\b", n_lower))
+        # "eliminar/borrar/cancelar/anular" también va a Claude (accion=eliminar).
+        verbo_eliminar = bool(re.search(r"\b(eliminar|borrar|cancelar|anular|quitar|deshacer)\b", n_lower))
         # Texto largo, multi-insumo, multi-precio o "venta/vendí" → Claude.
         complejo = (
             len(texto) > 80
@@ -2113,7 +2128,7 @@ async def _kapso_texto_libre(ident: dict, numero: str, texto: str,
             or bool(re.search(r"\b(venta|vendí|vendimos|vender)\b", n_lower))
             or bool(re.search(r"\b(stock|insumo|insumos|bodega|galp(ó|o)n|dep(ó|o)sito)\b", n_lower))
         )
-        if verbo_no_gasto or complejo or not es_simple_criollo:
+        if verbo_no_gasto or verbo_eliminar or complejo or not es_simple_criollo:
             saltear_parser = True
 
     parseado = _parsear_gasto(texto, ident.get("campos") or []) if (
@@ -3581,7 +3596,8 @@ ESQUEMA_INTENCION = {
             "type": "string",
             "enum": ["completar_tarea", "iniciar_tarea", "nota_tarea", "ver_tareas",
                      "gasto", "lluvia", "invitar", "menu", "nada",
-                     "ingreso", "pago", "insumo", "tarea_nueva", "siembra"],
+                     "ingreso", "pago", "insumo", "tarea_nueva", "siembra",
+                     "eliminar"],
         },
         "tarea_id":        {"type": "string"},
         "nota":            {"type": "string"},
@@ -3642,6 +3658,9 @@ ESQUEMA_INTENCION = {
         "prioridad":       {"type": "string"},
         # Siembra
         "fecha_siembra":   {"type": "string"},
+        # Eliminar: qué tipo de registro quiere borrar el user. Valores:
+        # "gasto", "ingreso", "lluvia", "insumo", "pago", "tarea".
+        "tipo_eliminar":   {"type": "string"},
         "confianza":       {"type": "string", "enum": ["alta", "media", "baja"]},
     },
     "required": ["accion", "tarea_id", "nota", "campo_id", "rubro", "monto_usd", "monto_ars",
@@ -3650,7 +3669,7 @@ ESQUEMA_INTENCION = {
                  "tipo_pago", "beneficiario", "fecha_venc",
                  "tipo_insumo", "cantidad", "unidad",
                  "precio_unit_usd", "precio_unit_ars", "por_hectarea", "items",
-                 "titulo_tarea", "prioridad", "fecha_siembra",
+                 "titulo_tarea", "prioridad", "fecha_siembra", "tipo_eliminar",
                  "confianza"],
     "additionalProperties": False,
 }
@@ -3666,6 +3685,7 @@ _KEYS_STR_OPCIONALES = (
     "tarea_id", "nota", "campo_id", "rubro", "descripcion", "nombre_invitado",
     "cultivo", "comprador", "tipo_pago", "beneficiario", "fecha_venc",
     "tipo_insumo", "unidad", "titulo_tarea", "prioridad", "fecha_siembra",
+    "tipo_eliminar",
 )
 
 
@@ -3787,6 +3807,11 @@ cantidad:280, unidad:"litros", ubicacion:"Fraga"}].
 prioridad entre alta, media, baja. fecha_venc si menciona cuándo.
 - siembra: dice que se sembró un campo ("sembré La Escondida con soja el 10/12"). cultivo, campo_id, \
 fecha_siembra (YYYY-MM-DD). Se guarda como gasto de semillas con la fecha.
+- eliminar: quiere borrar el último registro recién cargado ("eliminar el último gasto", "borrar \
+la venta que cargué", "cancelar la última lluvia", "borrar ese cheque"). Poné tipo_eliminar con \
+el tipo: "gasto", "ingreso", "lluvia", "insumo", "pago" o "tarea". Si dice "el último" sin \
+decir de qué tipo, poné tipo_eliminar="ultimo" (el servidor busca el más reciente de cualquier \
+tipo). El servidor sólo borra lo cargado en los últimos 30 minutos y siempre pide confirmación.
 - invitar: quiere sumar a alguien al equipo. nombre_invitado es de quién habla.
 - menu: saluda o pide ver las opciones.
 - nada: no se entiende o no tiene que ver con la app.
@@ -4233,6 +4258,214 @@ async def _kapso_guardar_multi_insumo(ident: dict, numero: str, datos: dict) -> 
     )
 
 
+_ELIMINAR_MAX_MIN = 30  # solo se puede borrar lo cargado en los últimos 30 minutos
+
+
+async def _wa_buscar_ultimo_registro(ident: dict, tipo: str) -> dict | None:
+    """
+    Busca el último registro del user del tipo pedido, cargado en los últimos
+    _ELIMINAR_MAX_MIN minutos. tipo puede ser: gasto, ingreso, lluvia, insumo,
+    pago, tarea, o "ultimo" (el más reciente de cualquier tipo).
+    Devuelve {kind, id, label, extra} o None.
+    """
+    corte = (datetime.now(AR_TZ) - timedelta(minutes=_ELIMINAR_MAX_MIN)).isoformat()
+    owner_id = ident["owner_id"]
+
+    async def _buscar(kind: str) -> dict | None:
+        if kind == "gasto":
+            rows = await _sb_get("gastos", {
+                "usuario_id": f"eq.{owner_id}",
+                "creado_en": f"gt.{corte}",
+                "select": "id,rubro,descripcion,total_de_usd,creado_en,campo_id",
+                "order": "creado_en.desc",
+                "limit": "1",
+            }) or []
+            if not rows:
+                return None
+            r = rows[0]
+            nombre_campo = next((c["nombre"] for c in ident.get("campos", [])
+                                 if c["id"] == r.get("campo_id")), "")
+            return {"kind": "gasto", "id": r["id"], "table": "gastos",
+                    "label": f"Gasto · {(r.get('rubro') or '').capitalize()} · "
+                             f"{r.get('descripcion') or ''} · USD {_num(r.get('total_de_usd') or 0)}"
+                             + (f" en {nombre_campo}" if nombre_campo else ""),
+                    "creado_en": r["creado_en"]}
+        if kind == "ingreso":
+            # Los ingresos viven como JSON en campos.ingresos_cultivos. El
+            # "último" lo detectamos por la fecha del elemento. No tenemos una
+            # fila a borrar, sino un JSON a reescribir: tratamos esto aparte en
+            # el delete.
+            campos = ident.get("campos") or []
+            if not campos:
+                return None
+            mejor = None
+            mejor_fecha = None
+            for c in campos:
+                filas = await _sb_get("campos", {
+                    "id": f"eq.{c['id']}", "select": "ingresos_cultivos", "limit": "1",
+                }) or []
+                if not filas:
+                    continue
+                try:
+                    data = json.loads(filas[0].get("ingresos_cultivos") or "{}")
+                except Exception:
+                    data = {}
+                for cultivo, info in (data or {}).items():
+                    for v in (info.get("ventas") or []):
+                        f = v.get("fecha") or ""
+                        if f and (mejor_fecha is None or f > mejor_fecha):
+                            mejor_fecha = f
+                            mejor = {"campo_id": c["id"], "campo_nombre": c["nombre"],
+                                     "cultivo": cultivo, "venta": v}
+            if not mejor:
+                return None
+            # Sólo si la venta es de hoy (la fecha de carga no la guardamos por
+            # venta, pero la fecha del JSON es suficiente para el día).
+            hoy = datetime.now(AR_TZ).date().isoformat()
+            if mejor_fecha != hoy:
+                return None
+            v = mejor["venta"]
+            return {"kind": "ingreso", "id": None, "table": "campos",
+                    "campo_id": mejor["campo_id"], "cultivo": mejor["cultivo"],
+                    "venta_ref": v,
+                    "label": f"Venta · {_num(v.get('tn') or 0)} tn de {mejor['cultivo']} "
+                             f"a USD {_num(v.get('precio') or 0)}/tn en {mejor['campo_nombre']}"}
+        if kind == "lluvia":
+            rows = await _sb_get("lluvias", {
+                "usuario_id": f"eq.{owner_id}",
+                "creado_en": f"gt.{corte}",
+                "select": "id,mm,fecha,creado_en,campo_id",
+                "order": "creado_en.desc",
+                "limit": "1",
+            }) or []
+            if not rows:
+                return None
+            r = rows[0]
+            nombre_campo = next((c["nombre"] for c in ident.get("campos", [])
+                                 if c["id"] == r.get("campo_id")), "")
+            return {"kind": "lluvia", "id": r["id"], "table": "lluvias",
+                    "label": f"Lluvia · {_num(r.get('mm') or 0)} mm"
+                             + (f" en {nombre_campo}" if nombre_campo else ""),
+                    "creado_en": r["creado_en"]}
+        if kind == "insumo":
+            rows = await _sb_get("stock_insumos", {
+                "owner_id": f"eq.{owner_id}",
+                "created_at": f"gt.{corte}",
+                "select": "id,nombre,tipo,stock_actual,unidad,created_at",
+                "order": "created_at.desc",
+                "limit": "1",
+            }) or []
+            if not rows:
+                return None
+            r = rows[0]
+            return {"kind": "insumo", "id": r["id"], "table": "stock_insumos",
+                    "label": f"Insumo · {_num(r.get('stock_actual') or 0)} "
+                             f"{r.get('unidad') or ''} de {r.get('nombre') or ''}",
+                    "creado_en": r["created_at"]}
+        if kind == "pago":
+            rows = await _sb_get("compromisos_pago", {
+                "owner_id": f"eq.{owner_id}",
+                "created_at": f"gt.{corte}",
+                "select": "id,tipo,beneficiario,importe,moneda,fecha_cobro,created_at",
+                "order": "created_at.desc",
+                "limit": "1",
+            }) or []
+            if not rows:
+                return None
+            r = rows[0]
+            return {"kind": "pago", "id": r["id"], "table": "compromisos_pago",
+                    "label": f"Pago · {r.get('tipo', '').capitalize()} · "
+                             f"{r.get('moneda')} {_miles(r.get('importe') or 0)} a "
+                             f"{r.get('beneficiario') or ''}",
+                    "creado_en": r["created_at"]}
+        if kind == "tarea":
+            rows = await _sb_get("tareas", {
+                "owner_id": f"eq.{owner_id}",
+                "created_at": f"gt.{corte}",
+                "select": "id,titulo,created_at",
+                "order": "created_at.desc",
+                "limit": "1",
+            }) or []
+            if not rows:
+                return None
+            r = rows[0]
+            return {"kind": "tarea", "id": r["id"], "table": "tareas",
+                    "label": f"Tarea · {r.get('titulo') or 'sin título'}",
+                    "creado_en": r["created_at"]}
+        return None
+
+    if tipo == "ultimo":
+        # Probamos todos y nos quedamos con el más reciente por creado_en.
+        candidatos = []
+        for k in ("gasto", "lluvia", "insumo", "pago", "tarea"):
+            r = await _buscar(k)
+            if r:
+                candidatos.append(r)
+        if not candidatos:
+            return None
+        return max(candidatos, key=lambda x: x.get("creado_en") or "")
+    return await _buscar(tipo)
+
+
+async def _kapso_confirmar_eliminar(numero: str, registro: dict) -> None:
+    """Muestra el registro candidato a borrar y espera el ✅."""
+    await _wa_set_conv(numero, "k_elim_confirmar", {"registro": registro})
+    await kapso.enviar_botones(
+        numero,
+        f"🗑️ ¿Borro este registro?\n\n{registro.get('label') or 'sin detalle'}",
+        [("elim_ok", "✅ Sí, borralo"), ("elim_cancel", "❌ Cancelar")],
+    )
+
+
+async def _kapso_ejecutar_eliminar(ident: dict, numero: str, registro: dict) -> None:
+    """Hace el DELETE real. Para ingresos reescribe el JSON del campo."""
+    kind = registro.get("kind")
+    if kind == "ingreso":
+        campo_id = registro.get("campo_id")
+        cultivo = registro.get("cultivo")
+        venta_ref = registro.get("venta_ref") or {}
+        filas = await _sb_get("campos", {
+            "id": f"eq.{campo_id}", "select": "ingresos_cultivos", "limit": "1"}) or []
+        try:
+            data = json.loads(filas[0].get("ingresos_cultivos") or "{}") if filas else {}
+        except Exception:
+            data = {}
+        ventas = (data.get(cultivo) or {}).get("ventas") or []
+        # Filtramos la venta exacta (por tn + precio + fecha).
+        nuevas = [v for v in ventas if not (
+            v.get("tn") == venta_ref.get("tn")
+            and v.get("precio") == venta_ref.get("precio")
+            and v.get("fecha") == venta_ref.get("fecha"))]
+        if len(nuevas) == len(ventas):
+            await kapso.enviar_texto(numero, "No encontré esa venta para borrar. "
+                                              "Puede que ya la hayas quitado.")
+            await _wa_clear_conv(numero)
+            return
+        if nuevas:
+            data[cultivo]["ventas"] = nuevas
+        else:
+            # Cultivo sin ventas: lo dejamos vacío pero conservamos el cultivo.
+            data[cultivo]["ventas"] = []
+        await _sb_patch(f"campos?id=eq.{campo_id}",
+                        {"ingresos_cultivos": json.dumps(data)})
+        await _wa_clear_conv(numero)
+        await kapso.enviar_texto(numero, f"✅ Borré la venta.")
+        return
+
+    table = registro.get("table")
+    rid = registro.get("id")
+    if not table or not rid:
+        await kapso.enviar_texto(numero, "No pude identificar el registro para borrar.")
+        await _wa_clear_conv(numero)
+        return
+    ok = await _sb_delete(f"{table}?id=eq.{rid}")
+    await _wa_clear_conv(numero)
+    if ok:
+        await kapso.enviar_texto(numero, f"✅ Borré: {registro.get('label') or ''}")
+    else:
+        await kapso.enviar_texto(numero, "No pude borrarlo. Probá desde la app.")
+
+
 async def _kapso_aplicar_intencion(ident: dict, numero: str, intencion: dict,
                                    texto_crudo: str = "") -> bool:
     """Ejecuta lo que Claude entendió. Devuelve False si no se pudo hacer nada."""
@@ -4270,6 +4503,21 @@ async def _kapso_aplicar_intencion(ident: dict, numero: str, intencion: dict,
 
     if accion == "ver_tareas":
         await _kapso_tareas(ident, numero)
+        return True
+
+    if accion == "eliminar":
+        tipo = (intencion.get("tipo_eliminar") or "ultimo").strip().lower()
+        if tipo not in ("gasto", "ingreso", "lluvia", "insumo", "pago", "tarea", "ultimo"):
+            tipo = "ultimo"
+        registro = await _wa_buscar_ultimo_registro(ident, tipo)
+        if not registro:
+            tipo_lbl = "nada reciente" if tipo == "ultimo" else f"ningún {tipo}"
+            await kapso.enviar_texto(
+                numero,
+                f"No encontré {tipo_lbl} tuyo cargado en los últimos {_ELIMINAR_MAX_MIN} minutos. "
+                "Para borrar algo más viejo, entrá desde la app.")
+            return True
+        await _kapso_confirmar_eliminar(numero, registro)
         return True
 
     if accion in ("completar_tarea", "iniciar_tarea", "nota_tarea"):
@@ -4795,6 +5043,21 @@ async def _kapso_procesar(m) -> None:
         await kapso.enviar_texto(numero, "Avisos reactivados 🌾")
         return
 
+    # Botones del flujo de eliminación
+    if accion in ("elim_ok", "elim_cancel"):
+        conv_tmp = await _wa_get_conv(numero)
+        datos_tmp = (conv_tmp or {}).get("datos_parciales") or {}
+        if (conv_tmp or {}).get("estado") != "k_elim_confirmar":
+            await kapso.enviar_texto(numero, "Ya no tengo ese registro en memoria.")
+            await _wa_clear_conv(numero)
+            return
+        if accion == "elim_ok":
+            await _kapso_ejecutar_eliminar(ident, numero, datos_tmp.get("registro") or {})
+            return
+        await _wa_clear_conv(numero)
+        await kapso.enviar_texto(numero, "Listo, no borré nada. 👌")
+        return
+
     # Botones del flujo de confirmación de ingreso
     if accion in ("ing_ok", "ing_cancel"):
         conv_tmp = await _wa_get_conv(numero)
@@ -4988,7 +5251,8 @@ async def _kapso_procesar(m) -> None:
     # largo es esperado — no descartamos.
     estados_edicion_activa = {"k_gasto_multi_edit_texto", "k_gasto_multi_confirmar",
                               "k_gasto_multi_campo", "k_ins_multi_confirmar",
-                              "k_ing_confirmar", "k_lluvia_confirmar"}
+                              "k_ing_confirmar", "k_lluvia_confirmar",
+                              "k_elim_confirmar"}
     if (conv and texto and m.tipo in ("text", "audio")
             and conv.get("estado") not in estados_edicion_activa
             and _texto_es_nueva_intencion(texto)):
