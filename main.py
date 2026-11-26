@@ -2120,6 +2120,18 @@ async def _kapso_texto_libre(ident: dict, numero: str, texto: str,
         verbo_no_gasto = bool(re.match(r"^(agregar|cargar|sumar|añadir|anadir|anotar)\b", n_lower))
         # "eliminar/borrar/cancelar/anular" también va a Claude (accion=eliminar).
         verbo_eliminar = bool(re.search(r"\b(eliminar|borrar|cancelar|anular|quitar|deshacer)\b", n_lower))
+        # Preguntas/consultas → Claude (accion=consultar). Marcadas por "?",
+        # "cuánto", "qué" seguido de pregunta, "stock de", "cheques pendientes".
+        verbo_consulta = (
+            "?" in texto
+            or bool(re.search(r"\b(cu(á|a)nto|cu(á|a)ntos|cu(á|a)ntas)\b", n_lower))
+            or bool(re.search(r"\bstock\s+(de|tengo)\b", n_lower))
+            or bool(re.search(r"\bcheques?\s+(pendientes?|por\s+venir|por\s+cobrar)\b", n_lower))
+            or bool(re.search(r"\b(resumen|resumí|resume|mostrame|most(rá|ra)|dame)\b", n_lower))
+        )
+        # Correcciones del tipo "el X no era Y era Z" → modificar_ultimo.
+        verbo_modificar = bool(re.search(r"\b(cambi(á|a)|corregí|corrige|modific(á|a)|actualiz(á|a))\b", n_lower)) \
+                          or bool(re.search(r"\bno\s+era\b.*\bera\b", n_lower))
         # Texto largo, multi-insumo, multi-precio o "venta/vendí" → Claude.
         complejo = (
             len(texto) > 80
@@ -2128,7 +2140,8 @@ async def _kapso_texto_libre(ident: dict, numero: str, texto: str,
             or bool(re.search(r"\b(venta|vendí|vendimos|vender)\b", n_lower))
             or bool(re.search(r"\b(stock|insumo|insumos|bodega|galp(ó|o)n|dep(ó|o)sito)\b", n_lower))
         )
-        if verbo_no_gasto or verbo_eliminar or complejo or not es_simple_criollo:
+        if (verbo_no_gasto or verbo_eliminar or verbo_consulta or verbo_modificar
+                or complejo or not es_simple_criollo):
             saltear_parser = True
 
     parseado = _parsear_gasto(texto, ident.get("campos") or []) if (
@@ -3597,7 +3610,7 @@ ESQUEMA_INTENCION = {
             "enum": ["completar_tarea", "iniciar_tarea", "nota_tarea", "ver_tareas",
                      "gasto", "lluvia", "invitar", "menu", "nada",
                      "ingreso", "pago", "insumo", "tarea_nueva", "siembra",
-                     "eliminar"],
+                     "eliminar", "modificar_ultimo", "consultar"],
         },
         "tarea_id":        {"type": "string"},
         "nota":            {"type": "string"},
@@ -3658,9 +3671,16 @@ ESQUEMA_INTENCION = {
         "prioridad":       {"type": "string"},
         # Siembra
         "fecha_siembra":   {"type": "string"},
-        # Eliminar: qué tipo de registro quiere borrar el user. Valores:
-        # "gasto", "ingreso", "lluvia", "insumo", "pago", "tarea".
+        # Eliminar / modificar: qué tipo de registro. Valores: "gasto",
+        # "ingreso", "lluvia", "insumo", "pago", "tarea".
         "tipo_eliminar":   {"type": "string"},
+        # Consultas: tipo de pregunta. Valores: "gastos_mes", "stock_producto",
+        # "ventas_cultivo", "cheques_pendientes", "resumen".
+        "tipo_consulta":   {"type": "string"},
+        # Modificar: campo a cambiar ("descripcion", "total", "campo",
+        # "precio", "cantidad", "fecha") y valor nuevo ya extraído.
+        "campo_a_cambiar": {"type": "string"},
+        "valor_nuevo":     {"type": "string"},
         "confianza":       {"type": "string", "enum": ["alta", "media", "baja"]},
     },
     "required": ["accion", "tarea_id", "nota", "campo_id", "rubro", "monto_usd", "monto_ars",
@@ -3670,6 +3690,7 @@ ESQUEMA_INTENCION = {
                  "tipo_insumo", "cantidad", "unidad",
                  "precio_unit_usd", "precio_unit_ars", "por_hectarea", "items",
                  "titulo_tarea", "prioridad", "fecha_siembra", "tipo_eliminar",
+                 "tipo_consulta", "campo_a_cambiar", "valor_nuevo",
                  "confianza"],
     "additionalProperties": False,
 }
@@ -3685,7 +3706,7 @@ _KEYS_STR_OPCIONALES = (
     "tarea_id", "nota", "campo_id", "rubro", "descripcion", "nombre_invitado",
     "cultivo", "comprador", "tipo_pago", "beneficiario", "fecha_venc",
     "tipo_insumo", "unidad", "titulo_tarea", "prioridad", "fecha_siembra",
-    "tipo_eliminar",
+    "tipo_eliminar", "tipo_consulta", "campo_a_cambiar", "valor_nuevo",
 )
 
 
@@ -3812,6 +3833,19 @@ la venta que cargué", "cancelar la última lluvia", "borrar ese cheque"). Poné
 el tipo: "gasto", "ingreso", "lluvia", "insumo", "pago" o "tarea". Si dice "el último" sin \
 decir de qué tipo, poné tipo_eliminar="ultimo" (el servidor busca el más reciente de cualquier \
 tipo). El servidor sólo borra lo cargado en los últimos 30 minutos y siempre pide confirmación.
+- modificar_ultimo: quiere corregir algo del último registro ("cambiar el último gasto a 180 \
+dólares", "el gasto no era glifosato era urea", "la lluvia era en Fraga no en Erlicher", "el \
+precio del cheque eran 10 millones"). Poné tipo_eliminar con el tipo de registro, \
+campo_a_cambiar con QUÉ cambiar ("total", "descripcion", "campo", "precio", "cantidad", \
+"fecha", "banco", "numero", "beneficiario", "comprador") y valor_nuevo con el valor como \
+string ("180" para montos, "Urea" para descripción, "Fraga" para campo). El servidor sólo \
+toca registros de los últimos 30 minutos y pide confirmación.
+- consultar: hace una pregunta ("¿cuánto gasté este mes?", "cuánto stock tengo de glifosato", \
+"cuánto vendí de maíz", "qué cheques tengo pendientes", "cómo vino el mes"). Poné tipo_consulta \
+con uno de: "gastos_mes" (total gastado este mes, opcional por rubro), "stock_producto" (stock \
+de un insumo — poné el nombre en descripcion), "ventas_cultivo" (toneladas y USD vendidos de \
+un cultivo — poné el cultivo en "cultivo"), "cheques_pendientes" (cheques por vencer), \
+"resumen" (resumen del mes). Si pregunta por un rubro específico en gastos, poné el rubro.
 - invitar: quiere sumar a alguien al equipo. nombre_invitado es de quién habla.
 - menu: saluda o pide ver las opciones.
 - nada: no se entiende o no tiene que ver con la app.
@@ -3884,7 +3918,39 @@ async def _dolar_venta() -> float:
     return float(cache_precios.get("bna") or 1400)
 
 
-def _contexto_para_claude(ident: dict, tareas: list, tarea_activa: dict = None) -> str:
+async def _wa_terceros_conocidos(ident: dict) -> list[str]:
+    """Lista única de compradores + beneficiarios que el user ya usó, para que
+    Claude resuelva nombres parciales ("cerealista" → "Cerealista Moldes")."""
+    owner_id = ident.get("owner_id")
+    if not owner_id:
+        return []
+    nombres = set()
+    # Beneficiarios de pagos
+    filas = await _sb_get("compromisos_pago", {
+        "owner_id": f"eq.{owner_id}",
+        "select": "beneficiario",
+        "order": "created_at.desc",
+        "limit": "50",
+    }) or []
+    for f in filas:
+        v = (f.get("beneficiario") or "").strip()
+        if v:
+            nombres.add(v)
+    # Compradores de ingresos (viven dentro de campos.ingresos_cultivos)
+    for c in ident.get("campos") or []:
+        try:
+            data = json.loads(c.get("ingresos_cultivos") or "{}")
+        except Exception:
+            data = {}
+        for info in (data or {}).values():
+            for v in (info.get("ventas") or []):
+                comp = (v.get("comprador") or "").strip()
+                if comp:
+                    nombres.add(comp)
+    return sorted(nombres, key=lambda x: x.lower())
+
+
+async def _contexto_para_claude(ident: dict, tareas: list, tarea_activa: dict = None) -> str:
     partes = []
     campos = ident.get("campos") or []
     if campos:
@@ -3893,6 +3959,18 @@ def _contexto_para_claude(ident: dict, tareas: list, tarea_activa: dict = None) 
             partes.append(f"- id={c['id']} · {c['nombre']}")
     else:
         partes.append("El productor no tiene campos cargados.")
+
+    # Terceros ya conocidos (compradores, beneficiarios). Si el user los
+    # menciona parcial ("cerealista"), Claude usa el nombre completo.
+    try:
+        terceros = await _wa_terceros_conocidos(ident)
+    except Exception:
+        terceros = []
+    if terceros:
+        partes.append("\nCompradores y proveedores ya conocidos (reutilizalos tal cual "
+                      "si el user los menciona parciales):")
+        for t in terceros[:30]:
+            partes.append(f"- {t}")
 
     if tareas:
         partes.append("\nTareas pendientes:")
@@ -3964,7 +4042,7 @@ async def _interpretar_con_claude(texto: str, ident: dict, tareas: list,
 
     try:
         cliente = anthropic.AsyncAnthropic()
-        contexto = _contexto_para_claude(ident, tareas, tarea_activa)
+        contexto = await _contexto_para_claude(ident, tareas, tarea_activa)
         prompt_user = f"{contexto}\n\nMensaje recibido:\n{texto}"
         print(f"[CLAUDE] IN >> {texto[:400]!r}")
 
@@ -4466,6 +4544,291 @@ async def _kapso_ejecutar_eliminar(ident: dict, numero: str, registro: dict) -> 
         await kapso.enviar_texto(numero, "No pude borrarlo. Probá desde la app.")
 
 
+async def _wa_consultar(ident: dict, numero: str, intencion: dict) -> None:
+    """Responde consultas rápidas (gastos del mes, stock, ventas, cheques)."""
+    tipo = (intencion.get("tipo_consulta") or "resumen").strip().lower()
+    owner_id = ident["owner_id"]
+
+    if tipo in ("gastos_mes", "gastos"):
+        hoy = datetime.now(AR_TZ).date()
+        desde = hoy.replace(day=1).isoformat()
+        rubro_filtro = (intencion.get("rubro") or "").strip().lower()
+        params = {
+            "usuario_id": f"eq.{owner_id}",
+            "fecha": f"gte.{desde}",
+            "select": "rubro,total_de_usd",
+            "limit": "500",
+        }
+        if rubro_filtro:
+            params["rubro"] = f"eq.{rubro_filtro}"
+        filas = await _sb_get("gastos", params) or []
+        if not filas:
+            await kapso.enviar_texto(
+                numero, f"No cargaste gastos este mes" +
+                        (f" en *{rubro_filtro}*" if rubro_filtro else "") + ".")
+            return
+        total = sum(float(f.get("total_de_usd") or 0) for f in filas)
+        por_rubro = {}
+        for f in filas:
+            r = (f.get("rubro") or "otros").capitalize()
+            por_rubro[r] = por_rubro.get(r, 0) + float(f.get("total_de_usd") or 0)
+        lineas = [f"💰 Gastos de este mes: *USD {_num(round(total, 2))}*"]
+        if not rubro_filtro:
+            for r, v in sorted(por_rubro.items(), key=lambda kv: -kv[1]):
+                lineas.append(f"• {r} · USD {_num(round(v, 2))}")
+        else:
+            lineas.append(f"({len(filas)} cargas de *{rubro_filtro}*)")
+        await kapso.enviar_texto(numero, "\n".join(lineas))
+        return
+
+    if tipo == "stock_producto":
+        nombre = (intencion.get("descripcion") or "").strip()
+        params = {
+            "owner_id": f"eq.{owner_id}",
+            "select": "nombre,stock_actual,unidad,ubicacion,costo_unitario",
+            "order": "stock_actual.desc",
+            "limit": "20",
+        }
+        if nombre:
+            params["nombre"] = f"ilike.%{nombre}%"
+        filas = await _sb_get("stock_insumos", params) or []
+        if not filas:
+            await kapso.enviar_texto(
+                numero, f"No tengo stock" +
+                        (f" de *{nombre}*" if nombre else "") + " cargado.")
+            return
+        total = sum(float(f.get("stock_actual") or 0) for f in filas)
+        unidad = filas[0].get("unidad") or ""
+        lineas = []
+        if nombre:
+            lineas.append(f"📦 Stock de *{nombre}*: *{_num(total)} {unidad}*")
+        else:
+            lineas.append(f"📦 Stock total ({len(filas)} productos):")
+        for f in filas[:10]:
+            ubi = f" · 📍 {f['ubicacion']}" if f.get("ubicacion") else ""
+            lineas.append(f"• {f.get('nombre')} · {_num(f.get('stock_actual') or 0)} "
+                          f"{f.get('unidad') or ''}{ubi}")
+        if len(filas) > 10:
+            lineas.append(f"...y {len(filas) - 10} más.")
+        await kapso.enviar_texto(numero, "\n".join(lineas))
+        return
+
+    if tipo == "ventas_cultivo":
+        cultivo = (intencion.get("cultivo") or "").strip()
+        campos = ident.get("campos") or []
+        total_tn = 0.0
+        total_usd = 0.0
+        por_campo = {}
+        for c in campos:
+            try:
+                data = json.loads(c.get("ingresos_cultivos") or "{}")
+            except Exception:
+                data = {}
+            for k, info in (data or {}).items():
+                if cultivo and _norm_cultivo(k) != _norm_cultivo(cultivo):
+                    continue
+                for v in (info.get("ventas") or []):
+                    tn = float(v.get("tn") or 0)
+                    pr = float(v.get("precio") or 0)
+                    total_tn += tn
+                    total_usd += tn * pr
+                    por_campo[c["nombre"]] = por_campo.get(c["nombre"], 0) + tn
+        if total_tn == 0:
+            cultivo_lbl = f" de *{cultivo}*" if cultivo else ""
+            await kapso.enviar_texto(numero, f"No tengo ventas{cultivo_lbl} registradas.")
+            return
+        lineas = [f"🌾 Ventas{' de ' + cultivo if cultivo else ''}: "
+                  f"*{_num(total_tn)} tn · USD {_miles(round(total_usd, 2))}*"]
+        for nombre, tn in sorted(por_campo.items(), key=lambda kv: -kv[1]):
+            lineas.append(f"• {nombre}: {_num(tn)} tn")
+        await kapso.enviar_texto(numero, "\n".join(lineas))
+        return
+
+    if tipo == "cheques_pendientes":
+        hoy = datetime.now(AR_TZ).date().isoformat()
+        filas = await _sb_get("compromisos_pago", {
+            "owner_id": f"eq.{owner_id}",
+            "estado": "eq.pendiente",
+            "fecha_cobro": f"gte.{hoy}",
+            "select": "tipo,beneficiario,importe,moneda,fecha_cobro,banco,numero_cheque",
+            "order": "fecha_cobro.asc",
+            "limit": "30",
+        }) or []
+        if not filas:
+            await kapso.enviar_texto(numero, "No tenés pagos pendientes a futuro. 🎉")
+            return
+        lineas = [f"🧾 Tenés *{len(filas)} pagos* por venir:"]
+        for f in filas[:10]:
+            tipo_lbl = f.get("tipo", "pago").capitalize()
+            num = f" #{f['numero_cheque']}" if f.get("numero_cheque") else ""
+            lineas.append(
+                f"• {_wa_fecha_corta(f.get('fecha_cobro'))} · {tipo_lbl}{num} · "
+                f"{f.get('moneda', 'ARS')} {_miles(f.get('importe') or 0)} "
+                f"a {f.get('beneficiario') or '—'}")
+        if len(filas) > 10:
+            lineas.append(f"...y {len(filas) - 10} más.")
+        await kapso.enviar_texto(numero, "\n".join(lineas))
+        return
+
+    # resumen genérico del mes (gastos + ingresos + lluvias + cheques)
+    hoy = datetime.now(AR_TZ).date()
+    desde = hoy.replace(day=1).isoformat()
+    gastos = await _sb_get("gastos", {
+        "usuario_id": f"eq.{owner_id}", "fecha": f"gte.{desde}",
+        "select": "total_de_usd", "limit": "500"}) or []
+    total_gasto = sum(float(g.get("total_de_usd") or 0) for g in gastos)
+    lluvias = await _sb_get("lluvias", {
+        "usuario_id": f"eq.{owner_id}", "fecha": f"gte.{desde}",
+        "select": "mm", "limit": "500"}) or []
+    total_mm = sum(float(l.get("mm") or 0) for l in lluvias)
+    cheques = await _sb_get("compromisos_pago", {
+        "owner_id": f"eq.{owner_id}", "estado": "eq.pendiente",
+        "fecha_cobro": f"gte.{hoy.isoformat()}",
+        "select": "importe", "limit": "100"}) or []
+    lineas = [f"📊 Resumen de este mes:",
+              f"💰 Gastos: *USD {_num(round(total_gasto, 2))}* ({len(gastos)} cargas)",
+              f"🌧️ Lluvia: *{_num(total_mm)} mm* ({len(lluvias)} registros)",
+              f"🧾 Pagos pendientes: *{len(cheques)}*"]
+    await kapso.enviar_texto(numero, "\n".join(lineas))
+
+
+async def _wa_modificar_ultimo(ident: dict, numero: str, intencion: dict) -> None:
+    """Modifica el último registro del tipo indicado. Pide confirmación."""
+    tipo = (intencion.get("tipo_eliminar") or "ultimo").strip().lower()
+    if tipo not in ("gasto", "ingreso", "lluvia", "insumo", "pago", "tarea", "ultimo"):
+        tipo = "ultimo"
+    campo_cambiar = (intencion.get("campo_a_cambiar") or "").strip().lower()
+    valor_nuevo = (intencion.get("valor_nuevo") or "").strip()
+
+    if not campo_cambiar or not valor_nuevo:
+        await kapso.enviar_texto(
+            numero, "No entendí qué querés cambiar. Probá así:\n"
+                     "_cambiá el último gasto a USD 180_\n"
+                     "_el gasto no era glifosato era urea_")
+        return
+
+    registro = await _wa_buscar_ultimo_registro(ident, tipo)
+    if not registro:
+        tipo_lbl = "nada reciente" if tipo == "ultimo" else f"ningún {tipo}"
+        await kapso.enviar_texto(
+            numero,
+            f"No encontré {tipo_lbl} tuyo cargado en los últimos {_ELIMINAR_MAX_MIN} minutos. "
+            "Para editar algo más viejo, la app.")
+        return
+
+    # Armo el patch según el campo que quiere cambiar
+    patch = {}
+    kind = registro.get("kind")
+    cm = campo_cambiar
+    try:
+        if kind == "gasto":
+            if cm in ("total", "importe", "monto"):
+                patch["total_de_usd"] = float(valor_nuevo.replace(",", "."))
+            elif cm in ("descripcion", "producto", "nombre"):
+                patch["descripcion"] = valor_nuevo[:200]
+            elif cm == "rubro":
+                patch["rubro"] = valor_nuevo.strip().lower()
+            elif cm in ("precio", "precio_unitario"):
+                patch["precio_unitario"] = float(valor_nuevo.replace(",", "."))
+            elif cm == "cantidad":
+                patch["cantidad"] = float(valor_nuevo.replace(",", "."))
+            elif cm == "fecha":
+                f = _parsear_fecha_natural(valor_nuevo)
+                if f:
+                    patch["fecha"] = f
+        elif kind == "lluvia":
+            if cm in ("mm", "cantidad"):
+                patch["mm"] = float(valor_nuevo.replace(",", "."))
+            elif cm == "fecha":
+                f = _parsear_fecha_natural(valor_nuevo)
+                if f:
+                    patch["fecha"] = f
+        elif kind == "insumo":
+            if cm in ("cantidad", "stock"):
+                patch["stock_actual"] = float(valor_nuevo.replace(",", "."))
+            elif cm in ("precio", "precio_unitario", "costo"):
+                patch["costo_unitario"] = float(valor_nuevo.replace(",", "."))
+            elif cm in ("ubicacion", "ubicación", "lugar"):
+                patch["ubicacion"] = valor_nuevo[:150]
+            elif cm in ("nombre", "descripcion"):
+                patch["nombre"] = valor_nuevo[:150]
+        elif kind == "pago":
+            if cm in ("importe", "monto", "total"):
+                patch["importe"] = float(valor_nuevo.replace(",", "."))
+            elif cm in ("beneficiario", "a quien", "a quién"):
+                patch["beneficiario"] = valor_nuevo[:150]
+            elif cm == "banco":
+                patch["banco"] = valor_nuevo[:100]
+            elif cm in ("numero", "número"):
+                patch["numero_cheque"] = valor_nuevo[:30]
+            elif cm == "fecha":
+                f = _parsear_fecha_natural(valor_nuevo)
+                if f:
+                    patch["fecha_cobro"] = f
+    except (ValueError, TypeError):
+        pass
+
+    if not patch:
+        await kapso.enviar_texto(
+            numero,
+            f"No entendí cómo cambiar *{campo_cambiar}* en un {kind}. Probá otra forma.")
+        return
+
+    # Confirmación: estado + botones
+    await _wa_set_conv(numero, "k_mod_confirmar",
+                       {"registro": registro, "patch": patch})
+    cambios = ", ".join(f"*{k}* → *{v}*" for k, v in patch.items())
+    await kapso.enviar_botones(
+        numero,
+        f"✏️ Cambios para:\n{registro.get('label') or ''}\n\n{cambios}\n\n¿Lo aplico?",
+        [("mod_ok", "✅ Sí, cambialo"), ("mod_cancel", "❌ Cancelar")],
+    )
+
+
+async def _kapso_ejecutar_modificar(ident: dict, numero: str, datos: dict) -> None:
+    registro = datos.get("registro") or {}
+    patch = datos.get("patch") or {}
+    kind = registro.get("kind")
+
+    if kind == "ingreso":
+        # Ingresos no tienen tabla, requieren reescribir el JSON.
+        # Para simplificar, soportamos cambiar precio o tn: buscamos la venta
+        # exacta del JSON y reemplazamos los campos del patch.
+        campo_id = registro.get("campo_id")
+        cultivo = registro.get("cultivo")
+        venta_ref = registro.get("venta_ref") or {}
+        filas = await _sb_get("campos", {
+            "id": f"eq.{campo_id}", "select": "ingresos_cultivos", "limit": "1"}) or []
+        try:
+            data = json.loads(filas[0].get("ingresos_cultivos") or "{}") if filas else {}
+        except Exception:
+            data = {}
+        for v in (data.get(cultivo) or {}).get("ventas") or []:
+            if (v.get("tn") == venta_ref.get("tn")
+                    and v.get("precio") == venta_ref.get("precio")
+                    and v.get("fecha") == venta_ref.get("fecha")):
+                if "mm" in patch or "precio" in patch:
+                    pass  # precio ya está arriba; no toco
+                # Aplicar campos del patch (mapeo: 'total_de_usd' no aplica aquí)
+                for k, val in patch.items():
+                    if k == "precio_unitario":
+                        v["precio"] = val
+                break
+        await _sb_patch(f"campos?id=eq.{campo_id}",
+                        {"ingresos_cultivos": json.dumps(data)})
+    else:
+        table = registro.get("table")
+        rid = registro.get("id")
+        if not table or not rid:
+            await kapso.enviar_texto(numero, "No pude identificar el registro.")
+            await _wa_clear_conv(numero)
+            return
+        await _sb_patch(f"{table}?id=eq.{rid}", patch)
+
+    await _wa_clear_conv(numero)
+    await kapso.enviar_texto(numero, f"✅ Listo, actualicé el registro.")
+
+
 async def _kapso_aplicar_intencion(ident: dict, numero: str, intencion: dict,
                                    texto_crudo: str = "") -> bool:
     """Ejecuta lo que Claude entendió. Devuelve False si no se pudo hacer nada."""
@@ -4518,6 +4881,14 @@ async def _kapso_aplicar_intencion(ident: dict, numero: str, intencion: dict,
                 "Para borrar algo más viejo, entrá desde la app.")
             return True
         await _kapso_confirmar_eliminar(numero, registro)
+        return True
+
+    if accion == "modificar_ultimo":
+        await _wa_modificar_ultimo(ident, numero, intencion)
+        return True
+
+    if accion == "consultar":
+        await _wa_consultar(ident, numero, intencion)
         return True
 
     if accion in ("completar_tarea", "iniciar_tarea", "nota_tarea"):
@@ -5043,6 +5414,21 @@ async def _kapso_procesar(m) -> None:
         await kapso.enviar_texto(numero, "Avisos reactivados 🌾")
         return
 
+    # Botones del flujo de modificación
+    if accion in ("mod_ok", "mod_cancel"):
+        conv_tmp = await _wa_get_conv(numero)
+        datos_tmp = (conv_tmp or {}).get("datos_parciales") or {}
+        if (conv_tmp or {}).get("estado") != "k_mod_confirmar":
+            await kapso.enviar_texto(numero, "Ya no tengo ese cambio en memoria.")
+            await _wa_clear_conv(numero)
+            return
+        if accion == "mod_ok":
+            await _kapso_ejecutar_modificar(ident, numero, datos_tmp)
+            return
+        await _wa_clear_conv(numero)
+        await kapso.enviar_texto(numero, "Listo, no cambié nada. 👌")
+        return
+
     # Botones del flujo de eliminación
     if accion in ("elim_ok", "elim_cancel"):
         conv_tmp = await _wa_get_conv(numero)
@@ -5252,7 +5638,7 @@ async def _kapso_procesar(m) -> None:
     estados_edicion_activa = {"k_gasto_multi_edit_texto", "k_gasto_multi_confirmar",
                               "k_gasto_multi_campo", "k_ins_multi_confirmar",
                               "k_ing_confirmar", "k_lluvia_confirmar",
-                              "k_elim_confirmar"}
+                              "k_elim_confirmar", "k_mod_confirmar"}
     if (conv and texto and m.tipo in ("text", "audio")
             and conv.get("estado") not in estados_edicion_activa
             and _texto_es_nueva_intencion(texto)):
