@@ -2396,10 +2396,19 @@ async def _kapso_texto_libre(ident: dict, numero: str, texto: str,
                 await _kapso_guardar_lluvia(ident, numero, campo_unico, mm)
             return
 
-    # Ver tareas
+    # Ver tareas: sólo si el texto parece una CONSULTA. Si tiene un verbo de
+    # acción (borrar / modificar / crear / completar / asignar / iniciar), cae
+    # a Claude para que decida el accion real (caso real 2026-11-26: "borra la
+    # última tarea" terminaba en ver_tareas porque el regex matchea "tarea" sola).
     if _wa_puede(ident, "tareas") and _RE_VER_TAREAS.search(n) and len(n) < 60:
-        await _kapso_tareas(ident, numero)
-        return
+        verbo_accion = re.search(
+            r"\b(borr|elimin|cancel|anul|quit|deshac|modif|cambi|corrig|edit|"
+            r"asign|complet|termin|hice|cerr|cre[oa]r|crea|nuev|inici|arranc|"
+            r"empec|empez)",
+            n)
+        if not verbo_accion:
+            await _kapso_tareas(ident, numero)
+            return
 
     # Gasto dicho en criollo, SIN IA, SOLO si Claude no está disponible o el
     # texto es muy corto y simple (p. ej. "gasté 100 de urea"). Si Claude está
