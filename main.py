@@ -922,46 +922,35 @@ async def _kapso_pedir_distribucion_estructura(
 async def _kapso_pedir_multi_seleccion_campos(
     ident: dict, numero: str, datos: dict
 ) -> None:
-    """Muestra una lista con los campos que el user todavía no eligió, para
-    que vaya tocando uno por uno y los vaya sumando al reparto. Arriba van
-    las acciones (Listo / Cancelar) y abajo los campos que faltan. El estado
-    queda en k_gasto_multi_pick."""
+    """Muestra la lista de campos numerada y pide al user que escriba en UN
+    mensaje los números (o nombres) separados por coma. Soporta también
+    *todos* como atajo. El estado queda en k_gasto_multi_pick."""
     campos = ident.get("campos") or []
-    elegidos_ids = datos.get("elegidos_multi") or []
-    elegidos = [c for c in campos if c["id"] in elegidos_ids]
-    no_elegidos = [c for c in campos if c["id"] not in elegidos_ids]
-
-    if len(elegidos) == 0:
-        pregunta = ("Tocá un campo para agregarlo al reparto.\n"
-                    "Después vas a poder seguir agregando más.")
-    elif len(elegidos) == 1:
-        pregunta = (f"🧮 Elegiste: *{elegidos[0]['nombre']}*\n"
-                    "Tocá otro campo para agregarlo. Necesito al menos 2.")
-    else:
-        nombres = ", ".join(c["nombre"] for c in elegidos)
-        pregunta = (f"🧮 Elegidos: *{nombres}*\n"
-                    "Agregá otro o tocá *Listo* para repartir.")
-
-    # Primero los campos, al final las acciones (así el user ve la lista de
-    # opciones a tocar y Cancelar no está en la línea superior tentándolo).
-    filas = []
-    campos_cupo = 10 - (2 if len(elegidos) >= 2 else 1)
-    for c in no_elegidos[:campos_cupo]:
+    lineas = []
+    for i, c in enumerate(campos, start=1):
         sub = []
         if c.get("hectareas"):
             sub.append(f"{_num(c['hectareas'])} ha")
         if c.get("cultivo"):
             sub.append(str(c["cultivo"]))
-        filas.append((f"campo:{c['id']}", c["nombre"], " · ".join(sub) or "agregar"))
-    if len(elegidos) >= 2:
-        filas.append(
-            ("multi:listo",
-             f"✅ Listo con {len(elegidos)} campos",
-             "Reparto proporcional por ha"))
-    filas.append(("multi:cancelar", "❌ Cancelar", "Vuelvo al principio"))
-
+        extra = f" _({' · '.join(sub)})_" if sub else ""
+        lineas.append(f"*{i}.* {c['nombre']}{extra}")
+    lista_txt = "\n".join(lineas)
+    pregunta = (
+        "📂 Elegí los campos a los que repartir el gasto.\n"
+        "Mandame los *números* separados por coma en UN solo mensaje.\n\n"
+        f"{lista_txt}\n\n"
+        "Ejemplos:\n"
+        "  • _1, 3, 5_ → los campos 1, 3 y 5\n"
+        "  • _erlicher, fraga_ → por nombre\n"
+        "  • _todos_ → todos los campos\n\n"
+        "Para salir: _cancelar_"
+    )
+    # Guardamos el orden de los campos tal como el user los vio, así "1" se
+    # resuelve al mismo campo aunque el orden del ident cambie entre mensajes.
+    datos["multi_lista_ids"] = [c["id"] for c in campos]
     await _wa_set_conv(numero, "k_gasto_multi_pick", datos)
-    await kapso.enviar_lista(numero, pregunta, "Elegir", filas, "Tus campos")
+    await kapso.enviar_texto(numero, pregunta)
 
 
 async def _kapso_pedir_distribucion_gasto(
@@ -3166,54 +3155,83 @@ async def _kapso_flujo(ident: dict, numero: str, m, conv: dict) -> None:
         return
 
     if estado == "k_gasto_multi_pick":
-        # El user está armando la lista de campos con la UI de pick (lista
-        # de campos no elegidos + Listo / Cancelar).
-        elegidos_ids = list(datos.get("elegidos_multi") or [])
-        if accion == "multi:listo":
-            if len(elegidos_ids) < 2:
-                await kapso.enviar_texto(
-                    numero, "Necesito al menos 2 campos para repartir.")
-                await _kapso_pedir_multi_seleccion_campos(ident, numero, datos)
-                return
-            campos_user = ident.get("campos") or []
-            elegidos = [c for c in campos_user if c["id"] in elegidos_ids]
-            elegidos_ha = [c for c in elegidos if float(c.get("hectareas") or 0) > 0]
-            if len(elegidos_ha) < 2:
-                await kapso.enviar_texto(
-                    numero,
-                    "Al menos 2 de los campos elegidos tienen que tener "
-                    "hectáreas cargadas para repartir por ha.")
-                await _kapso_pedir_multi_seleccion_campos(ident, numero, datos)
-                return
-            datos["campo_ids_multi"] = [c["id"] for c in elegidos_ha]
-            datos["campo_id"] = elegidos_ha[0]["id"]
-            datos["campo_nombre"] = f"{len(elegidos_ha)} campos"
-            datos.pop("elegidos_multi", None)
-            await _kapso_finalizar_gasto_multi(ident, numero, datos)
-            return
-        if accion == "multi:cancelar":
+        # El user mandó números y/o nombres separados por coma en UN mensaje.
+        # Admite también "todos" y "cancelar".
+        campos_user = ident.get("campos") or []
+        lista_ids = datos.get("multi_lista_ids") or [c["id"] for c in campos_user]
+        # Reconstruimos los campos en el ORDEN que el user vio, para que los
+        # números coincidan con lo que había en pantalla.
+        ids_to_campo = {c["id"]: c for c in campos_user}
+        campos_ordenados = [ids_to_campo[i] for i in lista_ids if i in ids_to_campo]
+
+        t = (texto or "").strip().lower()
+        if t in ("cancelar", "cancel", "salir", "chau", "no", "nada"):
             await _wa_clear_conv(numero)
             await kapso.enviar_texto(
                 numero, "Cancelado. Mandame el gasto de nuevo cuando quieras.")
             return
-        if accion.startswith("campo:"):
-            cid = accion.split(":", 1)[1]
-            if cid not in elegidos_ids:
-                elegidos_ids.append(cid)
-            datos["elegidos_multi"] = elegidos_ids
-            await _kapso_pedir_multi_seleccion_campos(ident, numero, datos)
-            return
-        # Texto libre como atajo: resolvemos un nombre y lo agregamos.
-        if texto:
-            campo = _buscar_campo(texto, ident.get("campos") or [])
-            if campo and campo["id"] not in elegidos_ids:
-                elegidos_ids.append(campo["id"])
-                datos["elegidos_multi"] = elegidos_ids
-                await _kapso_pedir_multi_seleccion_campos(ident, numero, datos)
+        if t in ("todos", "todo", "todos los campos", "a todos"):
+            elegidos = [c for c in campos_ordenados if float(c.get("hectareas") or 0) > 0]
+            if len(elegidos) < 2:
+                await kapso.enviar_texto(
+                    numero,
+                    "Tengo que tener al menos 2 campos con hectáreas cargadas "
+                    "para repartir. Cargalas desde la app y probá de nuevo.")
+                await _wa_clear_conv(numero)
                 return
-        await kapso.enviar_texto(
-            numero, "Tocá un campo de la lista para agregarlo, o *Listo* para repartir.")
-        await _kapso_pedir_multi_seleccion_campos(ident, numero, datos)
+            datos["campo_ids_multi"] = [c["id"] for c in elegidos]
+            datos["campo_id"] = elegidos[0]["id"]
+            datos["campo_nombre"] = f"{len(elegidos)} campos"
+            datos.pop("multi_lista_ids", None)
+            await _kapso_finalizar_gasto_multi(ident, numero, datos)
+            return
+
+        # Parseamos: separamos por coma / " y " / salto de línea y resolvemos
+        # cada token como número (1-based) o como nombre (fuzzy).
+        tokens = [p.strip() for p in re.split(r"[,\n/;]|\s+y\s+", texto or "") if p.strip()]
+        elegidos_ids_seen: list[str] = []
+        no_encontrados: list[str] = []
+        for tk in tokens:
+            if tk.isdigit():
+                idx = int(tk) - 1
+                if 0 <= idx < len(campos_ordenados):
+                    cid = campos_ordenados[idx]["id"]
+                    if cid not in elegidos_ids_seen:
+                        elegidos_ids_seen.append(cid)
+                    continue
+                no_encontrados.append(tk)
+                continue
+            c = _buscar_campo(tk, campos_user)
+            if c and c["id"] not in elegidos_ids_seen:
+                elegidos_ids_seen.append(c["id"])
+            elif not c:
+                no_encontrados.append(tk)
+
+        if no_encontrados:
+            await kapso.enviar_texto(
+                numero,
+                f"No reconocí: *{', '.join(no_encontrados)}*.\n"
+                "Mandame los números (ej: *1, 3, 5*) o los nombres completos.")
+            return
+        if len(elegidos_ids_seen) < 2:
+            await kapso.enviar_texto(
+                numero,
+                "Necesito al menos 2 campos para repartir. "
+                "Mandame los números o nombres separados por coma.")
+            return
+        elegidos = [ids_to_campo[i] for i in elegidos_ids_seen if i in ids_to_campo]
+        elegidos_ha = [c for c in elegidos if float(c.get("hectareas") or 0) > 0]
+        if len(elegidos_ha) < 2:
+            await kapso.enviar_texto(
+                numero,
+                "Al menos 2 de los campos elegidos tienen que tener hectáreas "
+                "cargadas para repartir por ha. Cargalas desde la app y probá de nuevo.")
+            return
+        datos["campo_ids_multi"] = [c["id"] for c in elegidos_ha]
+        datos["campo_id"] = elegidos_ha[0]["id"]
+        datos["campo_nombre"] = f"{len(elegidos_ha)} campos"
+        datos.pop("multi_lista_ids", None)
+        await _kapso_finalizar_gasto_multi(ident, numero, datos)
         return
 
     if estado == "k_flete_campo":
