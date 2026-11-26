@@ -869,6 +869,39 @@ async def _kapso_pedir_campo(ident: dict, numero: str, estado: str, datos: dict,
     return True
 
 
+async def _kapso_pedir_distribucion_estructura(
+    ident: dict, numero: str, datos: dict
+) -> bool:
+    """
+    Antes de guardar un gasto estructural (sueldo, oficina, combustible,
+    honorarios, seguros, otros), pregunta si va como estructura (sin campo),
+    a UN campo o repartido entre TODOS proporcional a hectáreas. Si el user
+    tiene 0 campos, no pregunta: lo guarda como estructura directamente.
+    Devuelve True si preguntó algo (hay que cortar el flujo)."""
+    campos = ident.get("campos") or []
+    if not campos:
+        return False
+    g = datos.get("gasto_estructura") or {}
+    importe = float(g.get("importe_usd") or 0)
+    tipo = (g.get("tipo") or "otros").lower()
+    frec = (g.get("frecuencia") or "mensual").lower()
+    desc = (g.get("descripcion") or "").strip()
+    resumen = f"*{tipo.capitalize()}* · USD {_num(importe)} ({frec})"
+    if desc and desc != "sin detalle":
+        resumen += f"\n_{desc}_"
+    await _wa_set_conv(numero, "k_gasto_estr_distribucion", datos)
+    await kapso.enviar_botones(
+        numero,
+        f"{resumen}\n\n¿Cómo lo imputo?",
+        [
+            ("dist_e:estructura", "🏢 Gasto general"),
+            ("dist_e:uno", "📍 A un campo"),
+            ("dist_e:todos", "🌍 Repartir entre todos"),
+        ],
+    )
+    return True
+
+
 async def _kapso_pedir_distribucion_gasto(
     ident: dict, numero: str, estado_campo: str, datos: dict, texto_pregunta: str
 ) -> bool:
@@ -3023,6 +3056,55 @@ async def _kapso_flujo(ident: dict, numero: str, m, conv: dict) -> None:
                 f"Tus campos: {nombres}")
             return
         await kapso.enviar_texto(numero, "No entendí la opción, tocá un botón.")
+        return
+
+    if estado == "k_gasto_estr_distribucion":
+        g = datos.get("gasto_estructura") or {}
+        if accion == "dist_e:estructura":
+            # Flujo original: guardar como gasto de estructura (sin campo).
+            await _kapso_guardar_gasto_estructura(ident, numero, datos)
+            return
+        if accion == "dist_e:uno":
+            # Pedir un campo y guardar como gasto normal con rubro=tipo.
+            # Armamos un "gasto" a partir del gasto_estructura para reusar
+            # el flujo normal de k_gasto_campo.
+            datos["gasto"] = {
+                "rubro": (g.get("tipo") or "otros").lower(),
+                "descripcion": g.get("descripcion") or (g.get("tipo") or "").capitalize(),
+                "total_de_usd": float(g.get("importe_usd") or 0),
+                "fecha": g.get("fecha_inicio") or datetime.now(AR_TZ).date().isoformat(),
+            }
+            datos.pop("gasto_estructura", None)
+            datos["confirmar"] = False
+            await _kapso_pedir_campo(ident, numero, "k_gasto_campo", datos,
+                                     "¿A qué campo lo cargo?")
+            return
+        if accion == "dist_e:todos":
+            # Dividir proporcional entre TODOS los campos con ha > 0.
+            elegibles = [c for c in (ident.get("campos") or [])
+                         if float(c.get("hectareas") or 0) > 0]
+            if not elegibles:
+                await kapso.enviar_texto(
+                    numero,
+                    "Ninguno de tus campos tiene hectáreas cargadas. "
+                    "Lo guardo como gasto de estructura.")
+                await _kapso_guardar_gasto_estructura(ident, numero, datos)
+                return
+            # Armamos el "gasto" base y campo_ids_multi para reusar
+            # _kapso_finalizar_gasto_multi.
+            datos["gasto"] = {
+                "rubro": (g.get("tipo") or "otros").lower(),
+                "descripcion": g.get("descripcion") or (g.get("tipo") or "").capitalize(),
+                "total_de_usd": float(g.get("importe_usd") or 0),
+                "fecha": g.get("fecha_inicio") or datetime.now(AR_TZ).date().isoformat(),
+            }
+            datos.pop("gasto_estructura", None)
+            datos["campo_ids_multi"] = [c["id"] for c in elegibles]
+            datos["campo_id"] = elegibles[0]["id"]
+            datos["campo_nombre"] = f"{len(elegibles)} campos"
+            await _kapso_finalizar_gasto_multi(ident, numero, datos)
+            return
+        await kapso.enviar_texto(numero, "Tocá un botón para seguir.")
         return
 
     if estado == "k_gasto_varios_sel":
@@ -6801,6 +6883,10 @@ async def _kapso_aplicar_intencion(ident: dict, numero: str, intencion: dict,
             "frecuencia": frec,
             "fecha_inicio": intencion.get("fecha_venc") or datetime.now(AR_TZ).date().isoformat(),
         }}
+        # Preguntamos cómo lo imputa: estructura (sin campo), un campo o
+        # todos (proporcional por ha). Si no tiene campos, va a estructura.
+        if await _kapso_pedir_distribucion_estructura(ident, numero, datos):
+            return True
         await _kapso_guardar_gasto_estructura(ident, numero, datos)
         return True
 
