@@ -2838,6 +2838,30 @@ async def _kapso_flujo(ident: dict, numero: str, m, conv: dict) -> None:
             return
         datos.setdefault("flete", {})["campo_id"] = campo["id"]
         datos["flete"]["campo_nombre"] = campo["nombre"]
+        # Si falta el precio por tn, lo pedimos antes de guardar.
+        if await _kapso_flete_pedir_precio(numero, datos):
+            return
+        await _kapso_guardar_flete(ident, numero, datos)
+        return
+
+    if estado == "k_flete_precio":
+        # Esperamos un número: el precio por tonelada en USD.
+        # Si el user escribe "20", "USD 20", "20/tn", "20 por tn", tomamos 20.
+        m = re.search(r"(\d+(?:[.,]\d+)?)", texto or "")
+        if not m:
+            await kapso.enviar_texto(
+                numero,
+                "No entendí el precio. Mandame un número (ej: *20* para USD 20/tn).")
+            return
+        precio_por_tn = float(m.group(1).replace(",", "."))
+        tn = float(datos.get("flete", {}).get("toneladas") or 0)
+        if tn <= 0:
+            await kapso.enviar_texto(
+                numero, "No tengo las toneladas del flete, no puedo calcular el total.")
+            await _wa_clear_conv(numero)
+            return
+        datos["flete"]["precio_flete_usd"] = round(precio_por_tn * tn, 2)
+        datos["flete"]["precio_por_tn_usd"] = precio_por_tn
         await _kapso_guardar_flete(ident, numero, datos)
         return
 
@@ -5149,6 +5173,26 @@ async def _kapso_ejecutar_eliminar(ident: dict, numero: str, registro: dict) -> 
         await kapso.enviar_texto(numero, "No pude borrarlo. Probá desde la app.")
 
 
+async def _kapso_flete_pedir_precio(numero: str, datos: dict) -> bool:
+    """Si el flete no tiene precio_flete_usd todavía, pregunta el precio por
+    tonelada y deja la conversación en k_flete_precio. Devuelve True si
+    preguntó (hay que cortar el flujo), False si ya había precio."""
+    f = datos.get("flete") or {}
+    if f.get("precio_flete_usd"):
+        return False
+    tn = f.get("toneladas")
+    cultivo = f.get("cultivo")
+    if tn and cultivo:
+        pregunta = f"¿A cuánto cerraste el flete por tonelada? ({_num(tn)} tn de {cultivo})"
+    elif tn:
+        pregunta = f"¿A cuánto cerraste el flete por tonelada? ({_num(tn)} tn)"
+    else:
+        pregunta = "¿A cuánto cerraste el flete por tonelada?"
+    await _wa_set_conv(numero, "k_flete_precio", datos)
+    await kapso.enviar_texto(numero, pregunta + "\nMandame el precio en USD/tn (ej: *20*).")
+    return True
+
+
 async def _kapso_guardar_flete(ident: dict, numero: str, datos: dict) -> None:
     """Inserta un flete en la tabla fletes."""
     f = datos.get("flete", {})
@@ -5173,7 +5217,11 @@ async def _kapso_guardar_flete(ident: dict, numero: str, datos: dict) -> None:
     if f.get("ctg"):
         partes.append(f"🧾 CTG: {f['ctg']}")
     if f.get("precio_flete_usd"):
-        partes.append(f"💰 Precio: USD {_num(f['precio_flete_usd'])}")
+        precio_tn = f.get("precio_por_tn_usd")
+        if precio_tn:
+            partes.append(f"💰 Precio: USD {_num(precio_tn)}/tn · total USD {_num(f['precio_flete_usd'])}")
+        else:
+            partes.append(f"💰 Precio: USD {_num(f['precio_flete_usd'])}")
     await kapso.enviar_texto(numero, "\n".join(partes))
 
 
@@ -6130,16 +6178,24 @@ async def _kapso_aplicar_intencion(ident: dict, numero: str, intencion: dict,
             return False
         campo = _wa_resolver_campo_fuzzy(ident, intencion.get("_texto_crudo") or "",
                                         intencion.get("campo_id"))
+        tn_val = float(intencion["toneladas"]) if intencion.get("toneladas") else None
+        # El precio puede venir como total (monto_usd) o por tn (precio_unit_usd).
+        # Si viene por tn y tenemos las toneladas, calculamos el total para la DB.
+        precio_por_tn = float(intencion["precio_unit_usd"]) if intencion.get("precio_unit_usd") else None
+        precio_total = float(intencion["monto_usd"]) if intencion.get("monto_usd") else None
+        if precio_total is None and precio_por_tn is not None and tn_val:
+            precio_total = round(precio_por_tn * tn_val, 2)
         datos = {"flete": {
             "campo_id": campo["id"] if campo else None,
             "campo_nombre": campo["nombre"] if campo else None,
             "cultivo": intencion.get("cultivo") or None,
             "fecha": intencion.get("fecha_venc") or datetime.now(AR_TZ).date().isoformat(),
             "patente_camion": intencion.get("patente_camion") or None,
-            "toneladas": float(intencion["toneladas"]) if intencion.get("toneladas") else None,
+            "toneladas": tn_val,
             "destino": intencion.get("destino") or None,
             "ctg": intencion.get("ctg") or None,
-            "precio_flete_usd": float(intencion["monto_usd"]) if intencion.get("monto_usd") else None,
+            "precio_flete_usd": precio_total,
+            "precio_por_tn_usd": precio_por_tn,
         }}
         # Faltan datos clave → mandar a menú guiado
         if not datos["flete"].get("toneladas") and not datos["flete"].get("patente_camion"):
@@ -6165,6 +6221,9 @@ async def _kapso_aplicar_intencion(ident: dict, numero: str, intencion: dict,
             # pasamos al dict del flete.
             datos["flete"]["campo_id"] = datos.get("campo_id")
             datos["flete"]["campo_nombre"] = datos.get("campo_nombre")
+        # Sin precio → preguntar precio por tonelada.
+        if await _kapso_flete_pedir_precio(numero, datos):
+            return True
         await _kapso_guardar_flete(ident, numero, datos)
         return True
 
