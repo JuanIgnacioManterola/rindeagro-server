@@ -4006,6 +4006,8 @@ ESQUEMA_INTENCION = {
         # Tarea nueva
         "titulo_tarea":    {"type": "string"},
         "prioridad":       {"type": "string"},
+        # Tarea nueva: nombre de la persona a quien se le asigna.
+        "asignado_nombre": {"type": "string"},
         # Siembra
         "fecha_siembra":   {"type": "string"},
         # Eliminar / modificar: qué tipo de registro. Valores: "gasto",
@@ -4051,7 +4053,8 @@ ESQUEMA_INTENCION = {
                  "banco", "numero_cheque",
                  "tipo_insumo", "cantidad", "unidad",
                  "precio_unit_usd", "precio_unit_ars", "por_hectarea", "items",
-                 "titulo_tarea", "prioridad", "fecha_siembra", "tipo_eliminar",
+                 "titulo_tarea", "prioridad", "asignado_nombre",
+                 "fecha_siembra", "tipo_eliminar",
                  "tipo_consulta", "campo_a_cambiar", "valor_nuevo",
                  "patente_camion", "destino", "ctg", "rendimiento_tha",
                  "frecuencia_pago", "vida_util_anos",
@@ -4075,7 +4078,8 @@ _KEYS_STR_OPCIONALES = (
     "tarea_id", "nota", "campo_id", "rubro", "descripcion", "nombre_invitado",
     "cultivo", "comprador", "tipo_pago", "beneficiario", "fecha_venc",
     "banco", "numero_cheque",
-    "tipo_insumo", "unidad", "titulo_tarea", "prioridad", "fecha_siembra",
+    "tipo_insumo", "unidad", "titulo_tarea", "prioridad", "asignado_nombre",
+    "fecha_siembra",
     "tipo_eliminar", "tipo_consulta", "campo_a_cambiar", "valor_nuevo",
     "patente_camion", "destino", "ctg", "frecuencia_pago",
     "momento_pulverizacion", "variedad", "rol_invitado", "telefono_invitado",
@@ -4201,7 +4205,10 @@ ubicacion:"Fraga"}, {rubro:"herbicidas", descripcion:"Glifosato 48%", cantidad:5
 unidad:"litros", ubicacion:"cerealista moldes"}, {rubro:"herbicidas", descripcion:"2,4-D 60%", \
 cantidad:280, unidad:"litros", ubicacion:"Fraga"}].
 - tarea_nueva: pide crear una tarea nueva. titulo_tarea con el título. descripcion si hay detalle. \
-prioridad entre alta, media, baja. fecha_venc si menciona cuándo.
+prioridad entre alta, media, baja. fecha_venc si menciona cuándo. Si menciona a quién se le \
+asigna ("asignada a Agustina", "para Juan", "que lo haga Pedro"), poné el nombre en \
+asignado_nombre — el servidor lo matchea contra el equipo del user. Si no menciona a nadie, \
+dejalo "".
 - siembra: dice que se sembró un campo ("sembré La Escondida con soja el 10/12"). cultivo, campo_id, \
 fecha_siembra (YYYY-MM-DD). Se guarda como gasto de semillas con la fecha.
 - flete: cargar un flete / carta de porte ("mandé 30 tn de soja a Rosario, patente ABC123, CTG \
@@ -6438,6 +6445,24 @@ async def _kapso_aplicar_intencion(ident: dict, numero: str, intencion: dict,
         if campo is not None:
             datos["tarea_nueva"]["campo_id"] = campo["id"]
             datos["tarea_nueva"]["campo_nombre"] = campo["nombre"]
+        # Asignado: si Claude extrajo un nombre, lo matcheamos contra el
+        # equipo del user. Mismo criterio que k_tar_asignado: match por
+        # nombre normalizado, el primero que contenga o sea contenido por
+        # el nombre pedido (caso real 2026-11-26: "asignada a Agustina"
+        # creaba la tarea Sin asignar porque el fast path no miraba el
+        # campo de asignado).
+        nombre_asig = (intencion.get("asignado_nombre") or "").strip()
+        if nombre_asig:
+            equipo = await _wa_equipo_del_user(ident["owner_id"])
+            n_pedido = _norm(nombre_asig)
+            for m in equipo:
+                nombre_norm = _norm(str(m.get("nombre_display") or ""))
+                if not nombre_norm:
+                    continue
+                if nombre_norm == n_pedido or n_pedido in nombre_norm or nombre_norm in n_pedido:
+                    datos["tarea_nueva"]["asignado_a"] = m["miembro_id"]
+                    datos["tarea_nueva"]["asignado_nombre"] = m.get("nombre_display")
+                    break
         await _kapso_guardar_tarea_nueva(ident, numero, datos)
         return True
 
