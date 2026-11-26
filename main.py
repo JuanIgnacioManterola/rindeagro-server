@@ -5249,7 +5249,10 @@ async def _kapso_flete_pedir_precio(numero: str, datos: dict) -> bool:
 
 
 async def _kapso_guardar_flete(ident: dict, numero: str, datos: dict) -> None:
-    """Inserta un flete en la tabla fletes."""
+    """Inserta un flete en la tabla fletes y genera el gasto espejo en
+    `gastos` con rubro='flete', linkeado por flete_id. Si el precio está en
+    ARS, se convierte con el dólar BNA venta (el user puede re-convertir
+    después desde la app)."""
     f = datos.get("flete", {})
     payload = {"owner_id": ident["owner_id"], "fuente": "whatsapp"}
     for k in ("campo_id", "cultivo", "fecha", "patente_camion", "nombre_transporte",
@@ -5259,8 +5262,61 @@ async def _kapso_guardar_flete(ident: dict, numero: str, datos: dict) -> None:
               "precio_por_tn_ars", "precio_flete_moneda", "km_recorridos", "notas"):
         if f.get(k) is not None:
             payload[k] = f[k]
-    await _sb_post("fletes", payload)
+    flete_row = await _sb_post("fletes", payload)
+    flete_id = (flete_row or {}).get("id")
     await _wa_clear_conv(numero)
+
+    # Crear gasto espejo si tenemos campo + precio. Sin campo_id no se puede
+    # imputar y sin precio no hay nada que gastar.
+    gasto_total_usd = None
+    tc_usado = None
+    if flete_id and f.get("campo_id"):
+        total_usd = f.get("precio_flete_usd")
+        precio_tn_usd = f.get("precio_por_tn_usd")
+        if total_usd is None and f.get("precio_flete_ars"):
+            tc_usado = await _dolar_venta()
+            if tc_usado > 0:
+                total_usd = round(float(f["precio_flete_ars"]) / tc_usado, 2)
+                if f.get("precio_por_tn_ars"):
+                    precio_tn_usd = round(float(f["precio_por_tn_ars"]) / tc_usado, 4)
+        if total_usd and total_usd > 0:
+            tn = float(f.get("toneladas") or 0)
+            fecha_g = f.get("fecha") or datetime.now(AR_TZ).date().isoformat()
+            desc_partes = ["Flete"]
+            if tn:
+                desc_partes.append(f"{_num(tn)} tn")
+            if f.get("cultivo"):
+                desc_partes.append(f"de {f['cultivo']}")
+            if f.get("destino"):
+                desc_partes.append(f"a {f['destino']}")
+            descripcion = " ".join(desc_partes)[:300]
+            # ha del campo para usd_ha (el frontend lo usa en rentabilidad).
+            ha_campo = 0.0
+            for c in ident.get("campos", []):
+                if c["id"] == f.get("campo_id"):
+                    ha_campo = float(c.get("hectareas") or 0)
+                    break
+            gasto_payload = {
+                "campo_id": f.get("campo_id"),
+                "usuario_id": ident["owner_id"],
+                "rubro": "flete",
+                "fecha": fecha_g,
+                "total_de_usd": round(total_usd, 2),
+                "descripcion": descripcion,
+                "flete_id": flete_id,
+            }
+            if tn:
+                gasto_payload["cantidad"] = tn
+                gasto_payload["unidad"] = "toneladas"
+            if precio_tn_usd:
+                gasto_payload["precio_unitario"] = precio_tn_usd
+            if ha_campo > 0:
+                gasto_payload["usd_ha"] = round(total_usd / ha_campo, 2)
+            if f.get("cultivo"):
+                gasto_payload["cultivo"] = (f["cultivo"] or "").strip().lower()[:50]
+            await _sb_post("gastos", gasto_payload)
+            gasto_total_usd = total_usd
+
     partes = [f"🚚 Flete cargado."]
     if f.get("toneladas"):
         partes.append(f"⚖️ {_num(f['toneladas'])} tn" + (f" de {f['cultivo']}" if f.get("cultivo") else ""))
@@ -5272,8 +5328,7 @@ async def _kapso_guardar_flete(ident: dict, numero: str, datos: dict) -> None:
         partes.append(f"🚛 Patente: {f['patente_camion']}")
     if f.get("ctg"):
         partes.append(f"🧾 CTG: {f['ctg']}")
-    # Mostrar el precio en la moneda cargada. Si fue ARS, agregar nota de
-    # conversión en la app.
+    # Mostrar el precio en la moneda cargada.
     if f.get("precio_flete_ars"):
         precio_tn = f.get("precio_por_tn_ars")
         if precio_tn:
@@ -5281,13 +5336,22 @@ async def _kapso_guardar_flete(ident: dict, numero: str, datos: dict) -> None:
                 f"💰 Precio: $ {_miles(precio_tn)}/tn · total $ {_miles(f['precio_flete_ars'])}")
         else:
             partes.append(f"💰 Precio: $ {_miles(f['precio_flete_ars'])}")
-        partes.append("🪙 Convertilo a USD desde la app cuando quieras.")
     elif f.get("precio_flete_usd"):
         precio_tn = f.get("precio_por_tn_usd")
         if precio_tn:
             partes.append(f"💰 Precio: USD {_num(precio_tn)}/tn · total USD {_num(f['precio_flete_usd'])}")
         else:
             partes.append(f"💰 Precio: USD {_num(f['precio_flete_usd'])}")
+    # Confirmación del impacto como gasto.
+    if gasto_total_usd:
+        linea_gasto = f"📉 Gasto imputado a {f.get('campo_nombre') or 'el campo'}: USD {_num(gasto_total_usd)}"
+        if tc_usado:
+            linea_gasto += f" (TC BNA ${_miles(tc_usado)})"
+        partes.append(linea_gasto)
+        if tc_usado:
+            partes.append("🪙 Podés ajustar el TC desde la app y el gasto se recalcula.")
+    elif f.get("precio_flete_ars") and not f.get("campo_id"):
+        partes.append("⚠️ No imputé el gasto porque falta el campo de origen.")
     await kapso.enviar_texto(numero, "\n".join(partes))
 
 
@@ -6209,9 +6273,87 @@ async def _kapso_ejecutar_modificar(ident: dict, numero: str, datos: dict) -> No
             await _wa_clear_conv(numero)
             return
         await _sb_patch(f"{table}?id=eq.{rid}", patch)
+        # Si modificamos un flete, hay que mantener sincronizado el gasto
+        # espejo (rubro=flete, linkeado por flete_id). Reconstruimos el payload
+        # de gasto desde el flete actual (post-update) + los campos del user.
+        if kind == "flete":
+            await _wa_sincronizar_gasto_flete(ident, rid)
 
     await _wa_clear_conv(numero)
     await kapso.enviar_texto(numero, f"✅ Listo, actualicé el registro.")
+
+
+async def _wa_sincronizar_gasto_flete(ident: dict, flete_id: str) -> None:
+    """Después de modificar un flete, reconstruye el gasto espejo (rubro=flete,
+    flete_id=...) en base a la fila actual del flete. Si no existe gasto, lo
+    crea; si existe, lo actualiza; si el flete quedó sin campo o sin precio,
+    lo borra."""
+    filas = await _sb_get("fletes", {
+        "id": f"eq.{flete_id}",
+        "select": "id,owner_id,campo_id,cultivo,fecha,toneladas,destino,"
+                  "precio_flete_ars,precio_por_tn_ars,precio_flete_usd,"
+                  "precio_por_tn_usd,precio_flete_moneda",
+        "limit": "1"}) or []
+    if not filas:
+        return
+    f = filas[0]
+    gastos_actuales = await _sb_get("gastos", {
+        "flete_id": f"eq.{flete_id}", "select": "id", "limit": "1"}) or []
+    gasto_existente_id = gastos_actuales[0]["id"] if gastos_actuales else None
+
+    # Sin campo o sin precio, borramos el gasto espejo si había.
+    if not f.get("campo_id"):
+        if gasto_existente_id:
+            await _sb_delete(f"gastos?id=eq.{gasto_existente_id}")
+        return
+    total_usd = f.get("precio_flete_usd")
+    precio_tn_usd = f.get("precio_por_tn_usd")
+    tc_usado = None
+    if total_usd is None and f.get("precio_flete_ars"):
+        tc_usado = await _dolar_venta()
+        if tc_usado > 0:
+            total_usd = round(float(f["precio_flete_ars"]) / tc_usado, 2)
+            if f.get("precio_por_tn_ars"):
+                precio_tn_usd = round(float(f["precio_por_tn_ars"]) / tc_usado, 4)
+    if not total_usd or total_usd <= 0:
+        if gasto_existente_id:
+            await _sb_delete(f"gastos?id=eq.{gasto_existente_id}")
+        return
+
+    tn = float(f.get("toneladas") or 0)
+    desc_partes = ["Flete"]
+    if tn:
+        desc_partes.append(f"{_num(tn)} tn")
+    if f.get("cultivo"):
+        desc_partes.append(f"de {f['cultivo']}")
+    if f.get("destino"):
+        desc_partes.append(f"a {f['destino']}")
+    descripcion = " ".join(desc_partes)[:300]
+    ha_campo = 0.0
+    for c in ident.get("campos", []):
+        if c["id"] == f.get("campo_id"):
+            ha_campo = float(c.get("hectareas") or 0)
+            break
+    gasto_payload = {
+        "campo_id": f.get("campo_id"),
+        "usuario_id": f.get("owner_id") or ident["owner_id"],
+        "rubro": "flete",
+        "fecha": f.get("fecha") or datetime.now(AR_TZ).date().isoformat(),
+        "total_de_usd": round(float(total_usd), 2),
+        "descripcion": descripcion,
+        "flete_id": flete_id,
+        "cantidad": tn if tn else None,
+        "unidad": "toneladas" if tn else None,
+        "precio_unitario": precio_tn_usd,
+        "usd_ha": round(float(total_usd) / ha_campo, 2) if ha_campo > 0 else None,
+        "cultivo": ((f.get("cultivo") or "").strip().lower()[:50] or None),
+    }
+    # Sacamos keys con valor None antes de mandar (el patch mergea).
+    gasto_payload = {k: v for k, v in gasto_payload.items() if v is not None}
+    if gasto_existente_id:
+        await _sb_patch(f"gastos?id=eq.{gasto_existente_id}", gasto_payload)
+    else:
+        await _sb_post("gastos", gasto_payload)
 
 
 async def _kapso_aplicar_intencion(ident: dict, numero: str, intencion: dict,
