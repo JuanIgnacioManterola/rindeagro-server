@@ -3840,12 +3840,31 @@ campo_a_cambiar con QUÉ cambiar ("total", "descripcion", "campo", "precio", "ca
 "fecha", "banco", "numero", "beneficiario", "comprador") y valor_nuevo con el valor como \
 string ("180" para montos, "Urea" para descripción, "Fraga" para campo). El servidor sólo \
 toca registros de los últimos 30 minutos y pide confirmación.
-- consultar: hace una pregunta ("¿cuánto gasté este mes?", "cuánto stock tengo de glifosato", \
-"cuánto vendí de maíz", "qué cheques tengo pendientes", "cómo vino el mes"). Poné tipo_consulta \
-con uno de: "gastos_mes" (total gastado este mes, opcional por rubro), "stock_producto" (stock \
-de un insumo — poné el nombre en descripcion), "ventas_cultivo" (toneladas y USD vendidos de \
-un cultivo — poné el cultivo en "cultivo"), "cheques_pendientes" (cheques por vencer), \
-"resumen" (resumen del mes). Si pregunta por un rubro específico en gastos, poné el rubro.
+- consultar: hace una pregunta. Poné tipo_consulta con uno de los valores de abajo. Si pregunta \
+por un campo, poné campo_id. Si pregunta por un cultivo, poné cultivo. Si pregunta por un rubro, \
+poné rubro. Si pregunta por un producto/insumo específico, poné descripcion.
+
+Valores de tipo_consulta:
+  • "gastos_mes" — total gastado este mes (opcional filtro por rubro). "cuánto gasté", "cuánto va en herbicidas".
+  • "gastos_campo" — gastos totales de un campo (requiere campo_id). "cuánto llevo gastado en Erlicher".
+  • "gastos_producto" — gastos de un producto específico (poné el nombre en descripcion). "cuánto gasté en glifosato".
+  • "stock_producto" — stock de un insumo. "cuánto stock tengo de glifosato".
+  • "ventas_cultivo" — total tn/USD vendidos de un cultivo. "cuánto vendí de maíz".
+  • "ventas_forward_spot" — desglose forward vs spot. "qué tengo vendido forward".
+  • "cheques_pendientes" — pagos a futuro. "qué cheques tengo pendientes".
+  • "cuentas_por_vencer" — todos los pagos (cheques + cuotas) por vencer en 30 días. "qué pagos me vienen".
+  • "lluvia_campo" — lluvia acumulada del mes/temporada en un campo (requiere campo_id). "cuánto llovió en Fraga".
+  • "lluvia_por_etapa" — lluvia desglosada por etapa fenológica del campo (barbecho, siembra, vegetativo, etc.). "cuánto llovió en la etapa floración".
+  • "rentabilidad_campo" — P&L estimado de un campo (requiere campo_id). "cómo va la rentabilidad de Erlicher".
+  • "rentabilidad_total" — P&L global sumando todos los campos. "cómo voy en total este año".
+  • "ranking_campos" — ranking de campos por rentabilidad USD/ha. "qué campo me va mejor".
+  • "rendimiento_campo" — rendimiento t/ha real del campo (requiere campo_id). "cuánto rindió La Escondida".
+  • "precios_dia" — precios pizarra de hoy (soja/maíz/trigo/girasol/sorgo) + dólar BNA. "a cuánto está la soja".
+  • "historial_insumo" — dónde se aplicó un insumo (requiere descripcion). "dónde usé el glifosato".
+  • "analisis_suelo" — último análisis de suelo de un campo (requiere campo_id). "cómo está el suelo de Fraga".
+  • "fletes_recientes" — últimos fletes cargados. "qué fletes cargué este mes".
+  • "timeline_campo" — últimas actividades de un campo (requiere campo_id). "qué pasó en Erlicher últimamente".
+  • "resumen" (default) — gastos + lluvia + pagos del mes. "cómo vino el mes".
 - invitar: quiere sumar a alguien al equipo. nombre_invitado es de quién habla.
 - menu: saluda o pide ver las opciones.
 - nada: no se entiende o no tiene que ver con la app.
@@ -4544,40 +4563,119 @@ async def _kapso_ejecutar_eliminar(ident: dict, numero: str, registro: dict) -> 
         await kapso.enviar_texto(numero, "No pude borrarlo. Probá desde la app.")
 
 
+def _wa_resolver_campo_consulta(ident: dict, intencion: dict) -> dict | None:
+    """Helper para consultas: Claude campo_id → fuzzy → único del user."""
+    return _wa_resolver_campo_fuzzy(ident, intencion.get("_texto_crudo") or "",
+                                   intencion.get("campo_id"))
+
+
 async def _wa_consultar(ident: dict, numero: str, intencion: dict) -> None:
-    """Responde consultas rápidas (gastos del mes, stock, ventas, cheques)."""
+    """Responde consultas rápidas."""
     tipo = (intencion.get("tipo_consulta") or "resumen").strip().lower()
     owner_id = ident["owner_id"]
 
-    if tipo in ("gastos_mes", "gastos"):
+    # --- precios del día: pizarra + dólar
+    if tipo == "precios_dia":
+        pizarras = await _sb_get("precios_pizarra", {
+            "select": "fecha,soja,maiz,trigo,girasol,sorgo,bna",
+            "order": "fecha.desc", "limit": "1"}) or []
+        dolar = await _sb_get("precios_dolar", {
+            "select": "fecha,billete_compra,billete_venta,divisa_venta",
+            "order": "fecha.desc", "limit": "1"}) or []
+        if not pizarras and not dolar:
+            await kapso.enviar_texto(numero, "No tengo precios cargados.")
+            return
+        lineas = []
+        if pizarras:
+            p = pizarras[0]
+            lineas.append(f"📊 *Pizarra ({_wa_fecha_corta(p.get('fecha'))})*")
+            for cultivo, label in [("soja", "Soja"), ("maiz", "Maíz"),
+                                     ("trigo", "Trigo"), ("girasol", "Girasol"),
+                                     ("sorgo", "Sorgo")]:
+                v = p.get(cultivo)
+                if v:
+                    lineas.append(f"  🌾 {label}: *USD {_num(v)}/tn*")
+        if dolar:
+            d = dolar[0]
+            lineas.append(f"\n💵 *Dólar BNA*")
+            if d.get("billete_compra"):
+                lineas.append(f"  Compra: ARS {_num(d.get('billete_compra'))}")
+            if d.get("billete_venta"):
+                lineas.append(f"  Venta:  ARS {_num(d.get('billete_venta'))}")
+        await kapso.enviar_texto(numero, "\n".join(lineas))
+        return
+
+    # --- gastos del mes (ya existía, lo refactorizo con filtro por producto)
+    if tipo in ("gastos_mes", "gastos_producto"):
         hoy = datetime.now(AR_TZ).date()
         desde = hoy.replace(day=1).isoformat()
         rubro_filtro = (intencion.get("rubro") or "").strip().lower()
+        producto_filtro = (intencion.get("descripcion") or "").strip()
         params = {
             "usuario_id": f"eq.{owner_id}",
             "fecha": f"gte.{desde}",
-            "select": "rubro,total_de_usd",
+            "select": "rubro,descripcion,total_de_usd,campo_id",
             "limit": "500",
         }
         if rubro_filtro:
             params["rubro"] = f"eq.{rubro_filtro}"
+        if producto_filtro or tipo == "gastos_producto":
+            # Si pidió un producto específico, ampliamos la ventana a año en curso.
+            params["fecha"] = f"gte.{hoy.replace(month=1, day=1).isoformat()}"
+            if producto_filtro:
+                params["descripcion"] = f"ilike.%{producto_filtro}%"
         filas = await _sb_get("gastos", params) or []
         if not filas:
             await kapso.enviar_texto(
-                numero, f"No cargaste gastos este mes" +
-                        (f" en *{rubro_filtro}*" if rubro_filtro else "") + ".")
+                numero, f"No encontré gastos" +
+                        (f" de *{producto_filtro}*" if producto_filtro else "") +
+                        (f" en *{rubro_filtro}*" if rubro_filtro else "") +
+                        ".")
             return
         total = sum(float(f.get("total_de_usd") or 0) for f in filas)
+        encabezado = (f"💰 Gastos de *{producto_filtro}*" if producto_filtro
+                      else "💰 Gastos de este mes")
+        lineas = [f"{encabezado}: *USD {_num(round(total, 2))}* ({len(filas)} cargas)"]
+        if not producto_filtro:
+            por_rubro = {}
+            for f in filas:
+                r = (f.get("rubro") or "otros").capitalize()
+                por_rubro[r] = por_rubro.get(r, 0) + float(f.get("total_de_usd") or 0)
+            for r, v in sorted(por_rubro.items(), key=lambda kv: -kv[1]):
+                lineas.append(f"• {r} · USD {_num(round(v, 2))}")
+        await kapso.enviar_texto(numero, "\n".join(lineas))
+        return
+
+    # --- gastos por campo
+    if tipo == "gastos_campo":
+        campo = _wa_resolver_campo_consulta(ident, intencion)
+        if not campo:
+            await kapso.enviar_texto(numero, "¿De qué campo?")
+            return
+        hoy = datetime.now(AR_TZ).date()
+        desde = hoy.replace(month=1, day=1).isoformat()
+        filas = await _sb_get("gastos", {
+            "usuario_id": f"eq.{owner_id}",
+            "campo_id": f"eq.{campo['id']}",
+            "fecha": f"gte.{desde}",
+            "select": "rubro,total_de_usd",
+            "limit": "1000",
+        }) or []
+        if not filas:
+            await kapso.enviar_texto(numero, f"No hay gastos cargados en *{campo['nombre']}* este año.")
+            return
+        total = sum(float(f.get("total_de_usd") or 0) for f in filas)
+        ha = float(campo.get("hectareas") or 0)
         por_rubro = {}
         for f in filas:
             r = (f.get("rubro") or "otros").capitalize()
             por_rubro[r] = por_rubro.get(r, 0) + float(f.get("total_de_usd") or 0)
-        lineas = [f"💰 Gastos de este mes: *USD {_num(round(total, 2))}*"]
-        if not rubro_filtro:
-            for r, v in sorted(por_rubro.items(), key=lambda kv: -kv[1]):
-                lineas.append(f"• {r} · USD {_num(round(v, 2))}")
-        else:
-            lineas.append(f"({len(filas)} cargas de *{rubro_filtro}*)")
+        lineas = [f"💰 Gastos en *{campo['nombre']}* (año en curso): "
+                  f"*USD {_num(round(total, 2))}*"]
+        if ha > 0:
+            lineas.append(f"  📐 USD {_num(round(total/ha, 2))}/ha ({_num(ha)} ha)")
+        for r, v in sorted(por_rubro.items(), key=lambda kv: -kv[1]):
+            lineas.append(f"• {r} · USD {_num(round(v, 2))}")
         await kapso.enviar_texto(numero, "\n".join(lineas))
         return
 
@@ -4644,29 +4742,349 @@ async def _wa_consultar(ident: dict, numero: str, intencion: dict) -> None:
         await kapso.enviar_texto(numero, "\n".join(lineas))
         return
 
-    if tipo == "cheques_pendientes":
-        hoy = datetime.now(AR_TZ).date().isoformat()
-        filas = await _sb_get("compromisos_pago", {
+    if tipo in ("cheques_pendientes", "cuentas_por_vencer"):
+        hoy = datetime.now(AR_TZ).date()
+        hasta = (hoy + timedelta(days=30)).isoformat() if tipo == "cuentas_por_vencer" else None
+        params = {
             "owner_id": f"eq.{owner_id}",
             "estado": "eq.pendiente",
-            "fecha_cobro": f"gte.{hoy}",
-            "select": "tipo,beneficiario,importe,moneda,fecha_cobro,banco,numero_cheque",
+            "fecha_cobro": f"gte.{hoy.isoformat()}",
+            "select": "tipo,beneficiario,importe,moneda,fecha_cobro,banco,numero_cheque,descripcion",
             "order": "fecha_cobro.asc",
-            "limit": "30",
-        }) or []
+            "limit": "40",
+        }
+        filas = await _sb_get("compromisos_pago", params) or []
+        if hasta:
+            filas = [f for f in filas if (f.get("fecha_cobro") or "") <= hasta]
         if not filas:
-            await kapso.enviar_texto(numero, "No tenés pagos pendientes a futuro. 🎉")
+            titulo = "pagos en los próximos 30 días" if tipo == "cuentas_por_vencer" else "pagos pendientes a futuro"
+            await kapso.enviar_texto(numero, f"No tenés {titulo}. 🎉")
             return
-        lineas = [f"🧾 Tenés *{len(filas)} pagos* por venir:"]
-        for f in filas[:10]:
+        titulo = "pagos en los próximos 30 días" if tipo == "cuentas_por_vencer" else "pagos por venir"
+        lineas = [f"🧾 Tenés *{len(filas)} {titulo}*:"]
+        total_ars = sum(float(f.get("importe") or 0) for f in filas if f.get("moneda") == "ARS")
+        total_usd = sum(float(f.get("importe") or 0) for f in filas if f.get("moneda") == "USD")
+        for f in filas[:12]:
             tipo_lbl = f.get("tipo", "pago").capitalize()
             num = f" #{f['numero_cheque']}" if f.get("numero_cheque") else ""
             lineas.append(
                 f"• {_wa_fecha_corta(f.get('fecha_cobro'))} · {tipo_lbl}{num} · "
                 f"{f.get('moneda', 'ARS')} {_miles(f.get('importe') or 0)} "
                 f"a {f.get('beneficiario') or '—'}")
+        if len(filas) > 12:
+            lineas.append(f"...y {len(filas) - 12} más.")
+        if total_ars or total_usd:
+            lineas.append("")
+            if total_ars:
+                lineas.append(f"💰 Total ARS: *{_miles(total_ars)}*")
+            if total_usd:
+                lineas.append(f"💰 Total USD: *{_miles(total_usd)}*")
+        await kapso.enviar_texto(numero, "\n".join(lineas))
+        return
+
+    # --- Ventas forward vs spot
+    if tipo == "ventas_forward_spot":
+        campos = ident.get("campos") or []
+        forward_tn = spot_tn = 0.0
+        forward_usd = spot_usd = 0.0
+        for c in campos:
+            try:
+                data = json.loads(c.get("ingresos_cultivos") or "{}")
+            except Exception:
+                data = {}
+            for info in (data or {}).values():
+                for v in (info.get("ventas") or []):
+                    tn = float(v.get("tn") or 0)
+                    pr = float(v.get("precio") or 0)
+                    if (v.get("tipo") or "spot").lower() == "forward":
+                        forward_tn += tn
+                        forward_usd += tn * pr
+                    else:
+                        spot_tn += tn
+                        spot_usd += tn * pr
+        if forward_tn == 0 and spot_tn == 0:
+            await kapso.enviar_texto(numero, "No tenés ventas cargadas.")
+            return
+        lineas = ["🌾 *Ventas forward vs spot*"]
+        if forward_tn:
+            lineas.append(f"📅 Forward: *{_num(forward_tn)} tn · USD {_miles(round(forward_usd, 2))}*")
+        if spot_tn:
+            lineas.append(f"💵 Spot:    *{_num(spot_tn)} tn · USD {_miles(round(spot_usd, 2))}*")
+        lineas.append(f"\nTotal: *{_num(forward_tn + spot_tn)} tn · USD {_miles(round(forward_usd + spot_usd, 2))}*")
+        await kapso.enviar_texto(numero, "\n".join(lineas))
+        return
+
+    # --- Lluvia por campo
+    if tipo in ("lluvia_campo", "lluvia_por_etapa"):
+        campo = _wa_resolver_campo_consulta(ident, intencion)
+        if not campo:
+            await kapso.enviar_texto(numero, "¿De qué campo?")
+            return
+        hoy = datetime.now(AR_TZ).date()
+        desde = hoy.replace(month=1, day=1).isoformat()
+        filas = await _sb_get("lluvias", {
+            "usuario_id": f"eq.{owner_id}",
+            "campo_id": f"eq.{campo['id']}",
+            "fecha": f"gte.{desde}",
+            "select": "fecha,mm,etapa",
+            "order": "fecha.desc",
+            "limit": "500",
+        }) or []
+        if not filas:
+            await kapso.enviar_texto(numero,
+                f"No tengo lluvias registradas en *{campo['nombre']}* este año.")
+            return
+        total = sum(float(f.get("mm") or 0) for f in filas)
+        del_mes = [f for f in filas if (f.get("fecha") or "")[:7] == hoy.isoformat()[:7]]
+        mm_mes = sum(float(f.get("mm") or 0) for f in del_mes)
+        if tipo == "lluvia_por_etapa":
+            por_etapa = {}
+            for f in filas:
+                e = (f.get("etapa") or "sin etapa").lower()
+                por_etapa[e] = por_etapa.get(e, 0) + float(f.get("mm") or 0)
+            lineas = [f"🌧️ Lluvias en *{campo['nombre']}* por etapa (año en curso): "
+                      f"*{_num(total)} mm*"]
+            for e, mm in sorted(por_etapa.items(), key=lambda kv: -kv[1]):
+                lineas.append(f"• {e.capitalize()}: {_num(mm)} mm")
+        else:
+            lineas = [f"🌧️ Lluvias en *{campo['nombre']}*",
+                      f"📅 Este mes: *{_num(mm_mes)} mm* ({len(del_mes)} eventos)",
+                      f"📊 Año: *{_num(total)} mm* ({len(filas)} eventos)"]
+        await kapso.enviar_texto(numero, "\n".join(lineas))
+        return
+
+    # --- Rentabilidad por campo (texto) — calculamos P&L con lo que hay en DB
+    async def _calc_renta_campo(campo: dict) -> dict:
+        year_desde = datetime.now(AR_TZ).date().replace(month=1, day=1).isoformat()
+        gastos = await _sb_get("gastos", {
+            "usuario_id": f"eq.{owner_id}",
+            "campo_id": f"eq.{campo['id']}",
+            "fecha": f"gte.{year_desde}",
+            "select": "total_de_usd",
+            "limit": "1000"}) or []
+        total_gasto = sum(float(g.get("total_de_usd") or 0) for g in gastos)
+        total_venta = 0.0
+        tn_total = 0.0
+        try:
+            data = json.loads(campo.get("ingresos_cultivos") or "{}")
+        except Exception:
+            data = {}
+        for info in (data or {}).values():
+            for v in (info.get("ventas") or []):
+                tn = float(v.get("tn") or 0)
+                pr = float(v.get("precio") or 0)
+                tn_total += tn
+                total_venta += tn * pr
+        ha = float(campo.get("hectareas") or 0)
+        margen = total_venta - total_gasto
+        return {"gasto": total_gasto, "venta": total_venta, "margen": margen,
+                "ha": ha, "tn": tn_total}
+
+    if tipo == "rentabilidad_campo":
+        campo = _wa_resolver_campo_consulta(ident, intencion)
+        if not campo:
+            await kapso.enviar_texto(numero, "¿De qué campo?")
+            return
+        r = await _calc_renta_campo(campo)
+        lineas = [f"📈 *Rentabilidad de {campo['nombre']}* (año en curso)",
+                  f"💰 Ingresos: USD {_miles(round(r['venta'], 2))}",
+                  f"💵 Gastos:   USD {_miles(round(r['gasto'], 2))}",
+                  f"📊 Margen:   *USD {_miles(round(r['margen'], 2))}*"]
+        if r["ha"] > 0:
+            lineas.append(f"📐 USD {_num(round(r['margen']/r['ha'], 2))}/ha ({_num(r['ha'])} ha)")
+        if r["tn"] > 0:
+            lineas.append(f"🌾 {_num(r['tn'])} tn vendidas")
+        await kapso.enviar_texto(numero, "\n".join(lineas))
+        return
+
+    if tipo in ("rentabilidad_total", "ranking_campos"):
+        campos = ident.get("campos") or []
+        if not campos:
+            await kapso.enviar_texto(numero, "No tenés campos cargados.")
+            return
+        resultados = []
+        for c in campos:
+            r = await _calc_renta_campo(c)
+            resultados.append({**r, "nombre": c["nombre"]})
+        total_gasto = sum(r["gasto"] for r in resultados)
+        total_venta = sum(r["venta"] for r in resultados)
+        margen_total = total_venta - total_gasto
+        if tipo == "rentabilidad_total":
+            lineas = [f"📈 *Rentabilidad total* (año en curso, {len(resultados)} campos)",
+                      f"💰 Ingresos: USD {_miles(round(total_venta, 2))}",
+                      f"💵 Gastos:   USD {_miles(round(total_gasto, 2))}",
+                      f"📊 Margen:   *USD {_miles(round(margen_total, 2))}*"]
+            await kapso.enviar_texto(numero, "\n".join(lineas))
+            return
+        # ranking_campos
+        resultados.sort(key=lambda r: (r["margen"] / r["ha"]) if r["ha"] > 0 else r["margen"], reverse=True)
+        lineas = [f"🏆 *Ranking de campos por USD/ha* (margen anual):"]
+        for r in resultados[:10]:
+            if r["ha"] > 0:
+                lineas.append(f"• {r['nombre']}: *USD {_num(round(r['margen']/r['ha'], 2))}/ha* "
+                              f"(margen {_miles(round(r['margen'], 2))})")
+            else:
+                lineas.append(f"• {r['nombre']}: margen USD {_miles(round(r['margen'], 2))}")
+        await kapso.enviar_texto(numero, "\n".join(lineas))
+        return
+
+    # --- Rendimiento del campo (desde campanas o campos.rendimiento)
+    if tipo == "rendimiento_campo":
+        campo = _wa_resolver_campo_consulta(ident, intencion)
+        if not campo:
+            await kapso.enviar_texto(numero, "¿De qué campo?")
+            return
+        camps = await _sb_get("campanas", {
+            "campo_id": f"eq.{campo['id']}",
+            "select": "anio,cultivo,rendimiento,precio_venta",
+            "order": "anio.desc",
+            "limit": "5"}) or []
+        if not camps and campo.get("rendimiento"):
+            await kapso.enviar_texto(
+                numero,
+                f"🌾 *{campo['nombre']}*: {_num(campo['rendimiento'])} t/ha "
+                f"({_num(float(campo['rendimiento']) * float(campo.get('hectareas') or 0))} tn totales)")
+            return
+        if not camps:
+            await kapso.enviar_texto(numero, f"No tengo rendimiento cargado en *{campo['nombre']}*.")
+            return
+        ha = float(campo.get("hectareas") or 0)
+        lineas = [f"🌾 *Rendimiento histórico de {campo['nombre']}*"]
+        for c in camps:
+            rend = float(c.get("rendimiento") or 0)
+            tn = rend * ha if ha else 0
+            cultivo = c.get("cultivo") or ""
+            lineas.append(f"• {c.get('anio')} ({cultivo}): *{_num(rend)} t/ha*"
+                          + (f" · {_num(tn)} tn" if tn else ""))
+        await kapso.enviar_texto(numero, "\n".join(lineas))
+        return
+
+    # --- Historial de un insumo (dónde se aplicó)
+    if tipo == "historial_insumo":
+        nombre = (intencion.get("descripcion") or "").strip()
+        if not nombre:
+            await kapso.enviar_texto(numero, "¿De qué insumo?")
+            return
+        filas = await _sb_get("gastos", {
+            "usuario_id": f"eq.{owner_id}",
+            "descripcion": f"ilike.%{nombre}%",
+            "select": "fecha,descripcion,cantidad,unidad,total_de_usd,campo_id",
+            "order": "fecha.desc",
+            "limit": "15",
+        }) or []
+        if not filas:
+            await kapso.enviar_texto(numero, f"No encontré aplicaciones de *{nombre}*.")
+            return
+        nombres_campo = {c["id"]: c["nombre"] for c in ident.get("campos", [])}
+        lineas = [f"📜 Últimos usos de *{nombre}* ({len(filas)}):"]
+        for f in filas[:10]:
+            cnt = _num(f.get("cantidad") or 0) + " " + (f.get("unidad") or "") if f.get("cantidad") else ""
+            campo_nm = nombres_campo.get(f.get("campo_id"), "")
+            lineas.append(
+                f"• {_wa_fecha_corta(f.get('fecha'))} · {cnt} · USD {_num(f.get('total_de_usd') or 0)}"
+                + (f" en {campo_nm}" if campo_nm else ""))
+        await kapso.enviar_texto(numero, "\n".join(lineas))
+        return
+
+    # --- Análisis de suelo del campo
+    if tipo == "analisis_suelo":
+        campo = _wa_resolver_campo_consulta(ident, intencion)
+        if not campo:
+            await kapso.enviar_texto(numero, "¿De qué campo?")
+            return
+        filas = await _sb_get("analisis_suelo", {
+            "usuario_id": f"eq.{owner_id}",
+            "campo_id": f"eq.{campo['id']}",
+            "select": "fecha,laboratorio,n_total,p_disponible,k,s,materia_org,ph,zinc,boro",
+            "order": "fecha.desc",
+            "limit": "1",
+        }) or []
+        if not filas:
+            await kapso.enviar_texto(numero, f"No tengo análisis de suelo en *{campo['nombre']}*.")
+            return
+        a = filas[0]
+        lineas = [f"🧪 *Suelo de {campo['nombre']}* ({_wa_fecha_corta(a.get('fecha'))})"]
+        if a.get("laboratorio"):
+            lineas.append(f"🏢 {a['laboratorio']}")
+        for key, label, unit in [
+            ("n_total", "N total", "%"), ("p_disponible", "P disponible", "ppm"),
+            ("k", "K", "me/100g"), ("s", "S", "ppm"),
+            ("materia_org", "Mat. orgánica", "%"), ("ph", "pH", ""),
+            ("zinc", "Zn", "ppm"), ("boro", "B", "ppm"),
+        ]:
+            v = a.get(key)
+            if v is not None:
+                lineas.append(f"• {label}: *{v}{unit}*")
+        await kapso.enviar_texto(numero, "\n".join(lineas))
+        return
+
+    # --- Fletes recientes
+    if tipo == "fletes_recientes":
+        hoy = datetime.now(AR_TZ).date()
+        desde = hoy.replace(day=1).isoformat()
+        filas = await _sb_get("fletes", {
+            "owner_id": f"eq.{owner_id}",
+            "fecha": f"gte.{desde}",
+            "select": "fecha,cultivo,toneladas,destino,empresa_destino,patente_camion,ctg,carta_porte_nro",
+            "order": "fecha.desc",
+            "limit": "20",
+        }) or []
+        if not filas:
+            await kapso.enviar_texto(numero, "No cargaste fletes este mes.")
+            return
+        total_tn = sum(float(f.get("toneladas") or 0) for f in filas)
+        lineas = [f"🚚 Fletes de este mes: *{len(filas)} viajes · {_num(total_tn)} tn*"]
+        for f in filas[:10]:
+            dest = f.get("empresa_destino") or f.get("destino") or ""
+            ctg = f" CTG {f['ctg']}" if f.get("ctg") else ""
+            lineas.append(
+                f"• {_wa_fecha_corta(f.get('fecha'))} · {_num(f.get('toneladas') or 0)} tn de "
+                f"{f.get('cultivo') or ''} → {dest}{ctg}")
         if len(filas) > 10:
             lineas.append(f"...y {len(filas) - 10} más.")
+        await kapso.enviar_texto(numero, "\n".join(lineas))
+        return
+
+    # --- Timeline del campo (últimas N actividades)
+    if tipo == "timeline_campo":
+        campo = _wa_resolver_campo_consulta(ident, intencion)
+        if not campo:
+            await kapso.enviar_texto(numero, "¿De qué campo?")
+            return
+        desde = (datetime.now(AR_TZ).date() - timedelta(days=60)).isoformat()
+        acts = []
+        # Gastos
+        gastos = await _sb_get("gastos", {
+            "usuario_id": f"eq.{owner_id}", "campo_id": f"eq.{campo['id']}",
+            "fecha": f"gte.{desde}", "select": "fecha,rubro,descripcion,total_de_usd",
+            "order": "fecha.desc", "limit": "15"}) or []
+        for g in gastos:
+            acts.append((g.get("fecha") or "", "💵",
+                         f"{(g.get('rubro') or '').capitalize()} · {g.get('descripcion') or ''} · "
+                         f"USD {_num(g.get('total_de_usd') or 0)}"))
+        # Lluvias
+        lluvias = await _sb_get("lluvias", {
+            "usuario_id": f"eq.{owner_id}", "campo_id": f"eq.{campo['id']}",
+            "fecha": f"gte.{desde}", "select": "fecha,mm,etapa",
+            "order": "fecha.desc", "limit": "10"}) or []
+        for l in lluvias:
+            etapa = f" ({l['etapa']})" if l.get("etapa") else ""
+            acts.append((l.get("fecha") or "", "🌧️", f"{_num(l.get('mm') or 0)} mm{etapa}"))
+        # Eventos
+        eventos = await _sb_get("eventos", {
+            "usuario_id": f"eq.{owner_id}", "campo_id": f"eq.{campo['id']}",
+            "fecha": f"gte.{desde}", "select": "fecha,tipo,descripcion",
+            "order": "fecha.desc", "limit": "10"}) or []
+        for e in eventos:
+            acts.append((e.get("fecha") or "", "📌",
+                         f"{(e.get('tipo') or '').capitalize()}: {e.get('descripcion') or ''}"))
+        if not acts:
+            await kapso.enviar_texto(numero, f"No hay actividad en *{campo['nombre']}* los últimos 60 días.")
+            return
+        acts.sort(key=lambda x: x[0], reverse=True)
+        lineas = [f"📜 *Timeline de {campo['nombre']}* (60 días)"]
+        for fecha, emoji, texto in acts[:15]:
+            lineas.append(f"{emoji} {_wa_fecha_corta(fecha)} · {texto}")
         await kapso.enviar_texto(numero, "\n".join(lineas))
         return
 
