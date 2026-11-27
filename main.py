@@ -888,55 +888,15 @@ async def _kapso_pedir_distribucion_estructura(
     ident: dict, numero: str, datos: dict
 ) -> bool:
     """
-    Antes de guardar un gasto de estructura (sueldo, oficina, combustible,
-    honorarios, seguros, otros), pregunta si va a UN campo, a VARIOS o a
-    TODOS proporcional a hectáreas. Si el user tiene 0 campos, devuelve
-    False (el que llama avisa al user). Si tiene 1 solo, lo asigna sin
-    preguntar. Devuelve True si preguntó o resolvió (hay que cortar el
-    flujo)."""
-    campos = ident.get("campos") or []
-    if not campos:
-        return False
-    g = datos.get("gasto_estructura") or {}
-    importe = float(g.get("importe_usd") or 0)
-    tipo = (g.get("tipo") or "otros").lower()
-    frec = (g.get("frecuencia") or "mensual").lower()
-    desc = (g.get("descripcion") or "").strip()
-    resumen = f"*{tipo.capitalize()}* · USD {_num(importe)} ({frec})"
-    if desc and desc != "sin detalle":
-        resumen += f"\n_{desc}_"
+    Guarda el gasto de estructura directo en `gastos_estructura`. NO pregunta
+    a qué campo imputar: por definición agropecuaria un sueldo / honorario /
+    seguro / oficina / combustible estructural es un costo de la EMPRESA
+    (no de un campo específico), y el frontend lo prorratea por hectáreas
+    entre todos los campos del user en la fila "Estructura" del P&L.
 
-    # Un solo campo: no hay nada que preguntar, se asigna solo.
-    if len(campos) == 1:
-        c = campos[0]
-        # Mapeo del tipo de estructura al rubro válido de la tabla gastos
-        # (el frontend no reconoce "sueldo" / "honorarios" / etc.).
-        rubro_valido = _TIPO_ESTR_A_RUBRO.get(tipo, "otros")
-        desc_final = desc or tipo.capitalize()
-        if desc and tipo not in desc.lower() and tipo != "otros":
-            desc_final = f"{tipo.capitalize()}: {desc}"
-        datos["gasto"] = {
-            "rubro": rubro_valido,
-            "descripcion": desc_final,
-            "total_de_usd": importe,
-            "fecha": g.get("fecha_inicio") or datetime.now(AR_TZ).date().isoformat(),
-        }
-        datos["campo_id"] = c["id"]
-        datos["campo_nombre"] = c["nombre"]
-        datos.pop("gasto_estructura", None)
-        await _kapso_guardar_gasto(ident, numero, datos)
-        return True
-
-    await _wa_set_conv(numero, "k_gasto_estr_distribucion", datos)
-    await kapso.enviar_botones(
-        numero,
-        f"{resumen}\n\n¿A qué campo(s) lo imputo?",
-        [
-            ("dist_e:uno", "📍 Un solo campo"),
-            ("dist_e:varios", "📂 Varios campos"),
-            ("dist_e:todos", "🌍 Todos (por ha)"),
-        ],
-    )
+    Devuelve True siempre (indica al caller que el flujo ya se cerró).
+    """
+    await _kapso_guardar_gasto_estructura(ident, numero, datos)
     return True
 
 
@@ -7004,16 +6964,11 @@ async def _kapso_aplicar_intencion(ident: dict, numero: str, intencion: dict,
             "frecuencia": frec,
             "fecha_inicio": intencion.get("fecha_venc") or datetime.now(AR_TZ).date().isoformat(),
         }}
-        # Preguntamos a qué campo(s) lo imputa: uno, varios o todos
-        # (proporcional por ha). Si el user no tiene campos cargados,
-        # le decimos que arme uno primero — ya no soportamos "gasto
-        # de estructura sin campo".
-        if await _kapso_pedir_distribucion_estructura(ident, numero, datos):
-            return True
-        await kapso.enviar_texto(
-            numero,
-            f"Para cargar este gasto necesito al menos un campo tuyo. "
-            f"Creá uno en {APP_URL} y volvé.")
+        # Los gastos de estructura (sueldos, honorarios, seguros, oficina,
+        # combustible) son costos de la EMPRESA, no de un campo específico.
+        # Se guardan directo y el frontend los prorratea por hectáreas en la
+        # fila "Estructura" del P&L de cada campo.
+        await _kapso_guardar_gasto_estructura(ident, numero, datos)
         return True
 
     # ── Análisis de suelo ────────────────────────────
