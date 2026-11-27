@@ -888,15 +888,44 @@ async def _kapso_pedir_distribucion_estructura(
     ident: dict, numero: str, datos: dict
 ) -> bool:
     """
-    Guarda el gasto de estructura directo en `gastos_estructura`. NO pregunta
-    a qué campo imputar: por definición agropecuaria un sueldo / honorario /
-    seguro / oficina / combustible estructural es un costo de la EMPRESA
-    (no de un campo específico), y el frontend lo prorratea por hectáreas
-    entre todos los campos del user en la fila "Estructura" del P&L.
-
-    Devuelve True siempre (indica al caller que el flujo ya se cerró).
+    Pregunta a qué campo(s) prorratear el gasto de estructura. Se guarda
+    SIEMPRE en `gastos_estructura` (para que aparezca en la fila
+    "(−) Estructura" del P&L), pero `distribuir_config` indica a qué
+    subconjunto de campos se prorratea:
+      - 1 campo cargado → se asigna ahí sin preguntar (config={campos:[id]})
+      - "todos"          → distribuir_config = null (prorrateo a todos por ha)
+      - "uno" / "varios" → distribuir_config = '{"campos":[ids]}' (solo esos)
     """
-    await _kapso_guardar_gasto_estructura(ident, numero, datos)
+    campos = ident.get("campos") or []
+    if not campos:
+        return False
+    g = datos.get("gasto_estructura") or {}
+    importe = float(g.get("importe_usd") or 0)
+    tipo = (g.get("tipo") or "otros").lower()
+    frec = (g.get("frecuencia") or "mensual").lower()
+    desc = (g.get("descripcion") or "").strip()
+    resumen = f"*{tipo.capitalize()}* · USD {_num(importe)} ({frec})"
+    if desc and desc != "sin detalle":
+        resumen += f"\n_{desc}_"
+
+    # Un solo campo del user: lo asignamos directo (igual se guarda en
+    # gastos_estructura, no en gastos, para que aparezca en la fila Estructura).
+    if len(campos) == 1:
+        g["distribuir_config"] = json.dumps({"campos": [campos[0]["id"]]})
+        datos["gasto_estructura"] = g
+        await _kapso_guardar_gasto_estructura(ident, numero, datos)
+        return True
+
+    await _wa_set_conv(numero, "k_gasto_estr_distribucion", datos)
+    await kapso.enviar_botones(
+        numero,
+        f"{resumen}\n\n¿A qué campo(s) lo prorrateo?",
+        [
+            ("dist_e:uno", "📍 Un solo campo"),
+            ("dist_e:varios", "📂 Varios campos"),
+            ("dist_e:todos", "🌍 Todos (por ha)"),
+        ],
+    )
     return True
 
 
@@ -3087,67 +3116,100 @@ async def _kapso_flujo(ident: dict, numero: str, m, conv: dict) -> None:
 
     if estado == "k_gasto_estr_distribucion":
         g = datos.get("gasto_estructura") or {}
-
-        _tipo_estr = (g.get("tipo") or "otros").lower()
-        _rubro_valido = _TIPO_ESTR_A_RUBRO.get(_tipo_estr, "otros")
-
-        def _convertir_a_gasto_base() -> dict:
-            # Descripción: si el user no puso una, inicia con el tipo original
-            # para que se vea la categoría ("Sueldo encargado" cuando es sueldo
-            # con descripción "encargado", "Oficina: alquiler", etc).
-            desc = (g.get("descripcion") or "").strip()
-            if not desc:
-                desc = _tipo_estr.capitalize()
-            elif _tipo_estr not in desc.lower() and _tipo_estr != "otros":
-                # Prefijamos el tipo para que no se pierda info al mapear a
-                # un rubro más genérico ("empleados"/"otros").
-                desc = f"{_tipo_estr.capitalize()}: {desc}"
-            return {
-                "rubro": _rubro_valido,
-                "descripcion": desc,
-                "total_de_usd": float(g.get("importe_usd") or 0),
-                "fecha": g.get("fecha_inicio") or datetime.now(AR_TZ).date().isoformat(),
-            }
-
         if accion == "dist_e:uno":
-            # Pedir un campo y guardar como gasto normal con rubro=tipo.
-            # Armamos un "gasto" a partir del gasto_estructura para reusar
-            # el flujo normal de k_gasto_campo.
-            datos["gasto"] = _convertir_a_gasto_base()
-            datos.pop("gasto_estructura", None)
-            datos["confirmar"] = False
-            await _kapso_pedir_campo(ident, numero, "k_gasto_campo", datos,
-                                     "¿A qué campo lo cargo?")
+            # Pedir UN campo y guardar en gastos_estructura con
+            # distribuir_config={campos:[id]}. No va a la tabla gastos.
+            await _kapso_pedir_campo(ident, numero, "k_gasto_estr_campo", datos,
+                                     "¿A qué campo lo prorrateo?")
             return
         if accion == "dist_e:varios":
-            # El user elige campos con una lista (tocando uno por vez).
-            # Armamos el gasto base antes para que k_gasto_multi_pick / el
-            # finalizador puedan trabajar directo.
-            datos["gasto"] = _convertir_a_gasto_base()
-            datos.pop("gasto_estructura", None)
-            datos["elegidos_multi"] = []
-            await _kapso_pedir_multi_seleccion_campos(ident, numero, datos)
+            # El user elige varios campos.
+            await _kapso_pedir_multi_seleccion_campos_estr(ident, numero, datos)
             return
         if accion == "dist_e:todos":
-            # Dividir proporcional entre TODOS los campos con ha > 0.
-            elegibles = [c for c in (ident.get("campos") or [])
-                         if float(c.get("hectareas") or 0) > 0]
-            if not elegibles:
-                await kapso.enviar_texto(
-                    numero,
-                    "Ninguno de tus campos tiene hectáreas cargadas, "
-                    "no puedo repartir por ha. Cargalas desde la app y "
-                    "probá de nuevo.")
-                await _wa_clear_conv(numero)
-                return
-            datos["gasto"] = _convertir_a_gasto_base()
-            datos.pop("gasto_estructura", None)
-            datos["campo_ids_multi"] = [c["id"] for c in elegibles]
-            datos["campo_id"] = elegibles[0]["id"]
-            datos["campo_nombre"] = f"{len(elegibles)} campos"
-            await _kapso_finalizar_gasto_multi(ident, numero, datos)
+            # Prorrateo entre TODOS los campos por hectáreas:
+            # distribuir_config = null (comportamiento por_hectareas default).
+            g["distribuir_config"] = None
+            datos["gasto_estructura"] = g
+            await _kapso_guardar_gasto_estructura(ident, numero, datos)
             return
         await kapso.enviar_texto(numero, "Tocá una opción para seguir.")
+        return
+
+    if estado == "k_gasto_estr_campo":
+        # El user eligió UN campo para el gasto de estructura.
+        campo = _wa_resolver_campo_fuzzy(
+            ident, texto or "",
+            accion.split(":", 1)[1] if accion.startswith("campo:") else None)
+        if not campo:
+            await kapso.enviar_texto(
+                numero, "No encontré ese campo. Decime el nombre o tocá la lista.")
+            return
+        g = datos.get("gasto_estructura") or {}
+        g["distribuir_config"] = json.dumps({"campos": [campo["id"]]})
+        datos["gasto_estructura"] = g
+        await _kapso_guardar_gasto_estructura(ident, numero, datos)
+        return
+
+    if estado == "k_gasto_estr_multi_pick":
+        # Multi-selección para gasto de estructura: mismo parseo que el de
+        # gasto normal pero el resultado va a distribuir_config.
+        campos_user = ident.get("campos") or []
+        lista_ids = datos.get("multi_lista_ids") or [c["id"] for c in campos_user]
+        ids_to_campo = {c["id"]: c for c in campos_user}
+        campos_ordenados = [ids_to_campo[i] for i in lista_ids if i in ids_to_campo]
+
+        t = (texto or "").strip().lower()
+        if t in ("cancelar", "cancel", "salir", "no", "nada"):
+            await _wa_clear_conv(numero)
+            await kapso.enviar_texto(
+                numero, "Cancelado. Mandame el gasto de nuevo cuando quieras.")
+            return
+        if t in ("todos", "todo", "todos los campos", "a todos"):
+            elegidos = [c for c in campos_ordenados if float(c.get("hectareas") or 0) > 0]
+            g = datos.get("gasto_estructura") or {}
+            g["distribuir_config"] = None  # todos → por hectáreas default
+            datos["gasto_estructura"] = g
+            datos.pop("multi_lista_ids", None)
+            await _kapso_guardar_gasto_estructura(ident, numero, datos)
+            return
+
+        tokens = [p.strip() for p in re.split(r"[,\n/;]|\s+y\s+", texto or "") if p.strip()]
+        elegidos_ids: list[str] = []
+        no_encontrados: list[str] = []
+        for tk in tokens:
+            if tk.isdigit():
+                idx = int(tk) - 1
+                if 0 <= idx < len(campos_ordenados):
+                    cid = campos_ordenados[idx]["id"]
+                    if cid not in elegidos_ids:
+                        elegidos_ids.append(cid)
+                    continue
+                no_encontrados.append(tk)
+                continue
+            c = _buscar_campo(tk, campos_user)
+            if c and c["id"] not in elegidos_ids:
+                elegidos_ids.append(c["id"])
+            elif not c:
+                no_encontrados.append(tk)
+
+        if not elegidos_ids:
+            await kapso.enviar_texto(
+                numero,
+                "No pude identificar ningún campo. Probá con los números "
+                "de la lista (ej: `1, 3`) o con los nombres.")
+            return
+        if no_encontrados:
+            await kapso.enviar_texto(
+                numero,
+                f"⚠️ No encontré: {', '.join(no_encontrados)}. Igual sigo con "
+                f"los {len(elegidos_ids)} que sí matchearon.")
+
+        g = datos.get("gasto_estructura") or {}
+        g["distribuir_config"] = json.dumps({"campos": elegidos_ids})
+        datos["gasto_estructura"] = g
+        datos.pop("multi_lista_ids", None)
+        await _kapso_guardar_gasto_estructura(ident, numero, datos)
         return
 
     if estado == "k_gasto_multi_pick":
@@ -5825,14 +5887,64 @@ async def _kapso_guardar_gasto_estructura(ident: dict, numero: str, datos: dict)
     }
     if g.get("fecha_inicio"):
         payload["fecha_inicio"] = g["fecha_inicio"]
+    # distribuir_config: si es None → prorrateo a TODOS los campos por ha.
+    # Si trae {"campos":[ids]} → se prorratea solo entre esos.
+    if g.get("distribuir_config") is not None:
+        payload["distribuir_config"] = g["distribuir_config"]
     await _sb_post("gastos_estructura", payload)
     await _wa_clear_conv(numero)
+    # Nombres de los campos para el mensaje de confirmación.
+    scope_txt = "todos los campos (por ha)"
+    try:
+        cfg = json.loads(g.get("distribuir_config") or "null") or {}
+        ids = cfg.get("campos") or []
+        if ids:
+            nombres = [c.get("nombre") or "?" for c in (ident.get("campos") or [])
+                       if c.get("id") in ids]
+            if nombres:
+                scope_txt = ", ".join(nombres) + (" (por ha)" if len(nombres) > 1 else "")
+    except Exception:
+        pass
     await kapso.enviar_texto(
         numero,
         f"🏢 Gasto de estructura cargado.\n"
         f"📝 {payload['descripcion']}\n"
         f"💰 USD {_num(payload['importe_usd'])} ({payload['frecuencia']})\n"
-        f"📂 Rubro: {payload['tipo']}")
+        f"📂 Tipo: {payload['tipo']}\n"
+        f"🌾 Se prorratea en: {scope_txt}")
+
+
+async def _kapso_pedir_multi_seleccion_campos_estr(
+    ident: dict, numero: str, datos: dict
+) -> None:
+    """Multi-selección para gasto de estructura: mismo patrón que
+    `_kapso_pedir_multi_seleccion_campos` pero el estado destino es
+    `k_gasto_estr_multi_pick` y el resultado va a distribuir_config."""
+    campos = ident.get("campos") or []
+    lineas = []
+    for i, c in enumerate(campos, start=1):
+        sub = []
+        if c.get("hectareas"):
+            sub.append(f"{_num(c['hectareas'])} ha")
+        if c.get("cultivo"):
+            sub.append(str(c["cultivo"]))
+        extra = f" _({' · '.join(sub)})_" if sub else ""
+        lineas.append(f"*{i}.* {c['nombre']}{extra}")
+    lista_txt = "\n".join(lineas)
+    pregunta = (
+        "📂 *Elegí los campos a los que prorrateo el gasto.*\n"
+        "⚠️ WhatsApp no deja tildar varios de una lista. Mandame los "
+        "números separados por coma en UN solo mensaje.\n\n"
+        f"{lista_txt}\n\n"
+        "Ejemplos:\n"
+        "  • `1, 3, 5` → los campos 1, 3 y 5\n"
+        "  • `erlicher, fraga` → por nombre\n"
+        "  • `todos` → todos los campos\n\n"
+        "Para salir escribí `cancelar`."
+    )
+    datos["multi_lista_ids"] = [c["id"] for c in campos]
+    await _wa_set_conv(numero, "k_gasto_estr_multi_pick", datos)
+    await kapso.enviar_texto(numero, pregunta)
 
 
 async def _kapso_guardar_analisis_suelo(ident: dict, numero: str, datos: dict) -> None:
