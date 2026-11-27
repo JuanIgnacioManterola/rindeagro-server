@@ -869,6 +869,21 @@ async def _kapso_pedir_campo(ident: dict, numero: str, estado: str, datos: dict,
     return True
 
 
+# Mapeo de los tipos de gastos_estructura a rubros válidos de la tabla
+# gastos. Sin esto el gasto se guardaba con rubro='sueldo'/'honorarios' etc.
+# y el estado de resultados del campo (frontend) no lo mostraba porque ese
+# rubro no existe en su lista oficial (herbicidas, fungicidas, ...,
+# empleados, arrendamiento, riego, otros).
+_TIPO_ESTR_A_RUBRO = {
+    "sueldo":       "empleados",
+    "honorarios":   "otros",
+    "seguro":       "otros",
+    "oficina":      "otros",
+    "combustible":  "otros",
+    "otros":        "otros",
+}
+
+
 async def _kapso_pedir_distribucion_estructura(
     ident: dict, numero: str, datos: dict
 ) -> bool:
@@ -894,9 +909,15 @@ async def _kapso_pedir_distribucion_estructura(
     # Un solo campo: no hay nada que preguntar, se asigna solo.
     if len(campos) == 1:
         c = campos[0]
+        # Mapeo del tipo de estructura al rubro válido de la tabla gastos
+        # (el frontend no reconoce "sueldo" / "honorarios" / etc.).
+        rubro_valido = _TIPO_ESTR_A_RUBRO.get(tipo, "otros")
+        desc_final = desc or tipo.capitalize()
+        if desc and tipo not in desc.lower() and tipo != "otros":
+            desc_final = f"{tipo.capitalize()}: {desc}"
         datos["gasto"] = {
-            "rubro": tipo,
-            "descripcion": desc or tipo.capitalize(),
+            "rubro": rubro_valido,
+            "descripcion": desc_final,
             "total_de_usd": importe,
             "fecha": g.get("fecha_inicio") or datetime.now(AR_TZ).date().isoformat(),
         }
@@ -3107,10 +3128,23 @@ async def _kapso_flujo(ident: dict, numero: str, m, conv: dict) -> None:
     if estado == "k_gasto_estr_distribucion":
         g = datos.get("gasto_estructura") or {}
 
+        _tipo_estr = (g.get("tipo") or "otros").lower()
+        _rubro_valido = _TIPO_ESTR_A_RUBRO.get(_tipo_estr, "otros")
+
         def _convertir_a_gasto_base() -> dict:
+            # Descripción: si el user no puso una, inicia con el tipo original
+            # para que se vea la categoría ("Sueldo encargado" cuando es sueldo
+            # con descripción "encargado", "Oficina: alquiler", etc).
+            desc = (g.get("descripcion") or "").strip()
+            if not desc:
+                desc = _tipo_estr.capitalize()
+            elif _tipo_estr not in desc.lower() and _tipo_estr != "otros":
+                # Prefijamos el tipo para que no se pierda info al mapear a
+                # un rubro más genérico ("empleados"/"otros").
+                desc = f"{_tipo_estr.capitalize()}: {desc}"
             return {
-                "rubro": (g.get("tipo") or "otros").lower(),
-                "descripcion": g.get("descripcion") or (g.get("tipo") or "").capitalize(),
+                "rubro": _rubro_valido,
+                "descripcion": desc,
                 "total_de_usd": float(g.get("importe_usd") or 0),
                 "fecha": g.get("fecha_inicio") or datetime.now(AR_TZ).date().isoformat(),
             }
